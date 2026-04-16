@@ -1,0 +1,1068 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from hashlib import blake2b
+from typing import Any
+
+import falcon
+from keri.peer.exchanging import Exchanger
+
+from kfboot.basing import (
+    ACCOUNT_STATE_ONBOARDED,
+    ACCOUNT_STATE_PENDING_ONBOARDING,
+    SESSION_STATE_ACCOUNT_CREATED,
+    SESSION_STATE_CANCELLED,
+    SESSION_STATE_COMPLETED,
+    SESSION_STATE_EXPIRED,
+    SESSION_STATE_FAILED,
+    SESSION_STATE_WITNESS_POOL_ALLOCATED,
+    TERMINAL_SESSION_STATES,
+    SessionRecord,
+)
+from kfboot.boot_client import BootError
+from kfboot.store import (
+    account_failed,
+    make_record,
+    now_iso,
+    parse_public_url,
+    resources_to_api,
+    session_failed,
+)
+
+
+ONBOARDING_ROUTES = {
+    "/onboarding/session/start",
+    "/onboarding/session/status",
+    "/onboarding/account/create",
+    "/onboarding/complete",
+    "/onboarding/cancel",
+}
+
+ACCOUNT_ROUTES = {
+    "/account/witnesses",
+    "/account/watchers",
+    "/account/watchers/status",
+    "/account/witnesses/delete",
+    "/account/watchers/delete",
+}
+
+
+@dataclass
+class BootContext:
+    config: Any
+    store: Any
+    witness_boots: Any
+    watcher_boot: Any
+    host_hab: Any
+    habery: Any
+
+
+class RouteHandler:
+    resource: str = ""
+
+    def __init__(self, exchanger: "BootExchanger"):
+        self.exchanger = exchanger
+
+    def verify(self, serder, **kwa) -> bool:
+        return True
+
+    def handle(self, serder, **kwa):
+        raise NotImplementedError
+
+
+class SessionStartHandler(RouteHandler):
+    resource = "/onboarding/session/start"
+
+    def handle(self, serder, **kwa):
+        sender = serder.pre
+        payload = _payload(serder)
+        option = self.exchanger.account_option(payload.get("chosen_profile_code", ""))
+        account_aid = _required_str(payload, "account_aid")
+        alias = _optional_str(payload, "account_alias")
+        region_id = _optional_str(payload, "region_id") or self.exchanger.ctx.config.region_id
+        watcher_required = bool(
+            payload.get("watcher_required", self.exchanger.ctx.config.bootstrap_watcher_required)
+        )
+        if self.exchanger.ctx.config.bootstrap_watcher_required and not watcher_required:
+            raise falcon.HTTPBadRequest(
+                title="Watcher required",
+                description="Conference v1 requires one hosted watcher per onboarded account.",
+            )
+
+        account = self.exchanger.ctx.store.get_account(account_aid)
+        if account is not None and account.status == ACCOUNT_STATE_ONBOARDED:
+            raise falcon.HTTPConflict(
+                title="Account already onboarded",
+                description="The permanent account AID already completed onboarding.",
+            )
+
+        session = None
+        session_for_account = self.exchanger.ctx.store.find_session_for_account(account_aid)
+        if session_for_account is not None and session_for_account.state not in TERMINAL_SESSION_STATES:
+            if session_for_account.ephemeral_aid != sender:
+                raise falcon.HTTPConflict(
+                    title="Account session already active",
+                    description="A different onboarding principal already owns the active session for this account AID.",
+                )
+            session = session_for_account
+        elif (existing := self.exchanger.ctx.store.find_active_session_for_ephemeral(sender)) is not None:
+            session = existing
+
+        if session is not None:
+            session = self.exchanger._reconcile_existing_start_session(
+                session=session,
+                account_aid=account_aid,
+                account_alias=alias,
+                option=option,
+                region_id=region_id,
+                watcher_required=watcher_required,
+            )
+        else:
+            self.exchanger.enforce_session_start_admission(
+                sender=sender,
+                account_aid=account_aid,
+            )
+            session = self.exchanger.ctx.store.create_session(
+                ephemeral_aid=sender,
+                account_aid=account_aid,
+                account_alias=alias,
+                chosen_profile_code=option["code"],
+                client_ip=self.exchanger.client_ip,
+                region_id=region_id,
+                region_name=self.exchanger.ctx.config.region_name,
+                watcher_required=watcher_required,
+                witness_count=option["witness_count"],
+                toad=option["toad"],
+            )
+
+        self.exchanger.provision_session_resources(session=session)
+        self.exchanger.refresh_session_lease(session)
+        self.exchanger.reply_session(self.resource, recipient=sender, session=session)
+
+
+class SessionStatusHandler(RouteHandler):
+    resource = "/onboarding/session/status"
+
+    def handle(self, serder, **kwa):
+        sender = serder.pre
+        session = self.exchanger.require_session(_required_str(_payload(serder), "session_id"))
+        self.exchanger.require_onboarding_principal(sender=sender, session=session)
+        self.exchanger.refresh_session_lease(session)
+        self.exchanger.reply_session(self.resource, recipient=sender, session=session)
+
+
+class AccountCreateHandler(RouteHandler):
+    resource = "/onboarding/account/create"
+
+    def handle(self, serder, **kwa):
+        sender = serder.pre
+        payload = _payload(serder)
+        session = self.exchanger.require_session(_required_str(payload, "session_id"))
+        self.exchanger.require_open_session(session)
+        self.exchanger.require_ephemeral_principal(sender=sender, session=session)
+
+        account_aid = _required_str(payload, "account_aid")
+
+        if session.account_aid and session.account_aid != account_aid:
+            raise falcon.HTTPConflict(
+                title="Session already bound",
+                description="This onboarding session is already bound to a different account AID.",
+            )
+
+        if not session.witness_eids or (session.watcher_required and not session.watcher_eid):
+            self.exchanger.fail_session(
+                session=session,
+                reason="Hosted resources were not fully allocated before account creation.",
+                teardown=True,
+            )
+            raise falcon.HTTPConflict(
+                title="Resources missing",
+                description="Witness or watcher allocation is incomplete for this session.",
+            )
+
+        account = self.exchanger.ctx.store.get_account(account_aid)
+        if account is not None and account.session_id not in {"", session.session_id}:
+            raise falcon.HTTPConflict(
+                title="Account already exists",
+                description="The permanent account AID is already bound to a different onboarding session.",
+            )
+
+        if session.state in {SESSION_STATE_ACCOUNT_CREATED, SESSION_STATE_COMPLETED} and session.account_aid == account_aid:
+            self.exchanger.reply_account(self.resource, recipient=sender, session=session)
+            return
+
+        try:
+            if account is None:
+                account = self.exchanger.ctx.store.build_account(
+                    account_aid=account_aid,
+                    account_alias=_optional_str(payload, "account_alias") or session.account_alias,
+                    witness_profile_code=session.chosen_profile_code,
+                    witness_count=session.witness_count,
+                    toad=session.toad,
+                    watcher_required=session.watcher_required,
+                    region_id=session.region_id,
+                    region_name=session.region_name,
+                    session_id=session.session_id,
+                    witness_eids=list(session.witness_eids),
+                    watcher_eid=session.watcher_eid,
+                    onboarded=False,
+                )
+            else:
+                account.account_alias = _optional_str(payload, "account_alias") or account.account_alias
+                account.status = ACCOUNT_STATE_PENDING_ONBOARDING
+                account.witness_eids = list(session.witness_eids)
+                account.watcher_eid = session.watcher_eid
+                account.session_id = session.session_id
+
+            session.account_aid = account_aid
+            session.state = SESSION_STATE_ACCOUNT_CREATED
+            session.updated_at = now_iso()
+
+            self.exchanger.ctx.store.save_account(account)
+            self.exchanger.ctx.store.bind_resources_to_account(session=session, account_aid=account_aid)
+            self.exchanger.refresh_session_lease(session)
+        except Exception as exc:
+            self.exchanger.fail_session(
+                session=session,
+                reason=str(exc),
+                account=account,
+                teardown=True,
+            )
+            raise
+
+        self.exchanger.reply_account(self.resource, recipient=sender, session=session)
+
+
+class CompleteHandler(RouteHandler):
+    resource = "/onboarding/complete"
+
+    def handle(self, serder, **kwa):
+        sender = serder.pre
+        payload = _payload(serder)
+        session = self.exchanger.require_session(_required_str(payload, "session_id"))
+        self.exchanger.require_open_session(session, allow_completed=True)
+        self.exchanger.require_ephemeral_principal(sender=sender, session=session)
+
+        account_aid = _required_str(payload, "account_aid")
+        if session.account_aid and session.account_aid != account_aid:
+            raise falcon.HTTPConflict(
+                title="Session already bound",
+                description="This onboarding session is already bound to a different account AID.",
+            )
+
+        account = self.exchanger.ctx.store.get_account(account_aid)
+        if account is None:
+            raise falcon.HTTPNotFound(
+                title="Account not found",
+                description="No account record exists for the requested permanent account AID.",
+            )
+
+        if session.state == SESSION_STATE_COMPLETED and account.status == ACCOUNT_STATE_ONBOARDED:
+            self.exchanger.reply_account(self.resource, recipient=sender, session=session)
+            return
+
+        if session.watcher_required and not session.watcher_eid:
+            self.exchanger.fail_session(
+                session=session,
+                reason="Hosted watcher is required before onboarding can complete.",
+                account=account,
+                teardown=True,
+            )
+            raise falcon.HTTPConflict(
+                title="Watcher missing",
+                description="Conference v1 requires one hosted watcher before onboarding completes.",
+            )
+
+        session.state = SESSION_STATE_COMPLETED
+        session.updated_at = now_iso()
+        account.status = ACCOUNT_STATE_ONBOARDED
+        account.onboarded_at = now_iso()
+        self.exchanger.ctx.store.save_session(session)
+        self.exchanger.ctx.store.save_account(account)
+        self.exchanger.reply_account(self.resource, recipient=sender, session=session)
+
+
+class CancelHandler(RouteHandler):
+    resource = "/onboarding/cancel"
+
+    def handle(self, serder, **kwa):
+        sender = serder.pre
+        payload = _payload(serder)
+        session = self.exchanger.require_session(_required_str(payload, "session_id"))
+        self.exchanger.require_ephemeral_principal(sender=sender, session=session)
+        if session.state == SESSION_STATE_COMPLETED:
+            raise falcon.HTTPConflict(
+                title="Session completed",
+                description="A completed onboarding session cannot be cancelled.",
+            )
+        if session.state != SESSION_STATE_CANCELLED:
+            account = self.exchanger.ctx.store.get_account(session.account_aid) if session.account_aid else None
+            try:
+                self.exchanger.teardown_session_resources(session=session, account=account)
+            except BootError as exc:
+                self.exchanger.fail_session(
+                    session=session,
+                    reason=f"Hosted resource teardown failed during cancellation: {exc}",
+                    account=account,
+                )
+                raise _boot_error(exc)
+
+            session.state = SESSION_STATE_CANCELLED
+            session.updated_at = now_iso()
+            self.exchanger.ctx.store.save_session(session)
+
+            failed = account_failed(account)
+            if failed is not None:
+                self.exchanger.ctx.store.save_account(failed)
+
+        self.exchanger.reply_session(self.resource, recipient=sender, session=session)
+
+
+class AccountWitnessesHandler(RouteHandler):
+    resource = "/account/witnesses"
+
+    def handle(self, serder, **kwa):
+        sender = serder.pre
+        self.exchanger.require_onboarded_account(sender, _payload(serder))
+        rows = resources_to_api(
+            self.exchanger.ctx.store.list_resources_for_account(kind="witness", account_aid=sender)
+        )
+        self.exchanger.queue_reply(self.resource, sender, {"account_aid": sender, "witnesses": rows})
+
+
+class AccountWatchersHandler(RouteHandler):
+    resource = "/account/watchers"
+
+    def handle(self, serder, **kwa):
+        sender = serder.pre
+        self.exchanger.require_onboarded_account(sender, _payload(serder))
+        rows = resources_to_api(
+            self.exchanger.ctx.store.list_resources_for_account(kind="watcher", account_aid=sender)
+        )
+        self.exchanger.queue_reply(self.resource, sender, {"account_aid": sender, "watchers": rows})
+
+
+class AccountWatcherStatusHandler(RouteHandler):
+    resource = "/account/watchers/status"
+
+    def handle(self, serder, **kwa):
+        sender = serder.pre
+        payload = _payload(serder)
+        self.exchanger.require_onboarded_account(sender, payload)
+
+        watcher_id = _optional_str(payload, "watcher_eid") or _required_str(payload, "watcher_id")
+        record = self.exchanger.ctx.store.get_resource("watcher", watcher_id)
+        if record is None or record.principal != sender:
+            raise falcon.HTTPNotFound(title="Watcher not found")
+
+        try:
+            status = self.exchanger.ctx.watcher_boot.watcher_status(watcher_id)
+        except BootError as exc:
+            raise _boot_error(exc)
+
+        derived_status = _watcher_status_label(status)
+        if derived_status:
+            record.status = derived_status
+            self.exchanger.ctx.store.save_resource(record)
+
+        watcher = resources_to_api([record])[0]
+        if isinstance(status, dict):
+            watcher.update(status)
+        self.exchanger.queue_reply(
+            self.resource,
+            sender,
+            {"account_aid": sender, "watcher": watcher, "watcher_id": watcher_id},
+        )
+
+
+class AccountWitnessDeleteHandler(RouteHandler):
+    resource = "/account/witnesses/delete"
+
+    def handle(self, serder, **kwa):
+        sender = serder.pre
+        payload = _payload(serder)
+        account = self.exchanger.require_onboarded_account(sender, payload)
+        witness_id = _optional_str(payload, "witness_eid") or _required_str(payload, "witness_id")
+        record = self.exchanger.ctx.store.get_resource("witness", witness_id)
+        if record is None or record.principal != sender:
+            raise falcon.HTTPNotFound(title="Witness not found")
+
+        try:
+            self.exchanger._delete_hosted_resource(
+                kind="witness",
+                eid=witness_id,
+                account=account,
+            )
+        except BootError as exc:
+            raise _boot_error(exc)
+
+        self.exchanger.queue_reply(
+            self.resource,
+            sender,
+            {"account_aid": sender, "witness_id": witness_id, "deleted": True},
+        )
+
+
+class AccountWatcherDeleteHandler(RouteHandler):
+    resource = "/account/watchers/delete"
+
+    def handle(self, serder, **kwa):
+        sender = serder.pre
+        payload = _payload(serder)
+        account = self.exchanger.require_onboarded_account(sender, payload)
+        watcher_id = _optional_str(payload, "watcher_eid") or _required_str(payload, "watcher_id")
+        record = self.exchanger.ctx.store.get_resource("watcher", watcher_id)
+        if record is None or record.principal != sender:
+            raise falcon.HTTPNotFound(title="Watcher not found")
+
+        try:
+            self.exchanger._delete_hosted_resource(
+                kind="watcher",
+                eid=watcher_id,
+                account=account,
+            )
+        except BootError as exc:
+            raise _boot_error(exc)
+
+        self.exchanger.queue_reply(
+            self.resource,
+            sender,
+            {"account_aid": sender, "watcher_id": watcher_id, "deleted": True},
+        )
+
+
+class BootExchanger(Exchanger):
+    def __init__(self, ctx: BootContext):
+        super().__init__(hby=ctx.habery, handlers=[])
+        self.ctx = ctx
+        self.host_hab = ctx.host_hab
+        self.reply_streams: list[bytes] = []
+        self.client_ip = ""
+        self.last_error: falcon.HTTPError | None = None
+
+        for handler in (
+            SessionStartHandler(self),
+            SessionStatusHandler(self),
+            AccountCreateHandler(self),
+            CompleteHandler(self),
+            CancelHandler(self),
+            AccountWitnessesHandler(self),
+            AccountWatchersHandler(self),
+            AccountWatcherStatusHandler(self),
+            AccountWitnessDeleteHandler(self),
+            AccountWatcherDeleteHandler(self),
+        ):
+            self.addHandler(handler)
+
+    def clear_replies(self) -> None:
+        self.reply_streams.clear()
+        self.last_error = None
+
+    def set_client_ip(self, client_ip: str) -> None:
+        self.client_ip = client_ip
+
+    def expire_sessions(self) -> None:
+        for session in self.ctx.store.expire_sessions():
+            account = self.ctx.store.get_account(session.account_aid) if session.account_aid else None
+            try:
+                self.teardown_session_resources(session=session, account=account)
+            except BootError as exc:
+                session.failure_reason = (
+                    f"{session.failure_reason} Cleanup failed: {exc}".strip()
+                    if session.failure_reason
+                    else f"Cleanup failed after expiry: {exc}"
+                )
+                self.ctx.store.save_session(session)
+            else:
+                failed = account_failed(account)
+                if failed is not None:
+                    self.ctx.store.save_account(failed)
+
+    def take_reply(self) -> bytes | None:
+        if not self.reply_streams:
+            return None
+        return self.reply_streams.pop(0)
+
+    def account_option(self, code: str) -> dict[str, Any]:
+        option = self.ctx.config.account_option(code or "")
+        if option is None:
+            raise falcon.HTTPBadRequest(
+                title="Unsupported witness profile",
+                description=f"Unknown account profile '{code or ''}'.",
+            )
+        return option
+
+    def require_session(self, session_id: str) -> SessionRecord:
+        session = self.ctx.store.get_session(session_id)
+        if session is None:
+            raise falcon.HTTPNotFound(
+                title="Session not found",
+                description=f"No onboarding session exists for '{session_id}'.",
+            )
+        return session
+
+    def require_onboarding_principal(self, *, sender: str, session: SessionRecord) -> None:
+        if sender in {session.ephemeral_aid, session.account_aid}:
+            return
+        raise falcon.HTTPUnauthorized(
+            title="Wrong principal",
+            description="The authenticated sender does not match the onboarding session principal.",
+        )
+
+    def require_ephemeral_principal(self, *, sender: str, session: SessionRecord) -> None:
+        if sender and sender == session.ephemeral_aid:
+            return
+        raise falcon.HTTPUnauthorized(
+            title="Wrong onboarding principal",
+            description="The authenticated sender must be the session's hidden onboarding AID.",
+        )
+
+    def require_account_principal(self, *, sender: str, session: SessionRecord) -> None:
+        if sender and sender == session.account_aid:
+            return
+        raise falcon.HTTPUnauthorized(
+            title="Wrong account principal",
+            description="The authenticated sender must be the permanent account AID.",
+        )
+
+    def require_open_session(self, session: SessionRecord, *, allow_completed: bool = False) -> None:
+        if session.state == SESSION_STATE_EXPIRED:
+            raise falcon.HTTPGone(title="Session expired")
+        if session.state == SESSION_STATE_FAILED:
+            raise falcon.HTTPConflict(
+                title="Session failed",
+                description=session.failure_reason or "The onboarding session is in a failed state.",
+            )
+        if session.state == SESSION_STATE_CANCELLED:
+            raise falcon.HTTPConflict(title="Session cancelled")
+        if session.state == SESSION_STATE_COMPLETED and not allow_completed:
+            raise falcon.HTTPConflict(title="Session completed")
+
+    def require_onboarded_account(self, sender: str, payload: dict[str, Any]) -> AccountRecord:
+        account_aid = _optional_str(payload, "account_aid")
+        if account_aid and account_aid != sender:
+            raise falcon.HTTPUnauthorized(
+                title="Account principal mismatch",
+                description="The authenticated sender must match account_aid.",
+            )
+        account = self.ctx.store.get_account(sender)
+        if account is None:
+            raise falcon.HTTPNotFound(
+                title="Account not found",
+                description="No account exists for the authenticated sender.",
+            )
+        if account.status != ACCOUNT_STATE_ONBOARDED:
+            raise falcon.HTTPConflict(
+                title="Account not onboarded",
+                description="Approved-account routes require an onboarded account principal.",
+            )
+        return account
+
+    def fail_session(
+        self,
+        *,
+        session: SessionRecord,
+        reason: str,
+        account=None,
+        teardown: bool = False,
+    ) -> None:
+        session_failed(session, reason)
+        self.ctx.store.save_session(session)
+
+        failed = account_failed(account)
+        if failed is not None:
+            self.ctx.store.save_account(failed)
+
+        if teardown:
+            self._teardown_failed_session_resources(
+                session=session,
+                failure_reason=reason,
+                account=failed,
+            )
+
+    def refresh_session_lease(self, session: SessionRecord) -> None:
+        self.ctx.store.refresh_session_lease(session)
+
+    def enforce_session_start_admission(self, *, sender: str, account_aid: str) -> None:
+        client_ip = (self.client_ip or "").strip()
+        if not client_ip:
+            return
+
+        active = self.ctx.store.list_active_sessions_for_ip(client_ip)
+        active_accounts = {record.account_aid for record in active if record.account_aid}
+        active_ephemerals = {record.ephemeral_aid for record in active if record.ephemeral_aid}
+
+        account_limit = self.ctx.config.bootstrap_accounts_per_ip
+        if account_limit > 0 and account_aid and account_aid not in active_accounts and len(active_accounts) >= account_limit:
+            raise falcon.HTTPTooManyRequests(
+                title="Per-IP onboarding account limit exceeded",
+                description=(
+                    f"Client IP {client_ip} already has {len(active_accounts)} active onboarding "
+                    f"account session(s); the configured limit is {account_limit}."
+                ),
+            )
+
+        aid_limit = self.ctx.config.bootstrap_aids_per_ip
+        if aid_limit > 0 and sender and sender not in active_ephemerals and len(active_ephemerals) >= aid_limit:
+            raise falcon.HTTPTooManyRequests(
+                title="Per-IP onboarding principal limit exceeded",
+                description=(
+                    f"Client IP {client_ip} already has {len(active_ephemerals)} active onboarding "
+                    f"principal(s); the configured limit is {aid_limit}."
+                ),
+            )
+
+    def provision_session_resources(self, *, session: SessionRecord) -> None:
+        if session.state in TERMINAL_SESSION_STATES:
+            if session.state == SESSION_STATE_FAILED:
+                raise falcon.HTTPConflict(
+                    title="Session failed",
+                    description=session.failure_reason or "The onboarding session is in a failed state.",
+                )
+            return
+
+        try:
+            missing_witnesses = max(session.witness_count - len(session.witness_eids), 0)
+            if missing_witnesses:
+                self._ensure_capacity(kind="witness", requested=missing_witnesses)
+                planned_backends = self._planned_witness_backends(session=session)
+                start_index = len(session.witness_eids)
+                for index, backend in enumerate(planned_backends[start_index:], start=start_index):
+                    created = self._witness_client(backend.id).allocate_witness(session.account_aid)
+                    record = make_record(
+                        kind="witness",
+                        eid=str(created.get("eid", "")),
+                        backend_id=backend.id,
+                        cid="",
+                        principal="",
+                        session_id=session.session_id,
+                        name=str(created.get("name", "") or f"witness-{index + 1}"),
+                        identifier_alias=session.account_alias,
+                        region_id=session.region_id,
+                        region_name=session.region_name,
+                        public_url=backend.public_url,
+                        boot_url=backend.boot_url,
+                        oobis=list(created.get("oobis", []) or []),
+                        status=str(created.get("status", "") or "allocated"),
+                    )
+                    self.ctx.store.add_resource(record)
+                    session.witness_eids.append(record.eid)
+                    session.updated_at = now_iso()
+                    self.ctx.store.save_session(session)
+
+                session.state = SESSION_STATE_WITNESS_POOL_ALLOCATED
+                session.updated_at = now_iso()
+                self.ctx.store.save_session(session)
+
+            if session.watcher_required and not session.watcher_eid:
+                self._ensure_capacity(kind="watcher", requested=1)
+                first_witness = self.ctx.store.get_resource("witness", session.witness_eids[0])
+                oobi = first_witness.oobis[0] if first_witness and first_witness.oobis else None
+                created = self.ctx.watcher_boot.allocate_watcher(session.account_aid, oobi=oobi)
+                record = make_record(
+                    kind="watcher",
+                    eid=str(created.get("eid", "")),
+                    cid="",
+                    principal="",
+                    session_id=session.session_id,
+                    name=str(created.get("name", "") or "watcher"),
+                    identifier_alias=session.account_alias,
+                    region_id=session.region_id,
+                    region_name=session.region_name,
+                    public_url=self.ctx.config.wat_public_url,
+                    boot_url=self.ctx.watcher_boot.base_url,
+                    oobis=list(created.get("oobis", []) or []),
+                    status=str(created.get("status", "") or "created"),
+                )
+                self.ctx.store.add_resource(record)
+                session.watcher_eid = record.eid
+                session.updated_at = now_iso()
+                self.ctx.store.save_session(session)
+        except BootError as exc:
+            self.fail_session(session=session, reason=str(exc), teardown=True)
+            raise _boot_error(exc)
+        except Exception as exc:
+            self.fail_session(session=session, reason=str(exc), teardown=True)
+            raise
+
+    def reply_session(self, route: str, *, recipient: str, session: SessionRecord) -> None:
+        payload = self.session_payload(session)
+        self.queue_reply(route, recipient, payload)
+
+    def reply_account(self, route: str, *, recipient: str, session: SessionRecord) -> None:
+        payload = self.session_payload(session)
+        if session.account_aid:
+            account = self.ctx.store.get_account(session.account_aid)
+            if account is not None:
+                payload["account"] = self.ctx.store.account_payload(account)
+        self.queue_reply(route, recipient, payload)
+
+    def session_payload(self, session: SessionRecord) -> dict[str, Any]:
+        witnesses = resources_to_api(
+            self.ctx.store.get_resources("witness", session.witness_eids),
+            include_boot_url=True,
+        )
+        watcher = None
+        if session.watcher_eid:
+            rows = resources_to_api(
+                self.ctx.store.get_resources("watcher", [session.watcher_eid]),
+                include_boot_url=True,
+            )
+            watcher = rows[0] if rows else None
+
+        payload = self.ctx.store.session_payload(session)
+        payload["session"] = dict(payload)
+        payload["witnesses"] = witnesses
+        payload["watcher"] = watcher
+        payload["witness_count"] = session.witness_count or len(witnesses)
+        payload["toad"] = session.toad
+        payload["region_id"] = session.region_id
+        payload["region_name"] = session.region_name
+        if session.account_aid:
+            payload["account_aid"] = session.account_aid
+        return payload
+
+    def queue_reply(self, route: str, recipient: str, payload: dict[str, Any]) -> None:
+        stream = bytearray(self.host_hab.replay())
+        stream.extend(self.host_hab.exchange(route=route, payload=payload, recipient=recipient or None))
+        self.reply_streams.append(bytes(stream))
+
+    def processEvent(self, serder, tsgs=None, cigars=None, ptds=None, essrs=None, **kwa):
+        try:
+            return super().processEvent(serder, tsgs=tsgs, cigars=cigars, ptds=ptds, essrs=essrs, **kwa)
+        except falcon.HTTPError as exc:
+            self.last_error = exc
+            return None
+
+    def _ensure_capacity(self, *, kind: str, requested: int) -> None:
+        if requested <= 0:
+            return
+        count = self.ctx.store.count_resources(kind)
+        limit = (
+            self.ctx.config.witness_limit
+            if kind == "witness"
+            else self.ctx.config.watcher_limit
+        )
+        if count + requested > limit:
+            raise falcon.HTTPConflict(
+                title="Capacity exceeded",
+                description=(
+                    f"{kind} limit is {limit}, current count is {count}, "
+                    f"requested {requested} additional"
+                ),
+            )
+
+    def _planned_witness_backends(self, *, session: SessionRecord) -> list[Any]:
+        if session.witness_backend_ids:
+            if len(session.witness_backend_ids) != session.witness_count:
+                raise BootError(
+                    "Session witness backend selection does not match the configured witness count.",
+                    status_code=503,
+                )
+            return [self._witness_backend(backend_id) for backend_id in session.witness_backend_ids]
+
+        backends = self._select_witness_backends(
+            count=session.witness_count,
+            seed=session.session_id,
+        )
+        session.witness_backend_ids = [backend.id for backend in backends]
+        session.updated_at = now_iso()
+        self.ctx.store.save_session(session)
+        return backends
+
+    def _select_witness_backends(self, *, count: int, seed: str) -> list[Any]:
+        ordered = sorted(self.ctx.config.witness_backends, key=lambda backend: backend.id)
+        if count > len(ordered):
+            raise BootError(
+                f"Witness profile requires {count} backends but only {len(ordered)} are configured.",
+                status_code=503,
+            )
+        if count <= 0:
+            return []
+
+        digest = blake2b(seed.encode("utf-8"), digest_size=8).digest()
+        start = int.from_bytes(digest, "big") % len(ordered)
+        return [ordered[(start + index) % len(ordered)] for index in range(count)]
+
+    def _witness_backend(self, backend_id: str) -> Any:
+        for backend in self.ctx.config.witness_backends:
+            if backend.id == backend_id:
+                return backend
+        raise BootError(f"Witness backend '{backend_id}' is not configured.", status_code=503)
+
+    def _witness_client(self, backend_id: str) -> Any:
+        client = self.ctx.witness_boots.get(backend_id)
+        if client is None:
+            raise BootError(f"Witness backend '{backend_id}' is not configured.", status_code=503)
+        return client
+
+    def _witness_client_for_record(self, record) -> Any:
+        if record.backend_id:
+            return self._witness_client(record.backend_id)
+
+        if record.boot_url:
+            for backend in self.ctx.config.witness_backends:
+                if backend.boot_url == record.boot_url:
+                    return self._witness_client(backend.id)
+
+        public_url = (record.url or "").rstrip("/")
+        if public_url:
+            matches = [
+                backend for backend in self.ctx.config.witness_backends if backend.public_url == public_url
+            ]
+            if len(matches) == 1:
+                return self._witness_client(matches[0].id)
+
+        if record.public_host:
+            matches = [
+                backend
+                for backend in self.ctx.config.witness_backends
+                if parse_public_url(backend.public_url) == (record.public_host, record.public_port)
+            ]
+            if len(matches) == 1:
+                return self._witness_client(matches[0].id)
+
+        if len(self.ctx.witness_boots) == 1:
+            return next(iter(self.ctx.witness_boots.values()))
+
+        raise BootError(
+            f"No witness backend matches stored routing data for witness '{record.eid}'.",
+            status_code=503,
+        )
+
+    def teardown_session_resources(self, *, session: SessionRecord, account=None) -> None:
+        errors: list[BootError] = []
+
+        for watcher_id in self._collect_session_resource_ids(kind="watcher", session=session, account=account):
+            try:
+                self._delete_hosted_resource(
+                    kind="watcher",
+                    eid=watcher_id,
+                    session=session,
+                    account=account,
+                    tolerate_missing_remote=True,
+                )
+            except BootError as exc:
+                errors.append(exc)
+
+        for witness_id in self._collect_session_resource_ids(kind="witness", session=session, account=account):
+            try:
+                self._delete_hosted_resource(
+                    kind="witness",
+                    eid=witness_id,
+                    session=session,
+                    account=account,
+                    tolerate_missing_remote=True,
+                )
+            except BootError as exc:
+                errors.append(exc)
+
+        if errors:
+            first = errors[0]
+            detail = "; ".join(str(error) for error in errors)
+            raise BootError(detail, status_code=first.status_code)
+
+    def _collect_session_resource_ids(self, *, kind: str, session: SessionRecord, account=None) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+
+        candidates: list[str] = []
+        if kind == "witness":
+            candidates.extend(session.witness_eids)
+            if account is not None:
+                candidates.extend(account.witness_eids)
+        else:
+            if session.watcher_eid:
+                candidates.append(session.watcher_eid)
+            if account is not None and account.watcher_eid:
+                candidates.append(account.watcher_eid)
+
+        candidates.extend(
+            record.eid
+            for record in self.ctx.store.list_resources_for_session(
+                kind=kind,
+                session_id=session.session_id,
+            )
+        )
+
+        for eid in candidates:
+            if not eid or eid in seen:
+                continue
+            seen.add(eid)
+            ordered.append(eid)
+
+        return ordered
+
+    def _delete_hosted_resource(
+        self,
+        *,
+        kind: str,
+        eid: str,
+        session: SessionRecord | None = None,
+        account=None,
+        tolerate_missing_remote: bool = False,
+    ) -> None:
+        if not eid:
+            return
+
+        record = self.ctx.store.get_resource(kind, eid)
+        if kind == "witness":
+            if record is None:
+                if session is not None:
+                    session.witness_eids = [item for item in session.witness_eids if item != eid]
+                if account is not None:
+                    account.witness_eids = [item for item in account.witness_eids if item != eid]
+                self._persist_owner_state(session=session, account=account)
+                return
+            delete_remote = self._witness_client_for_record(record).delete_witness
+        else:
+            delete_remote = self.ctx.watcher_boot.delete_watcher
+        try:
+            delete_remote(eid)
+        except BootError as exc:
+            if not (tolerate_missing_remote and exc.status_code == 404):
+                raise
+
+        self.ctx.store.delete_resource(kind, eid)
+        if session is not None:
+            if kind == "witness":
+                session.witness_eids = [item for item in session.witness_eids if item != eid]
+            elif session.watcher_eid == eid:
+                session.watcher_eid = ""
+
+        if account is not None:
+            if kind == "witness":
+                account.witness_eids = [item for item in account.witness_eids if item != eid]
+            elif account.watcher_eid == eid:
+                account.watcher_eid = ""
+
+        self._persist_owner_state(session=session, account=account)
+
+    def _persist_owner_state(self, *, session: SessionRecord | None = None, account=None) -> None:
+        if session is not None:
+            session.updated_at = now_iso()
+            self.ctx.store.save_session(session)
+        if account is not None:
+            self.ctx.store.save_account(account)
+
+    def _teardown_failed_session_resources(
+        self,
+        *,
+        session: SessionRecord,
+        failure_reason: str,
+        account=None,
+    ) -> None:
+        try:
+            self.teardown_session_resources(session=session, account=account)
+        except BootError as exc:
+            session.failure_reason = f"{failure_reason} Cleanup failed: {exc}"
+            session.updated_at = now_iso()
+            self.ctx.store.save_session(session)
+
+    def _reconcile_existing_start_session(
+        self,
+        *,
+        session: SessionRecord,
+        account_aid: str,
+        account_alias: str,
+        option: dict[str, Any],
+        region_id: str,
+        watcher_required: bool,
+    ) -> SessionRecord:
+        if session.state == SESSION_STATE_FAILED:
+            raise falcon.HTTPConflict(
+                title="Session failed",
+                description=session.failure_reason or "Blind retry would duplicate hosted resources.",
+            )
+        if session.state in {SESSION_STATE_CANCELLED, SESSION_STATE_EXPIRED}:
+            raise falcon.HTTPConflict(
+                title="Session closed",
+                description="The onboarding session is no longer active.",
+            )
+        if session.account_aid and session.account_aid != account_aid:
+            raise falcon.HTTPConflict(
+                title="Session parameter mismatch",
+                description="The existing onboarding session was started with a different permanent account AID.",
+            )
+        if account_alias and session.account_alias and session.account_alias != account_alias:
+            raise falcon.HTTPConflict(
+                title="Session parameter mismatch",
+                description="The existing onboarding session was started with a different account alias.",
+            )
+        if session.chosen_profile_code and session.chosen_profile_code != option["code"]:
+            raise falcon.HTTPConflict(
+                title="Session parameter mismatch",
+                description="The existing onboarding session uses a different witness profile.",
+            )
+        if session.region_id and session.region_id != region_id:
+            raise falcon.HTTPConflict(
+                title="Session parameter mismatch",
+                description="The existing onboarding session uses a different region.",
+            )
+        if session.watcher_required != watcher_required:
+            raise falcon.HTTPConflict(
+                title="Session parameter mismatch",
+                description="The existing onboarding session uses a different watcher requirement.",
+            )
+        return session
+
+
+def _payload(serder) -> dict[str, Any]:
+    payload = serder.ked.get("a", {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _optional_str(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key, "")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _required_str(payload: dict[str, Any], key: str) -> str:
+    value = _optional_str(payload, key)
+    if value:
+        return value
+    raise falcon.HTTPBadRequest(
+        title="Invalid request payload",
+        description=f"{key} is required.",
+    )
+
+
+def _watcher_status_label(status: Any) -> str:
+    if not isinstance(status, dict):
+        return ""
+    if "status" in status and status.get("status"):
+        return str(status.get("status"))
+
+    summary = status.get("summary", {})
+    if not isinstance(summary, dict):
+        return ""
+
+    total = int(summary.get("total_witnesses", 0) or 0)
+    responsive = int(summary.get("responsive_witnesses", 0) or 0)
+    if total <= 0:
+        return "created"
+    if responsive >= total:
+        return "connected"
+    return "query_pending"
+
+
+def _boot_error(exc: BootError) -> falcon.HTTPError:
+    if exc.status_code == 400:
+        return falcon.HTTPBadRequest(
+            title="Boot API rejected request",
+            description=str(exc),
+        )
+    if exc.status_code == 404:
+        return falcon.HTTPNotFound(
+            title="Upstream resource not found",
+            description=str(exc),
+        )
+    if exc.status_code == 409:
+        return falcon.HTTPConflict(
+            title="Boot API conflict",
+            description=str(exc),
+        )
+    return falcon.HTTPBadGateway(
+        title="Boot API call failed",
+        description=str(exc),
+    )
