@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import requests
+try:
+    import requests
+except ImportError:  # pragma: no cover - exercised only in thin local test envs
+    requests = None
 
 
 class BootError(RuntimeError):
@@ -18,17 +21,27 @@ class BootClient:
     base_url: str
     timeout: int = 10
 
+    def allocate_witness(self, account_aid: str) -> dict:
+        """Allocate a hosted witness for the permanent account AID."""
+
+        return self._json("POST", "/witnesses", json={"aid": account_aid})
+
     def create_witness(self, cid: str) -> dict:
-        return self._json("POST", "/witnesses", json={"aid": cid})
+        return self.allocate_witness(cid)
 
     def delete_witness(self, eid: str) -> None:
         self._empty("DELETE", f"/witnesses/{eid}")
 
-    def create_watcher(self, cid: str, oobi: str | None = None) -> dict:
-        payload = {"aid": cid}
+    def allocate_watcher(self, account_aid: str, oobi: str | None = None) -> dict:
+        """Allocate a hosted watcher for the permanent account AID."""
+
+        payload = {"aid": account_aid}
         if oobi:
             payload["oobi"] = oobi
         return self._json("POST", "/watchers", json=payload)
+
+    def create_watcher(self, cid: str, oobi: str | None = None) -> dict:
+        return self.allocate_watcher(cid, oobi=oobi)
 
     def delete_watcher(self, eid: str) -> None:
         self._empty("DELETE", f"/watchers/{eid}")
@@ -51,7 +64,9 @@ class BootClient:
 
     def _request(
         self, method: str, path: str, json: dict | None = None
-    ) -> requests.Response:
+    ):
+        if requests is None:
+            raise BootError("requests is required to call the downstream boot API")
         url = f"{self.base_url}{path}"
         try:
             response = requests.request(
