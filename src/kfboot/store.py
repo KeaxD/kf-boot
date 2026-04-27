@@ -154,11 +154,23 @@ class Store:
                 latest = record
         return latest
 
+    def list_sessions_for_account(self, account_aid: str) -> list[SessionRecord]:
+        rows = []
+        for _, record in self.baser.sessions.getTopItemIter(keys=()):
+            if record.account_aid != account_aid:
+                continue
+            rows.append(record)
+        rows.sort(key=lambda record: _sort_value(record.created_at), reverse=True)
+        return rows
+
     def save_account(self, record: AccountRecord) -> None:
         self.baser.accounts.pin(keys=(record.account_aid,), val=record)
 
     def get_account(self, account_aid: str) -> AccountRecord | None:
         return self.baser.accounts.get(keys=(account_aid,))
+
+    def delete_account(self, account_aid: str) -> None:
+        self.baser.accounts.rem(keys=(account_aid,))
 
     def list_accounts(self) -> list[AccountRecord]:
         return [record for _, record in self.baser.accounts.getTopItemIter(keys=())]
@@ -180,6 +192,15 @@ class Store:
             val=BindingRecord(principal=principal, cid=cid),
         )
 
+    def delete_bindings_for_principal(self, principal: str) -> None:
+        matches = [
+            keys
+            for keys, _record in self.baser.bindings.getTopItemIter(keys=())
+            if keys and keys[0] == principal
+        ]
+        for keys in matches:
+            self.baser.bindings.rem(keys=keys)
+
     def add_resource(self, record: ResourceRecord) -> None:
         self.baser.resources.pin(keys=(record.kind, record.eid), val=record)
 
@@ -199,6 +220,9 @@ class Store:
 
     def delete_resource(self, kind: str, eid: str) -> None:
         self.baser.resources.rem(keys=(kind, eid))
+
+    def delete_session(self, session_id: str) -> None:
+        self.baser.sessions.rem(keys=(session_id,))
 
     def count_resources(self, kind: str) -> int:
         return sum(1 for _, _ in self.baser.resources.getTopItemIter(keys=(kind,), topive=True))

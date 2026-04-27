@@ -2,8 +2,8 @@
 
 `kf-boot` is the KERI Foundation boot service for hosted witness and watcher onboarding.
 
-This repository implements the frozen conference v1 contract shared with `locksmith-kf`.
-Do not reopen the contract casually. If implementation and contract drift, fix one deliberately.
+This repository implements the boot service contract shared with `locksmith`.
+Keep the implementation, README contract, and client integration aligned.
 
 # To run
 
@@ -78,7 +78,7 @@ All authenticated business routes use:
 - KRAM
 - signed KERI `exn` request/reply exchanges
 
-Conference v1 does not use ESSR.
+This service does not use ESSR.
 
 Auth principals:
 
@@ -94,11 +94,11 @@ Boot-server authentication:
 - `kf-boot` has a durable boot-server `Habery` and durable boot-server `Hab`
 - signed replies prepend the boot-server KEL
 - clients verify the service by percolated discovery
-- conference v1 does not require preinstalled boot-server inception material
+- clients do not need preinstalled boot-server inception material
 
-## Frozen Message Contract
+## Message Contract
 
-Authenticated business routes are all `exn` in conference v1.
+Authenticated business routes are signed KERI `exn` exchanges.
 
 Onboarding routes:
 
@@ -113,6 +113,7 @@ Approved-account routes:
 - `exn /account/witnesses`
 - `exn /account/watchers`
 - `exn /account/watchers/status`
+- `exn /account/delete`
 - `exn /account/witnesses/delete`
 - `exn /account/watchers/delete`
 
@@ -134,22 +135,22 @@ Business handlers run only after the request has been parsed through the KRAM-en
 
 ## Onboarding Flow
 
-1. `locksmith-kf` fetches `GET /bootstrap/config`.
-2. `locksmith-kf` creates a hidden ephemeral onboarding AID locally.
-3. `locksmith-kf` sends the ephemeral inception or keystate material to the onboarding surface.
-4. `locksmith-kf` sends authenticated `exn /onboarding/session/start`.
+1. `locksmith` fetches `GET /bootstrap/config`.
+2. `locksmith` creates a hidden ephemeral onboarding AID locally.
+3. `locksmith` sends the ephemeral inception or keystate material to the onboarding surface.
+4. `locksmith` sends authenticated `exn /onboarding/session/start`.
 5. `kf-boot` allocates the witness pool before permanent account inception.
 6. `kf-boot` creates the required hosted watcher and records the allocated resources before replying.
 7. `kf-boot` replies with a signed boot-server `exn` and prepended boot-server KEL.
-8. `locksmith-kf` creates the permanent local account AID using the returned witness list.
-9. `locksmith-kf` finishes local witness registration and resolves witness and watcher OOBIs.
-10. `locksmith-kf` sends authenticated `exn /onboarding/account/create`.
-11. `locksmith-kf` sends authenticated `exn /onboarding/complete`.
+8. `locksmith` creates the permanent local account AID using the returned witness list.
+9. `locksmith` finishes local witness registration and resolves witness and watcher OOBIs.
+10. `locksmith` sends authenticated `exn /onboarding/account/create`.
+11. `locksmith` sends authenticated `exn /onboarding/complete`.
 12. Future operations move to the approved-account surface and use the permanent account AID.
 
-## Frozen Product Rules
+## Product Rules
 
-- one vault maps to one onboarded KF account in v1
+- one vault maps to one onboarded KF account
 - the permanent account AID is always a local wallet AID
 - witness profile is `1-of-1` or `3-of-4`
 - `1-of-1` means one distinct configured witness backend
