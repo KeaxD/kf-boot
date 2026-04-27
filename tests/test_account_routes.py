@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from kfboot.basing import ACCOUNT_STATE_PENDING_ONBOARDING
+from kfboot.basing import ACCOUNT_STATE_ONBOARDED, ACCOUNT_STATE_PENDING_ONBOARDING
 from kfboot.boot_client import BootError
 
 from .support import assert_reply_frame, build_exn, post_cesr, total_witness_delete_calls
@@ -90,6 +90,106 @@ def test_approved_account_routes_return_resources_update_status_and_delete_recor
         expected = [witness_id] if backend_id == witness_record.backend_id else []
         assert boot.delete_calls == expected
     assert contract.ctx.watcher_boot.delete_calls == [watcher_id]
+
+
+def test_account_delete_route_removes_account_state_and_is_idempotent(onboarded_bundle):
+    contract = onboarded_bundle["contract"]
+    account = onboarded_bundle["account"]
+    session_id = onboarded_bundle["session_id"]
+    witness_ids = onboarded_bundle["witness_ids"]
+    watcher_id = onboarded_bundle["watcher_id"]
+    contract.ctx.store.add_binding(account.pre, "cid-to-delete")
+
+    first = post_cesr(
+        contract,
+        "/account",
+        build_exn(
+            account,
+            route="/account/delete",
+            payload={"account_aid": account.pre},
+        ),
+    )
+    _, first_reply = assert_reply_frame(contract, first, route="/account/delete")
+    assert first_reply.ked["a"]["account_aid"] == account.pre
+    assert first_reply.ked["a"]["deleted"] is True
+    assert contract.ctx.store.baser.bindings.get(keys=(account.pre, "cid-to-delete")) is None
+    assert contract.ctx.store.get_account(account.pre) is None
+    assert contract.ctx.store.get_session(session_id) is None
+    assert contract.ctx.store.get_resource("watcher", watcher_id) is None
+    for witness_id in witness_ids:
+        assert contract.ctx.store.get_resource("witness", witness_id) is None
+    assert total_witness_delete_calls(contract.ctx) == witness_ids
+    assert contract.ctx.watcher_boot.delete_calls == [watcher_id]
+
+    second = post_cesr(
+        contract,
+        "/account",
+        build_exn(
+            account,
+            route="/account/delete",
+            payload={"account_aid": account.pre},
+        ),
+    )
+    _, second_reply = assert_reply_frame(contract, second, route="/account/delete")
+    assert second_reply.ked["a"]["account_aid"] == account.pre
+    assert second_reply.ked["a"]["deleted"] is True
+    assert contract.ctx.store.get_account(account.pre) is None
+    assert contract.ctx.store.get_session(session_id) is None
+    assert total_witness_delete_calls(contract.ctx) == witness_ids
+    assert contract.ctx.watcher_boot.delete_calls == [watcher_id]
+
+
+def test_account_delete_failure_keeps_remaining_state_retryable(onboarded_bundle):
+    contract = onboarded_bundle["contract"]
+    account = onboarded_bundle["account"]
+    session_id = onboarded_bundle["session_id"]
+    witness_id = onboarded_bundle["witness_ids"][0]
+    watcher_id = onboarded_bundle["watcher_id"]
+    witness_record = contract.ctx.store.get_resource("witness", witness_id)
+    witness_boot = contract.ctx.witness_boots[witness_record.backend_id]
+    witness_boot.delete_error = BootError("simulated witness delete failure", status_code=503)
+
+    failed = post_cesr(
+        contract,
+        "/account",
+        build_exn(
+            account,
+            route="/account/delete",
+            payload={"account_aid": account.pre},
+        ),
+    )
+
+    assert failed.status_code == 502
+    assert failed.json["title"] == "Boot API call failed"
+    account_record = contract.ctx.store.get_account(account.pre)
+    assert account_record is not None
+    assert account_record.status == ACCOUNT_STATE_ONBOARDED
+    assert account_record.watcher_eid == ""
+    assert account_record.witness_eids == [witness_id]
+    assert contract.ctx.store.get_session(session_id) is not None
+    assert contract.ctx.store.get_resource("watcher", watcher_id) is None
+    assert contract.ctx.store.get_resource("witness", witness_id) is not None
+    assert contract.ctx.watcher_boot.delete_calls == [watcher_id]
+    assert witness_boot.delete_calls == [witness_id]
+
+    witness_boot.delete_error = None
+    retry = post_cesr(
+        contract,
+        "/account",
+        build_exn(
+            account,
+            route="/account/delete",
+            payload={"account_aid": account.pre},
+        ),
+    )
+
+    _, retry_reply = assert_reply_frame(contract, retry, route="/account/delete")
+    assert retry_reply.ked["a"]["deleted"] is True
+    assert contract.ctx.store.get_account(account.pre) is None
+    assert contract.ctx.store.get_session(session_id) is None
+    assert contract.ctx.store.get_resource("witness", witness_id) is None
+    assert contract.ctx.watcher_boot.delete_calls == [watcher_id]
+    assert witness_boot.delete_calls == [witness_id, witness_id]
 
 
 @pytest.mark.parametrize(
@@ -255,6 +355,7 @@ def test_account_witnesses_route_tolerates_legacy_resource_rows(onboarded_bundle
     [
         ("/account/witnesses", lambda bundle: {"account_aid": bundle["account"].pre}),
         ("/account/watchers", lambda bundle: {"account_aid": bundle["account"].pre}),
+        ("/account/delete", lambda bundle: {"account_aid": bundle["account"].pre}),
         (
             "/account/watchers/status",
             lambda bundle: {"account_aid": bundle["account"].pre, "watcher_id": bundle["watcher_id"]},
@@ -289,6 +390,7 @@ def test_approved_account_routes_require_an_onboarded_account(pending_account_bu
     [
         ("/account/witnesses", {"account_aid": "different-account"}),
         ("/account/watchers", {"account_aid": "different-account"}),
+        ("/account/delete", {"account_aid": "different-account"}),
         (
             "/account/watchers/status",
             {"account_aid": "different-account", "watcher_id": "ignored"},

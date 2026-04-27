@@ -42,6 +42,7 @@ ACCOUNT_ROUTES = {
     "/account/witnesses",
     "/account/watchers",
     "/account/watchers/status",
+    "/account/delete",
     "/account/witnesses/delete",
     "/account/watchers/delete",
 }
@@ -86,7 +87,7 @@ class SessionStartHandler(RouteHandler):
         if self.exchanger.ctx.config.bootstrap_watcher_required and not watcher_required:
             raise falcon.HTTPBadRequest(
                 title="Watcher required",
-                description="Conference v1 requires one hosted watcher per onboarded account.",
+                description="This boot service requires one hosted watcher per onboarded account.",
             )
 
         account = self.exchanger.ctx.store.get_account(account_aid)
@@ -270,7 +271,7 @@ class CompleteHandler(RouteHandler):
             )
             raise falcon.HTTPConflict(
                 title="Watcher missing",
-                description="Conference v1 requires one hosted watcher before onboarding completes.",
+                description="This boot service requires one hosted watcher before onboarding completes.",
             )
 
         session.state = SESSION_STATE_COMPLETED
@@ -431,6 +432,38 @@ class AccountWatcherDeleteHandler(RouteHandler):
         )
 
 
+class AccountDeleteHandler(RouteHandler):
+    resource = "/account/delete"
+
+    def handle(self, serder, **kwa):
+        sender = serder.pre
+        payload = _payload(serder)
+        account_aid = _optional_str(payload, "account_aid") or sender
+        if account_aid != sender:
+            raise falcon.HTTPUnauthorized(
+                title="Account principal mismatch",
+                description="The authenticated sender must match account_aid.",
+            )
+
+        account = self.exchanger.ctx.store.get_account(sender)
+        if account is not None and account.status != ACCOUNT_STATE_ONBOARDED:
+            raise falcon.HTTPConflict(
+                title="Account not onboarded",
+                description="Approved-account routes require an onboarded account principal.",
+            )
+
+        try:
+            self.exchanger.delete_account(account_aid=sender, account=account)
+        except BootError as exc:
+            raise _boot_error(exc)
+
+        self.exchanger.queue_reply(
+            self.resource,
+            sender,
+            {"account_aid": sender, "deleted": True},
+        )
+
+
 class BootExchanger(Exchanger):
     def __init__(self, ctx: BootContext):
         super().__init__(hby=ctx.habery, handlers=[])
@@ -449,6 +482,7 @@ class BootExchanger(Exchanger):
             AccountWitnessesHandler(self),
             AccountWatchersHandler(self),
             AccountWatcherStatusHandler(self),
+            AccountDeleteHandler(self),
             AccountWitnessDeleteHandler(self),
             AccountWatcherDeleteHandler(self),
         ):
@@ -862,6 +896,101 @@ class BootExchanger(Exchanger):
             detail = "; ".join(str(error) for error in errors)
             raise BootError(detail, status_code=first.status_code)
 
+    def delete_account(self, *, account_aid: str, account=None) -> None:
+        sessions = self.ctx.store.list_sessions_for_account(account_aid)
+        errors: list[BootError] = []
+
+        for watcher_id in self._collect_account_resource_ids(
+            kind="watcher",
+            account_aid=account_aid,
+            account=account,
+            sessions=sessions,
+        ):
+            try:
+                self._delete_hosted_resource(
+                    kind="watcher",
+                    eid=watcher_id,
+                    account=account,
+                    tolerate_missing_remote=True,
+                )
+            except BootError as exc:
+                errors.append(exc)
+
+        for witness_id in self._collect_account_resource_ids(
+            kind="witness",
+            account_aid=account_aid,
+            account=account,
+            sessions=sessions,
+        ):
+            try:
+                self._delete_hosted_resource(
+                    kind="witness",
+                    eid=witness_id,
+                    account=account,
+                    tolerate_missing_remote=True,
+                )
+            except BootError as exc:
+                errors.append(exc)
+
+        if errors:
+            first = errors[0]
+            detail = "; ".join(str(error) for error in errors)
+            raise BootError(detail, status_code=first.status_code)
+
+        self.ctx.store.delete_bindings_for_principal(account_aid)
+        self.ctx.store.delete_account(account_aid)
+        for session in sessions:
+            self.ctx.store.delete_session(session.session_id)
+
+    def _collect_account_resource_ids(
+        self,
+        *,
+        kind: str,
+        account_aid: str,
+        account=None,
+        sessions: list[SessionRecord] | None = None,
+    ) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        sessions = sessions or []
+
+        candidates: list[str] = []
+        if kind == "witness":
+            if account is not None:
+                candidates.extend(account.witness_eids)
+            for session in sessions:
+                candidates.extend(session.witness_eids)
+        else:
+            if account is not None and account.watcher_eid:
+                candidates.append(account.watcher_eid)
+            for session in sessions:
+                if session.watcher_eid:
+                    candidates.append(session.watcher_eid)
+
+        candidates.extend(
+            record.eid
+            for record in self.ctx.store.list_resources_for_account(
+                kind=kind,
+                account_aid=account_aid,
+            )
+        )
+        for session in sessions:
+            candidates.extend(
+                record.eid
+                for record in self.ctx.store.list_resources_for_session(
+                    kind=kind,
+                    session_id=session.session_id,
+                )
+            )
+
+        for eid in candidates:
+            if not eid or eid in seen:
+                continue
+            seen.add(eid)
+            ordered.append(eid)
+
+        return ordered
+
     def _collect_session_resource_ids(self, *, kind: str, session: SessionRecord, account=None) -> list[str]:
         ordered: list[str] = []
         seen: set[str] = set()
@@ -906,14 +1035,21 @@ class BootExchanger(Exchanger):
             return
 
         record = self.ctx.store.get_resource(kind, eid)
-        if kind == "witness":
-            if record is None:
-                if session is not None:
+        if record is None:
+            if session is not None:
+                if kind == "witness":
                     session.witness_eids = [item for item in session.witness_eids if item != eid]
-                if account is not None:
+                elif session.watcher_eid == eid:
+                    session.watcher_eid = ""
+            if account is not None:
+                if kind == "witness":
                     account.witness_eids = [item for item in account.witness_eids if item != eid]
-                self._persist_owner_state(session=session, account=account)
-                return
+                elif account.watcher_eid == eid:
+                    account.watcher_eid = ""
+            self._persist_owner_state(session=session, account=account)
+            return
+
+        if kind == "witness":
             delete_remote = self._witness_client_for_record(record).delete_witness
         else:
             delete_remote = self.ctx.watcher_boot.delete_watcher
