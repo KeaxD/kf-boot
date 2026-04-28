@@ -7,6 +7,8 @@ from keri.app import habbing
 from kfboot.basing import (
     ACCOUNT_STATE_FAILED,
     ACCOUNT_STATE_ONBOARDED,
+    ACCOUNT_STATE_PAUSED,
+    ACCOUNT_STATE_EXPIRED,
     ACCOUNT_STATE_PENDING_ONBOARDING,
     SESSION_STATE_ACCOUNT_CREATED,
     SESSION_STATE_CANCELLED,
@@ -617,6 +619,105 @@ def test_session_start_rejects_account_alias_over_limit(contract_factory):
     assert response.status_code == 429
     assert response.json["title"] == "Account alias limit exceeded"
     assert "configured limit for tier 'trial' is 1" in response.json["description"]
+
+
+def test_session_start_rejects_alias_when_existing_account_is_pending(contract_factory):
+    """Verify onboarding rejects a new session when the alias already has an account pending onboarding."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=1,
+                max_requests_per_minute=100,
+                kel_budget=100,
+                kel_window_seconds=300,
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="alias-pending-ephemeral-1", temp=True, transferable=False) as (_, ephemeral1),
+        habbing.openHab(name="alias-pending-account-1", temp=True) as (_, account1),
+        habbing.openHab(name="alias-pending-ephemeral-2", temp=True, transferable=False) as (_, ephemeral2),
+    ):
+        # Don't complete the session to leave the account in pending onboarding status
+        register_aid(contract, "/onboarding", ephemeral1)
+        register_aid(contract, "/account", account1)
+
+        _, _, start_reply = start_session(
+            contract,
+            ephemeral1,
+            account_aid=account1.pre,
+            account_alias="alpha",
+        )
+        
+        create_account(contract, ephemeral1, start_reply, account_aid=account1.pre)
+
+        # Register and start a session with a different ephemeral but the same alias
+        register_aid(contract, "/onboarding", ephemeral2)
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(
+                ephemeral2,
+                route="/onboarding/session/start",
+                payload=start_payload(account_aid="AID_SECOND", account_alias="alpha"),
+            ),
+        )
+    # Assert the second session is rejected due to the alias already having an account pending onboarding
+    assert response.status_code == 429
+    assert response.json["title"] == "Account alias limit exceeded"
+    assert "configured limit for tier 'trial' is 1" in response.json["description"]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_reason"),
+    [
+        (ACCOUNT_STATE_PAUSED, "paused"),
+        (ACCOUNT_STATE_EXPIRED, "expired"),
+    ],
+)
+def test_account_create_rejects_paused_or_expired_permanent_account(contract_factory, status, expected_reason):
+    """Verify that onboarding rejects account creation when the account is paused or expired."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+    )
+
+    with (
+        habbing.openHab(name=f"{status}-account-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name=f"{status}-account", temp=True) as (_, account),
+    ):
+        # Onboard the account and then manually set it to the desired status
+        register_aid(contract, "/onboarding", ephemeral)
+        register_aid(contract, "/account", account)
+
+        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
+        create_account(contract, ephemeral, start_reply, account_aid=account.pre)
+
+        record = contract.ctx.store.get_account(account.pre)
+        assert record is not None
+
+        # Set the account status to paused/expired 
+        record.status = status
+        contract.ctx.store.save_account(record)
+
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(
+                ephemeral,
+                route="/onboarding/account/create",
+                payload=account_create_payload(start_reply, account.pre),
+            ),
+        )
+    # Assert the account creation is rejected
+    assert response.status_code == 409
+    assert response.json["title"] == "Account not available"
+    assert expected_reason in response.json["description"]
 
 
 def test_account_request_rate_soft_warning_thresholds_before_hard_limit(contract_factory, monkeypatch):

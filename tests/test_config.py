@@ -84,6 +84,83 @@ def test_config_from_env_parses_account_profiles(monkeypatch):
     assert config.account_profile("missing") is None
 
 
+def test_config_from_env_rejects_malformed_account_profiles(monkeypatch):
+    """Tests that malformed account profile entries are rejected with a clear error message."""
+    monkeypatch.setenv(
+        "KF_BOOT_WITNESS_BACKENDS",
+        "wit-1|http://127.0.0.1:5631|https://boot.example.com:5632",
+    )
+    monkeypatch.setenv("KF_BOOT_ACCOUNT_PROFILES", "trial|1-of-1|10|5|4")
+    monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
+    monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example")
+
+    # The entry is missing the kel_window_seconds field
+    with pytest.raises(ValueError, match="KF_BOOT_ACCOUNT_PROFILES entries must be formatted"):
+        Config.from_env()
+
+
+def test_config_from_env_rejects_duplicate_account_profile_codes(monkeypatch):
+    """Tests that duplicate account profile codes are rejected with a clear error message."""
+    monkeypatch.setenv(
+        "KF_BOOT_WITNESS_BACKENDS",
+        "wit-1|http://127.0.0.1:5631|https://boot.example.com:5632",
+    )
+    monkeypatch.setenv(
+        "KF_BOOT_ACCOUNT_PROFILES",
+        "trial|1-of-1|10|5|4|30,org|1-of-1|20|50|100|300",
+    )
+    monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
+    monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example")
+    
+    # The profile code "1-of-1" is duplicated in both entries
+    with pytest.raises(ValueError, match="Duplicate account profile code"):
+        Config.from_env()
+
+
+def test_config_from_env_generates_default_account_profiles_when_not_configured(monkeypatch):
+    """Tests that default account profiles are generated based on supported bootstrap options when no explicit profiles are provided"""
+    monkeypatch.setenv(
+        "KF_BOOT_WITNESS_BACKENDS",
+        (
+            "wit-1|http://127.0.0.1:5631|https://boot.example.com:5632,"
+            "wit-2|http://127.0.0.1:5641|https://boot.example.com:5642,"
+            "wit-3|http://127.0.0.1:5651|https://boot.example.com:5652,"
+            "wit-4|http://127.0.0.1:5661|https://boot.example.com:5662"
+        ),
+    )
+    monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
+    monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example")
+
+    config = Config.from_env()
+
+    assert [profile.code for profile in config.account_profiles] == ["1-of-1", "3-of-4"]
+    assert config.account_profile("1-of-1").tier == "trial"
+    assert config.account_profile("1-of-1").max_accounts == 1
+    assert config.account_profile("1-of-1").max_requests_per_minute == 30
+    assert config.account_profile("1-of-1").kel_budget == 100
+    assert config.account_profile("3-of-4").tier == "org"
+    assert config.account_profile("3-of-4").max_accounts == 3
+    assert config.account_profile("3-of-4").kel_budget == 200
+
+
+def test_config_from_env_rejects_account_profile_code_not_supported_by_witness_backends(monkeypatch):
+    """Tests that account profile codes that are not supported by witness backends are rejected"""
+    monkeypatch.setenv(
+        "KF_BOOT_WITNESS_BACKENDS",
+        "wit-1|http://127.0.0.1:5631|https://boot.example.com:5632",
+    )
+    monkeypatch.setenv(
+        "KF_BOOT_ACCOUNT_PROFILES",
+        "org|3-of-4|2|10|100|300",
+    )
+    monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
+    monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example")
+
+    # The code "3-of-4" is not supported because there is only 1 witness backend configured
+    with pytest.raises(ValueError, match="Account profile code '3-of-4' is not supported"):
+        Config.from_env()
+
+
 def test_config_from_env_rejects_malformed_witness_backend_entry(monkeypatch):
     monkeypatch.setenv("KF_BOOT_WITNESS_BACKENDS", "wit-1|http://127.0.0.1:5631")
 

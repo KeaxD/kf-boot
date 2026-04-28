@@ -197,6 +197,18 @@ class Store:
         rows.sort(key=lambda record: _sort_value(record.created_at), reverse=True)
         return rows
 
+    def list_active_sessions_for_alias(self, account_alias: str) -> list[SessionRecord]:
+        """Return a list of active SessionRecords matching the given account alias"""
+        rows = []
+        for _, record in self.baser.sessions.getTopItemIter(keys=()):
+            if record.state in TERMINAL_SESSION_STATES:
+                continue
+            if record.account_alias != account_alias:
+                continue
+            rows.append(record)
+        rows.sort(key=lambda record: _sort_value(record.created_at), reverse=True)
+        return rows
+
     def add_binding(self, principal: str, cid: str) -> None:
         self.baser.bindings.pin(
             keys=(principal, cid),
