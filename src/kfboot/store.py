@@ -98,6 +98,7 @@ class Store:
         watcher_required: bool,
         witness_count: int,
         toad: int,
+        account_tier: str,
     ) -> SessionRecord:
         created_at = now_iso()
         expires_at = (_parse_dt(created_at) + timedelta(seconds=self.session_ttl_seconds)).isoformat()
@@ -117,6 +118,7 @@ class Store:
             region_name=region_name,
             witness_count=witness_count,
             toad=toad,
+            account_tier=account_tier,
         )
         self.save_session(record)
         return record
@@ -174,6 +176,15 @@ class Store:
 
     def list_accounts(self) -> list[AccountRecord]:
         return [record for _, record in self.baser.accounts.getTopItemIter(keys=())]
+
+    def list_accounts_for_alias(self, account_alias: str) -> list[AccountRecord]:
+        """Return a list of AccountRecords matching the given account alias"""
+        rows: list[AccountRecord] = []
+        for _, record in self.baser.accounts.getTopItemIter(keys=()):
+            if record.account_alias == account_alias:
+                rows.append(record)
+        rows.sort(key=lambda record: _sort_value(record.created_at), reverse=True)
+        return rows
 
     def list_active_sessions_for_ip(self, client_ip: str) -> list[SessionRecord]:
         rows = []
@@ -264,6 +275,7 @@ class Store:
             "ephemeral_aid": session.ephemeral_aid,
             "account_aid": session.account_aid,
             "account_alias": session.account_alias,
+            "account_tier": session.account_tier,
             "state": session.state,
             "created_at": session.created_at,
             "updated_at": session.updated_at,
@@ -283,9 +295,12 @@ class Store:
         return {
             "account_aid": account.account_aid,
             "account_alias": account.account_alias,
+            "tier": account.tier,
             "status": account.status,
             "created_at": account.created_at,
             "onboarded_at": account.onboarded_at,
+            "expires_at": account.expires_at,
+            "pause_reason": account.pause_reason,
             "witness_profile_code": account.witness_profile_code,
             "witness_count": account.witness_count,
             "toad": account.toad,
@@ -311,6 +326,8 @@ class Store:
         session_id: str,
         witness_eids: list[str],
         watcher_eid: str,
+        tier: str = "",
+        expires_at: str = "",
         onboarded: bool = False,
     ) -> AccountRecord:
         created_at = now_iso()
@@ -329,6 +346,8 @@ class Store:
             session_id=session_id,
             witness_eids=list(witness_eids),
             watcher_eid=watcher_eid,
+            tier=tier,
+            expires_at=expires_at,
         )
 
 

@@ -51,6 +51,7 @@ class CesrSurfaceEnd:
 
         self.ctx.exchanger.set_client_ip(req.remote_addr or "")
         self.ctx.exchanger.expire_sessions()
+        self.ctx.exchanger.expire_accounts()
         self.ctx.exchanger.clear_replies()
 
         try:

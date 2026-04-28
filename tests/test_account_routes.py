@@ -3,11 +3,28 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import kfboot.boot_exchanger as boot_exchanger
+from keri.app import habbing
 
-from kfboot.basing import ACCOUNT_STATE_ONBOARDED, ACCOUNT_STATE_PENDING_ONBOARDING
+from kfboot.basing import (
+    ACCOUNT_STATE_EXPIRED,
+    ACCOUNT_STATE_ONBOARDED,
+    ACCOUNT_STATE_PAUSED,
+    ACCOUNT_STATE_PENDING_ONBOARDING,
+)
 from kfboot.boot_client import BootError
+from kfboot.config import AccountProfile
 
-from .support import assert_reply_frame, build_exn, post_cesr, total_witness_delete_calls
+from .support import (
+    assert_reply_frame,
+    build_exn,
+    complete_session,
+    create_account,
+    post_cesr,
+    register_aid,
+    start_session,
+    total_witness_delete_calls,
+)
 
 
 def test_approved_account_routes_return_resources_update_status_and_delete_records(onboarded_bundle):
@@ -488,3 +505,173 @@ def test_account_routes_map_downstream_boot_errors_to_http_statuses(
 
     assert response.status_code == expected_status
     assert response.json["title"] == expected_title
+
+
+def test_account_witnesses_route_enforces_kel_budget(contract_factory):
+    """Verify that account routes are rejected once the account KEL budget is exceeded."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=10,
+        bootstrap_aids_per_ip=10,
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=1,
+                max_requests_per_minute=100,
+                kel_budget=4,
+                kel_window_seconds=300,
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="kel-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name="kel-account", temp=True) as (_, account),
+    ):
+        register_aid(contract, "/onboarding", ephemeral)
+        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
+        create_account(contract, ephemeral, start_reply, account_aid=account.pre)
+        register_aid(contract, "/account", account)
+        _, _, _ = complete_session(
+            contract,
+            ephemeral,
+            session_id=start_reply.ked["a"]["session_id"],
+            account_aid=account.pre,
+        )
+
+        response = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+        assert response.status_code == 200
+
+        response = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+        assert response.status_code == 429
+        assert response.json["title"] == "Account key event budget exceeded"
+
+
+def test_account_route_request_rate_soft_warnings_before_hard_limit(contract_factory, monkeypatch):
+    """Verify account routes emit soft request-rate warnings before the hard limit rejects requests."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=1,
+                max_requests_per_minute=10,
+                kel_budget=100,
+                kel_window_seconds=300,
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="rate-warning-account-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name="rate-warning-account", temp=True) as (_, account),
+    ):
+        register_aid(contract, "/onboarding", ephemeral)
+        register_aid(contract, "/account", account)
+
+        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
+        create_account(contract, ephemeral, start_reply, account_aid=account.pre)
+        _, _, _ = complete_session(
+            contract,
+            ephemeral,
+            session_id=start_reply.ked["a"]["session_id"],
+            account_aid=account.pre,
+        )
+
+        info_calls: list[str] = []
+        warning_calls: list[str] = []
+        monkeypatch.setattr(
+            boot_exchanger.logger,
+            "info",
+            lambda message, **kwargs: info_calls.append(message),
+        )
+        monkeypatch.setattr(
+            boot_exchanger.logger,
+            "warning",
+            lambda message, **kwargs: warning_calls.append(message),
+        )
+
+        for _ in range(5):
+            response = post_cesr(
+                contract,
+                "/account",
+                build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+            )
+            assert response.status_code == 200
+
+        # The next request should hit the soft-warning threshold (9/10 total requests)
+        response = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+        assert response.status_code == 200
+        assert "approaching_request_rate_limit" in info_calls
+
+        # The following request should hit the high-warning threshold (10/10 total requests)
+        response = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+        assert response.status_code == 200
+        assert "high_request_rate" in warning_calls
+
+        response = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+
+    assert response.status_code == 429
+    assert response.json["title"] == "Account request rate limit exceeded"
+
+
+def test_expire_accounts_transitions_onboarded_account_to_expired(onboarded_bundle):
+    """Ensure onboarded accounts are moved to expired status when their expiry date passes."""
+    contract = onboarded_bundle["contract"]
+    account = onboarded_bundle["account"]
+    record = contract.ctx.store.get_account(account.pre)
+    record.expires_at = "2000-01-01T00:00:00+00:00"
+    contract.ctx.store.save_account(record)
+
+    contract.ctx.exchanger.expire_accounts()
+
+    updated = contract.ctx.store.get_account(account.pre)
+    assert updated is not None
+    assert updated.status == ACCOUNT_STATE_EXPIRED
+
+
+@pytest.mark.parametrize(
+    ("status", "title"),
+    [
+        (ACCOUNT_STATE_PAUSED, "Account paused"),
+        (ACCOUNT_STATE_EXPIRED, "Account expired"),
+    ],
+)
+def test_account_routes_reject_paused_or_expired_accounts(onboarded_bundle, status, title):
+    """Ensure paused or expired accounts cannot use account routes."""
+    contract = onboarded_bundle["contract"]
+    account = onboarded_bundle["account"]
+    record = contract.ctx.store.get_account(account.pre)
+    record.status = status
+    contract.ctx.store.save_account(record)
+
+    response = post_cesr(
+        contract,
+        "/account",
+        build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+    )
+
+    assert response.status_code == 409
+    assert response.json["title"] == title

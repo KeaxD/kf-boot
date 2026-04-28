@@ -60,6 +60,30 @@ def test_config_from_env_parses_witness_backend_pool(monkeypatch):
     assert config.bootstrap_account_options == ("1-of-1", "3-of-4")
 
 
+def test_config_from_env_parses_account_profiles(monkeypatch):
+    monkeypatch.setenv(
+        "KF_BOOT_WITNESS_BACKENDS",
+        "wit-1|http://127.0.0.1:5631|https://boot.example.com:5632",
+    )
+    monkeypatch.setenv(
+        "KF_BOOT_ACCOUNT_PROFILES",
+        "trial|1-of-1|10|5|4|30",
+    )
+
+    monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
+    monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example")
+
+    config = Config.from_env()
+
+    assert [profile.code for profile in config.account_profiles] == ["1-of-1"]
+    assert config.account_profile("1-of-1").tier == "trial"
+    assert config.account_profile("1-of-1").max_accounts == 10
+    assert config.account_profile("1-of-1").max_requests_per_minute == 5
+    assert config.account_profile("1-of-1").kel_budget == 4
+    assert config.account_profile("1-of-1").kel_window_seconds == 30
+    assert config.account_profile("missing") is None
+
+
 def test_config_from_env_rejects_malformed_witness_backend_entry(monkeypatch):
     monkeypatch.setenv("KF_BOOT_WITNESS_BACKENDS", "wit-1|http://127.0.0.1:5631")
 

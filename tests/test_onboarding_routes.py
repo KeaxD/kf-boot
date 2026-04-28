@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import kfboot.boot_exchanger as boot_exchanger
 from keri.app import habbing
 
 from kfboot.basing import (
@@ -14,6 +15,7 @@ from kfboot.basing import (
     SESSION_STATE_FAILED,
     SESSION_STATE_WITNESS_POOL_ALLOCATED,
 )
+from kfboot.config import AccountProfile
 from .support import (
     FakeWatcherBoot,
     account_create_payload,
@@ -539,6 +541,224 @@ def test_session_start_enforces_per_ip_onboarding_principal_limit(contract_facto
     assert response.json["title"] == "Per-IP onboarding principal limit exceeded"
 
 
+def test_session_start_enforces_account_request_rate_limit(contract_factory):
+    """Verify that onboarding session-start requests are throttled per account tier."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=10,
+        bootstrap_aids_per_ip=10,
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=1,
+                max_requests_per_minute=2,
+                kel_budget=100,
+                kel_window_seconds=300,
+            ),
+        ),
+    )
+
+    with habbing.openHab(name="rate-limit-ephemeral", temp=True, transferable=False) as (_, ephemeral):
+        register_aid(contract, "/onboarding", ephemeral)
+        start_session(contract, ephemeral)
+        start_session(contract, ephemeral)
+
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+        )
+
+    assert response.status_code == 429
+    assert response.json["title"] == "Account request rate limit exceeded"
+
+
+def test_session_start_rejects_account_alias_over_limit(contract_factory):
+    """Verify onboarding rejects a new session when the alias already has the max onboarded accounts."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=1,
+                max_requests_per_minute=100,
+                kel_budget=100,
+                kel_window_seconds=300,
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="alias-limit-ephemeral-1", temp=True, transferable=False) as (_, ephemeral1),
+        habbing.openHab(name="alias-limit-account-1", temp=True) as (_, account1),
+        habbing.openHab(name="alias-limit-ephemeral-2", temp=True, transferable=False) as (_, ephemeral2),
+    ):
+        register_aid(contract, "/onboarding", ephemeral1)
+        register_aid(contract, "/account", account1)
+
+        _, _, start_reply = start_session(contract, ephemeral1, account_aid=account1.pre)
+        create_account(contract, ephemeral1, start_reply, account_aid=account1.pre)
+        _, _, _ = complete_session(
+            contract,
+            ephemeral1,
+            session_id=start_reply.ked["a"]["session_id"],
+            account_aid=account1.pre,
+        )
+
+        register_aid(contract, "/onboarding", ephemeral2)
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral2, route="/onboarding/session/start", payload=start_payload(account_aid="AID_SECOND", account_alias="alpha")),
+        )
+
+    assert response.status_code == 429
+    assert response.json["title"] == "Account alias limit exceeded"
+    assert "configured limit for tier 'trial' is 1" in response.json["description"]
+
+
+def test_account_request_rate_soft_warning_thresholds_before_hard_limit(contract_factory, monkeypatch):
+    """Verify request-rate soft warnings are logged before the hard throttle is applied."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=1,
+                max_requests_per_minute=10,
+                kel_budget=100,
+                kel_window_seconds=300,
+            ),
+        ),
+    )
+
+    with habbing.openHab(name="rate-warning-ephemeral", temp=True, transferable=False) as (_, ephemeral):
+        register_aid(contract, "/onboarding", ephemeral)
+
+        info_calls: list[str] = []
+        warning_calls: list[str] = []
+        monkeypatch.setattr(
+            boot_exchanger.logger,
+            "info",
+            lambda message, **kwargs: info_calls.append(message),
+        )
+        monkeypatch.setattr(
+            boot_exchanger.logger,
+            "warning",
+            lambda message, **kwargs: warning_calls.append(message),
+        )
+
+        for _ in range(9):
+            start_session(contract, ephemeral)
+
+        assert "approaching_request_rate_limit" in info_calls
+
+        start_session(contract, ephemeral)
+        assert "high_request_rate" in warning_calls
+
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+        )
+
+    assert response.status_code == 429
+    assert response.json["title"] == "Account request rate limit exceeded"
+
+
+def test_account_kel_budget_soft_warning_thresholds_before_hard_limit(contract_factory, monkeypatch):
+    """Verify KEL budget soft warnings are logged before the final budget exhaustion."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=1,
+                max_requests_per_minute=100,
+                kel_budget=10,
+                kel_window_seconds=300,
+            ),
+        ),
+    )
+
+    with habbing.openHab(name="kel-warning-ephemeral", temp=True, transferable=False) as (_, ephemeral):
+        register_aid(contract, "/onboarding", ephemeral)
+
+        info_calls: list[str] = []
+        warning_calls: list[str] = []
+        monkeypatch.setattr(
+            boot_exchanger.logger,
+            "info",
+            lambda message, **kwargs: info_calls.append(message),
+        )
+        monkeypatch.setattr(
+            boot_exchanger.logger,
+            "warning",
+            lambda message, **kwargs: warning_calls.append(message),
+        )
+
+        for _ in range(9):
+            start_session(contract, ephemeral)
+
+        assert "approaching_kel_budget" in info_calls
+
+        start_session(contract, ephemeral)
+        assert "high_kel_usage" in warning_calls
+
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+        )
+
+    assert response.status_code == 429
+    assert response.json["title"] == "Account key event budget exceeded"
+
+
+def test_expire_sessions_cleans_up_stale_staging_allocations(contract_factory, monkeypatch):
+    """Ensure expired staging sessions trigger cleanup of stale allocations."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+    )
+
+    session = contract.ctx.store.create_session(
+        ephemeral_aid="E-STALE",
+        account_aid="AID_STALE",
+        account_alias="alpha",
+        chosen_profile_code="1-of-1",
+        client_ip="127.0.0.1",
+        region_id="test-region",
+        region_name="Test Region",
+        watcher_required=True,
+        witness_count=1,
+        toad=1,
+        account_tier="trial",
+    )
+    session.expires_at = "2000-01-01T00:00:00+00:00"
+    contract.ctx.store.save_session(session)
+
+    cleaned: list[tuple] = []
+
+    def fake_teardown(*, session: Any, account=None) -> None:
+        cleaned.append((session.session_id, account))
+
+    monkeypatch.setattr(contract.ctx.exchanger, "teardown_session_resources", fake_teardown)
+
+    contract.ctx.exchanger.expire_sessions()
+
+    expired_session = contract.ctx.store.get_session(session.session_id)
+    assert expired_session is not None
+    assert expired_session.state == SESSION_STATE_EXPIRED
+    assert cleaned == [(session.session_id, None)]
+
+
 def test_account_create_rejects_wrong_onboarding_principal(contract):
     with (
         habbing.openHab(name="create-mismatch-ephemeral", temp=True, transferable=False) as (_, ephemeral),
@@ -581,6 +801,7 @@ def test_account_create_marks_session_failed_when_resources_are_incomplete(contr
             watcher_required=True,
             witness_count=1,
             toad=1,
+            account_tier="trial",
         )
         register_aid(contract, "/onboarding", ephemeral)
 
@@ -663,6 +884,7 @@ def test_account_create_rejects_closed_sessions(contract, state, expected_status
             watcher_required=True,
             witness_count=1,
             toad=1,
+            account_tier="trial",
         )
         session.state = state
         if state == "failed":

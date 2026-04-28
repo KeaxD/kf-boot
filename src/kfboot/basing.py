@@ -22,6 +22,8 @@ SESSION_STATE_CANCELLED = "cancelled"
 
 ACCOUNT_STATE_PENDING_ONBOARDING = "pending_onboarding"
 ACCOUNT_STATE_ONBOARDED = "onboarded"
+ACCOUNT_STATE_PAUSED = "paused"
+ACCOUNT_STATE_EXPIRED = "expired"
 ACCOUNT_STATE_FAILED = "failed"
 
 TERMINAL_SESSION_STATES = {
@@ -79,6 +81,7 @@ class SessionRecord:
     region_name: str = ""
     witness_count: int = 0
     toad: int = 0
+    account_tier: str = ""
     failure_reason: str = ""
 
 
@@ -98,6 +101,9 @@ class AccountRecord:
     session_id: str = ""
     witness_eids: list[str] = field(default_factory=list)
     watcher_eid: str = ""
+    tier: str = ""
+    expires_at: str = ""
+    pause_reason: str = ""
 
 
 class PlatformBaser(dbing.LMDBer):

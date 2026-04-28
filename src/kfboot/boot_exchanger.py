@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from hashlib import blake2b
 from typing import Any
 
 import falcon
+from keri import help
 from keri.peer.exchanging import Exchanger
 
 from kfboot.basing import (
     ACCOUNT_STATE_ONBOARDED,
+    ACCOUNT_STATE_PAUSED,
     ACCOUNT_STATE_PENDING_ONBOARDING,
+    ACCOUNT_STATE_EXPIRED,
     SESSION_STATE_ACCOUNT_CREATED,
     SESSION_STATE_CANCELLED,
     SESSION_STATE_COMPLETED,
@@ -29,6 +33,7 @@ from kfboot.store import (
     session_failed,
 )
 
+logger = help.ogler.getLogger(__name__)
 
 ONBOARDING_ROUTES = {
     "/onboarding/session/start",
@@ -122,6 +127,8 @@ class SessionStartHandler(RouteHandler):
             self.exchanger.enforce_session_start_admission(
                 sender=sender,
                 account_aid=account_aid,
+                account_alias=alias,
+                profile=self.exchanger.ctx.config.account_profile(option["code"]),
             )
             session = self.exchanger.ctx.store.create_session(
                 ephemeral_aid=sender,
@@ -134,6 +141,7 @@ class SessionStartHandler(RouteHandler):
                 watcher_required=watcher_required,
                 witness_count=option["witness_count"],
                 toad=option["toad"],
+                account_tier=self.exchanger.ctx.config.account_profile(option["code"]).tier,
             )
 
         self.exchanger.provision_session_resources(session=session)
@@ -182,6 +190,13 @@ class AccountCreateHandler(RouteHandler):
             )
 
         account = self.exchanger.ctx.store.get_account(account_aid)
+        
+        # Check account state before attempting to create or update account records
+        if account is not None and account.status in {ACCOUNT_STATE_PAUSED, ACCOUNT_STATE_EXPIRED}:
+            raise falcon.HTTPConflict(
+                title="Account not available",
+                description="The permanent account AID is currently paused or expired and cannot be reused for onboarding.",
+            )
         if account is not None and account.session_id not in {"", session.session_id}:
             raise falcon.HTTPConflict(
                 title="Account already exists",
@@ -206,6 +221,7 @@ class AccountCreateHandler(RouteHandler):
                     session_id=session.session_id,
                     witness_eids=list(session.witness_eids),
                     watcher_eid=session.watcher_eid,
+                    tier=session.account_tier,
                     onboarded=False,
                 )
             else:
@@ -446,7 +462,13 @@ class AccountDeleteHandler(RouteHandler):
             )
 
         account = self.exchanger.ctx.store.get_account(sender)
-        if account is not None and account.status != ACCOUNT_STATE_ONBOARDED:
+        
+        # Check account state
+        if account is not None and account.status not in {
+            ACCOUNT_STATE_ONBOARDED,
+            ACCOUNT_STATE_PAUSED,
+            ACCOUNT_STATE_EXPIRED,
+        }:
             raise falcon.HTTPConflict(
                 title="Account not onboarded",
                 description="Approved-account routes require an onboarded account principal.",
@@ -472,6 +494,8 @@ class BootExchanger(Exchanger):
         self.reply_streams: list[bytes] = []
         self.client_ip = ""
         self.last_error: falcon.HTTPError | None = None
+        self._account_request_windows: dict[str, dict[str, Any]] = {}
+        self._account_kel_windows: dict[str, dict[str, Any]] = {}
 
         for handler in (
             SessionStartHandler(self),
@@ -511,6 +535,35 @@ class BootExchanger(Exchanger):
                 failed = account_failed(account)
                 if failed is not None:
                     self.ctx.store.save_account(failed)
+
+    def expire_accounts(self) -> None:
+        """ Expire accounts that have passed their expiration time, if configured. """
+        # Get the current time
+        now = datetime.now(UTC)
+
+        # Iterate through onboarded accounts 
+        for account in self.ctx.store.list_accounts():
+
+            # Only consider accounts that are onboarded and have an expiration time set
+            if account.status != ACCOUNT_STATE_ONBOARDED or not account.expires_at:
+                continue
+            try:
+                # Format the expiration time and compare to current time
+                expires_at = datetime.fromisoformat(account.expires_at)
+            except ValueError:
+                continue
+            if expires_at <= now:
+                account.status = ACCOUNT_STATE_EXPIRED
+                self.ctx.store.save_account(account)
+                logger.info(
+                    "account.expired",
+                    extra={
+                        "account_aid": account.account_aid,
+                        "tier": account.tier,
+                        "account_alias": account.account_alias,
+                        "expires_at": account.expires_at,
+                    },
+                )
 
     def take_reply(self) -> bytes | None:
         if not self.reply_streams:
@@ -585,6 +638,16 @@ class BootExchanger(Exchanger):
                 title="Account not found",
                 description="No account exists for the authenticated sender.",
             )
+        if account.status == ACCOUNT_STATE_PAUSED:
+            raise falcon.HTTPConflict(
+                title="Account paused",
+                description="This account is currently paused and cannot access approved account routes.",
+            )
+        if account.status == ACCOUNT_STATE_EXPIRED:
+            raise falcon.HTTPConflict(
+                title="Account expired",
+                description="This account has expired and must be renewed or deleted before accessing account routes.",
+            )
         if account.status != ACCOUNT_STATE_ONBOARDED:
             raise falcon.HTTPConflict(
                 title="Account not onboarded",
@@ -617,7 +680,14 @@ class BootExchanger(Exchanger):
     def refresh_session_lease(self, session: SessionRecord) -> None:
         self.ctx.store.refresh_session_lease(session)
 
-    def enforce_session_start_admission(self, *, sender: str, account_aid: str) -> None:
+    def enforce_session_start_admission(
+        self,
+        *,
+        sender: str,
+        account_aid: str,
+        account_alias: str,
+        profile: Any,
+    ) -> None:
         client_ip = (self.client_ip or "").strip()
         if not client_ip:
             return
@@ -645,6 +715,19 @@ class BootExchanger(Exchanger):
                     f"principal(s); the configured limit is {aid_limit}."
                 ),
             )
+
+        # Check account alias limits when provided
+        if profile is not None and account_alias:
+            alias_accounts = self.ctx.store.list_accounts_for_alias(account_alias)
+            onboarded = [record for record in alias_accounts if record.status == ACCOUNT_STATE_ONBOARDED]
+            if profile.max_accounts > 0 and len(onboarded) >= profile.max_accounts:
+                raise falcon.HTTPTooManyRequests(
+                    title="Account alias limit exceeded",
+                    description=(
+                        f"The account alias '{account_alias}' already has {len(onboarded)} onboarded "
+                        f"account(s); the configured limit for tier '{profile.tier}' is {profile.max_accounts}."
+                    ),
+                )
 
     def provision_session_resources(self, *, session: SessionRecord) -> None:
         if session.state in TERMINAL_SESSION_STATES:
@@ -763,10 +846,158 @@ class BootExchanger(Exchanger):
 
     def processEvent(self, serder, tsgs=None, cigars=None, ptds=None, essrs=None, **kwa):
         try:
+            # First enforce account quotas before processing the event
+            self._enforce_account_quotas(serder)
             return super().processEvent(serder, tsgs=tsgs, cigars=cigars, ptds=ptds, essrs=essrs, **kwa)
         except falcon.HTTPError as exc:
             self.last_error = exc
             return None
+
+    def _enforce_account_quotas(self, serder) -> None:
+        """Apply account quota enforcement for onboarding and account-side requests."""
+
+        # Check if valid route
+        route = str(serder.ked.get("r", "") or "")
+        if route not in ONBOARDING_ROUTES and route not in ACCOUNT_ROUTES:
+            return
+
+        # Check account context for the request
+        payload = _payload(serder)
+        account_aid, profile = self._account_context_for_route(serder, payload)
+        if not account_aid or profile is None:
+            return
+
+        # Enforce request rate and KEL budget for the account
+        self._enforce_account_request_rate(account_aid, profile)
+        self._enforce_account_kel_budget(account_aid, profile)
+
+    def _account_context_for_route(self, serder, payload: dict[str, Any]) -> tuple[str, Any]:
+        """Resolve the account AID and tier profile for the current request."""
+        route = str(serder.ked.get("r", "") or "")
+        sender = serder.pre
+
+        # For onboarding, return the account AID and profile based on session context
+        if route == "/onboarding/session/start":
+            account_aid = _optional_str(payload, "account_aid")
+            profile = self.ctx.config.account_profile(payload.get("chosen_profile_code", ""))
+            return account_aid, profile
+
+        # For other onboarding routes, resolve the account AID and profile from the session context
+        session_id = _optional_str(payload, "session_id")
+        if session_id:
+            session = self.ctx.store.get_session(session_id)
+            if session is not None:
+                profile = self.ctx.config.account_profile(session.chosen_profile_code)
+                account_aid = session.account_aid or _optional_str(payload, "account_aid")
+                return account_aid, profile
+
+        # For account routes, resolve the account AID and profile based on the authenticated sender
+        if route in ACCOUNT_ROUTES:
+            # Account routes are authenticated by the account AID sender.
+            account_aid = sender
+            account = self.ctx.store.get_account(account_aid)
+            profile = self.ctx.config.account_profile(account.witness_profile_code) if account is not None else None
+            return account_aid, profile
+
+        return "", None
+
+    def _enforce_account_request_rate(self, account_aid: str, profile: Any) -> None:
+        """Enforce per-account request limits on onboarding and account routes."""
+        
+        # Get the current time and the request window for this account
+        now = datetime.now(UTC)
+        window = self._account_request_windows.setdefault(
+            account_aid,
+            {"start": now, "count": 0},
+        )
+
+        # Reset the window if more than 60 seconds have elapsed since the start
+        elapsed = (now - window["start"]).total_seconds()
+        if elapsed >= 60:
+            window["start"] = now
+            window["count"] = 0
+
+        # Check if the request count exceeds the profile limit for the window
+        if window["count"] >= profile.max_requests_per_minute > 0:
+            raise falcon.HTTPTooManyRequests(
+                title="Account request rate limit exceeded",
+                description=(
+                    f"Account {account_aid} exceeded {profile.max_requests_per_minute} requests in the rolling minute window. "
+                    "Retry later or request a higher staging tier."
+                ),
+            )
+
+        # If not exceeded, increment the count and log if approaching soft limits
+        window["count"] += 1
+        ratio = window["count"] / max(profile.max_requests_per_minute, 1)
+        if ratio >= 0.95:
+            logger.warning(
+                "high_request_rate",
+                extra={
+                    "account_aid": account_aid,
+                    "tier": profile.tier,
+                    "count": window["count"],
+                    "limit": profile.max_requests_per_minute,
+                },
+            )
+        elif ratio >= 0.85:
+            logger.info(
+                "approaching_request_rate_limit",
+                extra={
+                    "account_aid": account_aid,
+                    "tier": profile.tier,
+                    "count": window["count"],
+                    "limit": profile.max_requests_per_minute,
+                },
+            )
+
+    def _enforce_account_kel_budget(self, account_aid: str, profile: Any) -> None:
+        """Enforce per-account KEL event limits on onboarding and account routes."""
+
+        # Get current time window for KEL events for this account
+        now = datetime.now(UTC)
+        window = self._account_kel_windows.setdefault(
+            account_aid,
+            {"start": now, "count": 0},
+        )
+        elapsed = (now - window["start"]).total_seconds()
+        if elapsed >= profile.kel_window_seconds:
+            window["start"] = now
+            window["count"] = 0
+
+        # Check if the count exceeds the profile KEL budget, reject the request if exceeded
+        if window["count"] >= profile.kel_budget > 0:
+            raise falcon.HTTPTooManyRequests(
+                title="Account key event budget exceeded",
+                description=(
+                    f"Account {account_aid} exceeded {profile.kel_budget} key events over {profile.kel_window_seconds} seconds. "
+                    "Retry later or request a higher staging tier."
+                ),
+            )
+
+        # Increment the count and log if approaching soft limits for the KEL budget
+        window["count"] += 1
+        ratio = window["count"] / max(profile.kel_budget, 1)
+        if ratio >= 0.95:
+            logger.warning(
+                "high_kel_usage",
+                extra={
+                    "account_aid": account_aid,
+                    "tier": profile.tier,
+                    "count": window["count"],
+                    "limit": profile.kel_budget,
+                },
+            )
+        elif ratio >= 0.85:
+            logger.info(
+                "approaching_kel_budget",
+                extra={
+                    "account_aid": account_aid,
+                    "tier": profile.tier,
+                    "count": window["count"],
+                    "limit": profile.kel_budget,
+                },
+            )
 
     def _ensure_capacity(self, *, kind: str, requested: int) -> None:
         if requested <= 0:
@@ -777,7 +1008,45 @@ class BootExchanger(Exchanger):
             if kind == "witness"
             else self.ctx.config.watcher_limit
         )
-        if count + requested > limit:
+        
+        # Log warnings if the projected resource count approaches or exceeds the limit,
+        # but still allow the request to proceed until the hard limit is reached
+        projected = count + requested
+        ratio = projected / max(limit, 1)
+        if ratio >= 0.95:
+            logger.warning(
+                "high_capacity_utilization",
+                extra={
+                    "kind": kind,
+                    "count": count,
+                    "requested": requested,
+                    "limit": limit,
+                    "projected": projected,
+                },
+            )
+        elif ratio >= 0.85:
+            logger.info(
+                "approaching_capacity_limit",
+                extra={
+                    "kind": kind,
+                    "count": count,
+                    "requested": requested,
+                    "limit": limit,
+                    "projected": projected,
+                },
+            )
+        elif ratio >= 0.7:
+            logger.info(
+                "soft_capacity_warning",
+                extra={
+                    "kind": kind,
+                    "count": count,
+                    "requested": requested,
+                    "limit": limit,
+                    "projected": projected,
+                },
+            )
+        if projected > limit:
             raise falcon.HTTPConflict(
                 title="Capacity exceeded",
                 description=(

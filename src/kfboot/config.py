@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Any
 
 
 def _env(name: str, default: str | None = None) -> str:
@@ -27,6 +28,97 @@ def _parse_bool(value: str, default: bool) -> bool:
 
 def _normalize_url(value: str) -> str:
     return value.rstrip("/")
+
+
+# Account profile definitions are used to enforce per-tier limits and quotas.
+# Each profile maps a staging tier to a bootstrap code and runtime limits.
+@dataclass(frozen=True)
+class AccountProfile:
+    """
+    Defines the account profile for a given bootstrap code
+
+    Attributes:
+    - tier: The staging tier (e.g. 'trial', 'org')
+    - code: The bootstrap code (e.g. '1-of-1', '3-of-4')
+    - max_accounts: Maximum number of accounts allowed for this profile
+    - max_requests_per_minute: Maximum number of requests per minute allowed for this profile
+    - kel_budget: Maximum number of KEL events allowed in the KEL window for this profile
+    - kel_window_seconds: The length of the time window in seconds for enforcing the KEL budget
+    """
+    tier: str
+    code: str
+    max_accounts: int
+    max_requests_per_minute: int
+    kel_budget: int
+    kel_window_seconds: int
+
+
+def _parse_account_profiles(value: str) -> tuple[AccountProfile, ...]:
+    """Parse the environment-configured account profiles into AccountProfile objects."""
+    profiles: list[AccountProfile] = []
+    for raw_item in value.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        parts = [part.strip() for part in item.split("|")]
+        if len(parts) != 6:
+            raise ValueError(
+                "KF_BOOT_ACCOUNT_PROFILES entries must be formatted as "
+                "'<tier>|<profile>|<max_accounts>|<max_requests_per_minute>|<kel_budget>|<kel_window_seconds>'"
+            )
+        tier, code, max_accounts, max_requests, kel_budget, kel_window = parts
+        profiles.append(
+            AccountProfile(
+                tier=tier,
+                code=code,
+                max_accounts=int(max_accounts),
+                max_requests_per_minute=int(max_requests),
+                kel_budget=int(kel_budget),
+                kel_window_seconds=int(kel_window),
+            )
+        )
+    return tuple(profiles)
+
+
+def _default_account_profiles(codes: tuple[str, ...]) -> tuple[AccountProfile, ...]:
+    """
+    Generate default account profiles based on the supported bootstrap account options 
+    if no explicit profiles are provided in the configuration.
+    
+    It maps '1-of-1' to a 'trial' tier and '3-of-4' to an 'org' tier with predefined limits.
+    
+    Trial tier has:
+    - max_accounts=1 
+    - max_requests_per_minute=30
+    - kel_budget=100
+    - kel_window_seconds=300
+    
+    Org tier has: 
+    - max_accounts=3
+    - max_requests_per_minute=60
+    - kel_budget=200
+    - kel_window_seconds=300
+    """
+
+    defaults: list[AccountProfile] = []
+    for code in codes:
+        option = _account_option(code)
+        tier = "trial" if option["witness_count"] == 1 else "org"
+        max_accounts = 1 if option["witness_count"] == 1 else 3
+        max_requests = 30 if option["witness_count"] == 1 else 60
+        kel_budget = 100 if option["witness_count"] == 1 else 200
+        kel_window = 300
+        defaults.append(
+            AccountProfile(
+                tier=tier,
+                code=option["code"],
+                max_accounts=max_accounts,
+                max_requests_per_minute=max_requests,
+                kel_budget=kel_budget,
+                kel_window_seconds=kel_window,
+            )
+        )
+    return tuple(defaults)
 
 
 def _account_option(code: str) -> dict[str, int | str]:
@@ -122,6 +214,7 @@ class Config:
     bootstrap_accounts_per_ip: int
     bootstrap_aids_per_ip: int
     session_ttl_seconds: int
+    account_profiles: tuple[AccountProfile, ...] = ()
     witness_backends: tuple[WitnessBackend, ...] = ()
 
     def __post_init__(self) -> None:
@@ -167,10 +260,30 @@ class Config:
         if not supported_options:
             raise ValueError("No bootstrap account options are supported by the configured witness backends.")
 
+        # Check for account profiles and validate that their codes are supported 
+        account_profiles = tuple(self.account_profiles)
+        if account_profiles:
+            normalized_profiles: list[AccountProfile] = []
+            seen_codes: set[str] = set()
+            for profile in account_profiles:
+                if profile.code not in supported_options:
+                    raise ValueError(
+                        f"Account profile code '{profile.code}' is not supported by the configured witness backends."
+                    )
+                if profile.code in seen_codes:
+                    raise ValueError(f"Duplicate account profile code '{profile.code}'.")
+                normalized_profiles.append(profile)
+                seen_codes.add(profile.code)
+            account_profiles = tuple(normalized_profiles)
+        else:
+            # If no explicit account profiles were provided, generate default profiles based on the supported bootstrap options
+            account_profiles = _default_account_profiles(supported_options)
+
         object.__setattr__(self, "witness_backends", tuple(normalized))
         object.__setattr__(self, "wit_boot_url", normalized[0].boot_url)
         object.__setattr__(self, "wit_public_url", normalized[0].public_url)
         object.__setattr__(self, "bootstrap_account_options", supported_options)
+        object.__setattr__(self, "account_profiles", tuple(account_profiles))
 
     def account_option(self, code: str) -> dict[str, int | str] | None:
         target = (code or "").strip().lower()
@@ -178,6 +291,14 @@ class Config:
             option = _account_option(item)
             if option["code"].lower() == target:
                 return option
+        return None
+
+    def account_profile(self, code: str) -> AccountProfile | None:
+        """Return the AccountProfile for the given bootstrap code, or None if not found."""
+        target = (code or "").strip().lower()
+        for profile in self.account_profiles:
+            if profile.code.lower() == target:
+                return profile
         return None
 
     @property
@@ -209,6 +330,9 @@ class Config:
         wat_boot_url = _env("WAT_BOOT_URL")
         wat_public_url = _env("WAT_PUBLIC_URL")
 
+        account_profiles_env = os.environ.get("KF_BOOT_ACCOUNT_PROFILES", "")
+        account_profiles = _parse_account_profiles(account_profiles_env) if account_profiles_env else ()
+
         return cls(
             host=host,
             port=port,
@@ -238,5 +362,6 @@ class Config:
             bootstrap_accounts_per_ip=int(_env("BOOTSTRAP_ACCOUNTS_PER_IP", "1")),
             bootstrap_aids_per_ip=int(_env("BOOTSTRAP_AIDS_PER_IP", "10")),
             session_ttl_seconds=int(_env("SESSION_TTL_SECONDS", "300")),
+            account_profiles=account_profiles,
             witness_backends=witness_backends,
         )

@@ -40,6 +40,7 @@ def test_session_creation_lookup_and_payload_integrity(store):
         watcher_required=True,
         witness_count=1,
         toad=1,
+        account_tier="trial",
     )
     older.created_at = "2024-01-01T00:00:00+00:00"
     older.updated_at = older.created_at
@@ -59,6 +60,7 @@ def test_session_creation_lookup_and_payload_integrity(store):
         watcher_required=True,
         witness_count=4,
         toad=3,
+        account_tier="org",
     )
     newer.created_at = "2024-01-01T00:00:01+00:00"
     newer.updated_at = newer.created_at
@@ -76,6 +78,7 @@ def test_session_creation_lookup_and_payload_integrity(store):
     payload = store.session_payload(newer)
     assert payload["session_id"] == newer.session_id
     assert payload["account_aid"] == "A1"
+    assert payload["account_tier"] == "org"
     assert payload["witness_count"] == 4
     assert "witness_backend_ids" not in payload
     payload["witness_eids"].append("EXTRA")
@@ -93,12 +96,14 @@ def test_session_creation_lookup_and_payload_integrity(store):
         session_id=newer.session_id,
         witness_eids=["W1", "W2", "W3", "W4"],
         watcher_eid="WA1",
+        tier="org",
         onboarded=True,
     )
     store.save_account(account)
 
     account_payload = store.account_payload(account)
     assert account_payload["status"] == ACCOUNT_STATE_ONBOARDED
+    assert account_payload["tier"] == "org"
     assert account_payload["watcher_eid"] == "WA1"
     account_payload["witness_eids"].append("EXTRA")
     assert account.witness_eids == ["W1", "W2", "W3", "W4"]
@@ -116,6 +121,7 @@ def test_expire_sessions_marks_only_non_terminal_records(store):
         watcher_required=True,
         witness_count=1,
         toad=1,
+        account_tier="trial",
     )
     open_session.expires_at = "2024-01-01T00:00:00+00:00"
     store.save_session(open_session)
@@ -131,6 +137,7 @@ def test_expire_sessions_marks_only_non_terminal_records(store):
         watcher_required=True,
         witness_count=1,
         toad=1,
+        account_tier="trial",
     )
     terminal.state = SESSION_STATE_COMPLETED
     terminal.expires_at = "2024-01-01T00:00:00+00:00"
@@ -155,6 +162,7 @@ def test_refresh_session_lease_extends_expiry_and_tracks_active_ip_sessions(stor
         watcher_required=True,
         witness_count=1,
         toad=1,
+        account_tier="trial",
     )
     second = store.create_session(
         ephemeral_aid="E2",
@@ -167,6 +175,7 @@ def test_refresh_session_lease_extends_expiry_and_tracks_active_ip_sessions(stor
         watcher_required=True,
         witness_count=1,
         toad=1,
+        account_tier="trial",
     )
     third = store.create_session(
         ephemeral_aid="E3",
@@ -179,6 +188,7 @@ def test_refresh_session_lease_extends_expiry_and_tracks_active_ip_sessions(stor
         watcher_required=True,
         witness_count=1,
         toad=1,
+        account_tier="trial",
     )
     second.state = SESSION_STATE_COMPLETED
     store.save_session(second)
@@ -209,6 +219,7 @@ def test_resource_binding_listing_and_api_payloads(store):
         watcher_required=True,
         witness_count=2,
         toad=1,
+        account_tier="trial",
     )
 
     witness_older = make_record(
