@@ -528,10 +528,17 @@ def test_account_witnesses_route_enforces_kel_budget(contract_factory):
         habbing.openHab(name="kel-ephemeral", temp=True, transferable=False) as (_, ephemeral),
         habbing.openHab(name="kel-account", temp=True) as (_, account),
     ):
+        # KEL budget is spent for each Onboarding and Account requests
         register_aid(contract, "/onboarding", ephemeral)
+        
+        # kel_budget=1 for /onboarding/session/start
         _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
+        
+        # kel_budget=2 for /onboarding/account/create
         create_account(contract, ephemeral, start_reply, account_aid=account.pre)
         register_aid(contract, "/account", account)
+        
+        # kel_budget=3 for /onboarding/complete
         _, _, _ = complete_session(
             contract,
             ephemeral,
@@ -539,6 +546,7 @@ def test_account_witnesses_route_enforces_kel_budget(contract_factory):
             account_aid=account.pre,
         )
 
+        # kel_budget=4 for /account/witnesses
         response = post_cesr(
             contract,
             "/account",
@@ -546,6 +554,7 @@ def test_account_witnesses_route_enforces_kel_budget(contract_factory):
         )
         assert response.status_code == 200
 
+        # Request exceed KEL budget, should be rejected with 429
         response = post_cesr(
             contract,
             "/account",
@@ -579,6 +588,8 @@ def test_account_route_request_rate_soft_warnings_before_hard_limit(contract_fac
         register_aid(contract, "/onboarding", ephemeral)
         register_aid(contract, "/account", account)
 
+        # Complete Onboarding, note that it takes 3 requests that count towards the rate limit 
+        # (start session, create account, complete onboarding)
         _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
         create_account(contract, ephemeral, start_reply, account_aid=account.pre)
         _, _, _ = complete_session(
@@ -601,6 +612,7 @@ def test_account_route_request_rate_soft_warnings_before_hard_limit(contract_fac
             lambda message, **kwargs: warning_calls.append(message),
         )
 
+        # Make requests 5 requests on top of the 3 requests already made during onboarding
         for _ in range(5):
             response = post_cesr(
                 contract,
@@ -627,6 +639,7 @@ def test_account_route_request_rate_soft_warnings_before_hard_limit(contract_fac
         assert response.status_code == 200
         assert "high_request_rate" in warning_calls
 
+        # The following request exceeds the max_requests_per_minute limit and should be rejected
         response = post_cesr(
             contract,
             "/account",
@@ -642,9 +655,12 @@ def test_expire_accounts_transitions_onboarded_account_to_expired(onboarded_bund
     contract = onboarded_bundle["contract"]
     account = onboarded_bundle["account"]
     record = contract.ctx.store.get_account(account.pre)
+    
+    # Set the account expiry date to the past to trigger expiration
     record.expires_at = "2000-01-01T00:00:00+00:00"
     contract.ctx.store.save_account(record)
 
+    # Manually trigger the expiration process
     contract.ctx.exchanger.expire_accounts()
 
     updated = contract.ctx.store.get_account(account.pre)
@@ -664,6 +680,8 @@ def test_account_routes_reject_paused_or_expired_accounts(onboarded_bundle, stat
     contract = onboarded_bundle["contract"]
     account = onboarded_bundle["account"]
     record = contract.ctx.store.get_account(account.pre)
+
+    # Set status to paused or expired to trigger rejection of account routes
     record.status = status
     contract.ctx.store.save_account(record)
 
@@ -673,5 +691,6 @@ def test_account_routes_reject_paused_or_expired_accounts(onboarded_bundle, stat
         build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
     )
 
+    # Assert that the request is rejected with the appropriate status code and message
     assert response.status_code == 409
     assert response.json["title"] == title

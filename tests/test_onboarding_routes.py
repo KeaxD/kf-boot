@@ -562,9 +562,12 @@ def test_session_start_enforces_account_request_rate_limit(contract_factory):
 
     with habbing.openHab(name="rate-limit-ephemeral", temp=True, transferable=False) as (_, ephemeral):
         register_aid(contract, "/onboarding", ephemeral)
+
+        # Make the maximum allowed number of requests by starting 2 sessions
         start_session(contract, ephemeral)
         start_session(contract, ephemeral)
 
+        # The 3rd request exceeds the max_requests_per_minute limitand should be rejected
         response = post_cesr(
             contract,
             "/onboarding",
@@ -600,6 +603,7 @@ def test_session_start_rejects_account_alias_over_limit(contract_factory):
         register_aid(contract, "/onboarding", ephemeral1)
         register_aid(contract, "/account", account1)
 
+        # Start and complete a session 
         _, _, start_reply = start_session(contract, ephemeral1, account_aid=account1.pre)
         create_account(contract, ephemeral1, start_reply, account_aid=account1.pre)
         _, _, _ = complete_session(
@@ -610,6 +614,9 @@ def test_session_start_rejects_account_alias_over_limit(contract_factory):
         )
 
         register_aid(contract, "/onboarding", ephemeral2)
+
+        # Attempt to start a session with a different ephemeral but the same alias
+        # which should be rejected because the alias already has the max onboarded accounts
         response = post_cesr(
             contract,
             "/onboarding",

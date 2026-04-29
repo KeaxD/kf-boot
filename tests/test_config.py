@@ -61,10 +61,16 @@ def test_config_from_env_parses_witness_backend_pool(monkeypatch):
 
 
 def test_config_from_env_parses_account_profiles(monkeypatch):
+    """Test that account profiles are correctly parsed from env variables and can be retrieved"""
+
+    # Set up environment variables for witness backends and account profiles
+    # Witness backend contains only 1 witness
     monkeypatch.setenv(
         "KF_BOOT_WITNESS_BACKENDS",
         "wit-1|http://127.0.0.1:5631|https://boot.example.com:5632",
     )
+
+    # Set up a single account profile with code "1-of-1" 
     monkeypatch.setenv(
         "KF_BOOT_ACCOUNT_PROFILES",
         "trial|1-of-1|10|5|4|30",
@@ -75,6 +81,7 @@ def test_config_from_env_parses_account_profiles(monkeypatch):
 
     config = Config.from_env()
 
+    # Assert that the account profile is correctly parsed and available in the config
     assert [profile.code for profile in config.account_profiles] == ["1-of-1"]
     assert config.account_profile("1-of-1").tier == "trial"
     assert config.account_profile("1-of-1").max_accounts == 10
@@ -86,10 +93,14 @@ def test_config_from_env_parses_account_profiles(monkeypatch):
 
 def test_config_from_env_rejects_malformed_account_profiles(monkeypatch):
     """Tests that malformed account profile entries are rejected with a clear error message."""
+
+    # Witness backend only has 1 witness, so only "1-of-1" code is supported for account profiles
     monkeypatch.setenv(
         "KF_BOOT_WITNESS_BACKENDS",
         "wit-1|http://127.0.0.1:5631|https://boot.example.com:5632",
     )
+
+    # Set up a malformed account profile that is missing the kel_window_seconds field
     monkeypatch.setenv("KF_BOOT_ACCOUNT_PROFILES", "trial|1-of-1|10|5|4")
     monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
     monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example")
@@ -133,6 +144,7 @@ def test_config_from_env_generates_default_account_profiles_when_not_configured(
 
     config = Config.from_env()
 
+    # When no account profiles are explicitly configure, default profiles should be generated
     assert [profile.code for profile in config.account_profiles] == ["1-of-1", "3-of-4"]
     assert config.account_profile("1-of-1").tier == "trial"
     assert config.account_profile("1-of-1").max_accounts == 1
