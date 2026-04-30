@@ -6,7 +6,6 @@ from keri.app.httping import CESR_ATTACHMENT_HEADER, CESR_CONTENT_TYPE
 from keri.core import eventing
 
 from .support import (
-    assert_reply_frame,
     build_exn,
     build_signed_serder,
     make_witness_backends,

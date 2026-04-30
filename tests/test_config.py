@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from kfboot.config import Config, WitnessBackend
+from kfboot.config import AccountProfile, Config, WitnessBackend
 
 from .support import make_config, make_witness_backends
 
@@ -171,6 +171,25 @@ def test_config_from_env_rejects_account_profile_code_not_supported_by_witness_b
     # The code "3-of-4" is not supported because there is only 1 witness backend configured
     with pytest.raises(ValueError, match="Account profile code '3-of-4' is not supported"):
         Config.from_env()
+
+
+def test_config_rejects_explicit_account_profiles_missing_supported_options(tmp_path):
+    """ Tests that all supported bootstrap options must have a corresponding account profile """
+    with pytest.raises(ValueError, match="Missing account profile code"):
+        make_config(
+            tmp_path,
+            account_profiles=(
+                # Only "1-of-1" profile is provided, "3-of-4" is missing 
+                AccountProfile(
+                    tier="trial",
+                    code="1-of-1",
+                    max_accounts=1,
+                    max_requests_per_minute=30,
+                    kel_budget=100,
+                    kel_window_seconds=300,
+                ),
+            ),
+        )
 
 
 def test_config_from_env_rejects_malformed_witness_backend_entry(monkeypatch):

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
 import pytest
 import kfboot.boot_exchanger as boot_exchanger
 from keri.app import habbing
@@ -26,6 +29,7 @@ from .support import (
     build_exn,
     complete_session,
     create_account,
+    freeze_boot_time,
     make_witness_backends,
     post_cesr,
     register_aid,
@@ -548,6 +552,7 @@ def test_session_start_enforces_account_request_rate_limit(contract_factory):
     contract = contract_factory(
         bootstrap_accounts_per_ip=10,
         bootstrap_aids_per_ip=10,
+        bootstrap_account_options=("1-of-1",),
         account_profiles=(
             AccountProfile(
                 tier="trial",
@@ -578,11 +583,155 @@ def test_session_start_enforces_account_request_rate_limit(contract_factory):
     assert response.json["title"] == "Account request rate limit exceeded"
 
 
+def test_session_start_request_rate_limit_resets_after_minute(contract_factory, monkeypatch):
+    """Tests per-account request throttles clear when the minute window rolls over."""
+    # Instantiate boot time
+    clock = freeze_boot_time(monkeypatch, datetime(2026, 1, 1, tzinfo=UTC))
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=10,
+        bootstrap_aids_per_ip=10,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=100,
+                max_requests_per_minute=2,
+                kel_budget=100,
+                kel_window_seconds=300,
+            ),
+        ),
+    )
+
+    with habbing.openHab(name="rate-rollover-ephemeral", temp=True, transferable=False) as (_, ephemeral):
+        register_aid(contract, "/onboarding", ephemeral)
+
+        # Send 2 requests to reach the max_requests_per_minute limit
+        start_session(contract, ephemeral)
+        start_session(contract, ephemeral)
+
+        rejected = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+        )
+        assert rejected.status_code == 429
+        assert rejected.json["title"] == "Account request rate limit exceeded"
+
+        # Advance clock by 61 seconds to reset the limit window 
+        clock.value += timedelta(seconds=61)
+        accepted = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+        )
+    # Assert the request is accepted 
+    assert accepted.status_code == 200
+
+
+def test_session_start_kel_budget_resets_after_profile_window(contract_factory, monkeypatch):
+    """Tests KEL budget enforcement clears when the profile KEL window rolls over."""
+    clock = freeze_boot_time(monkeypatch, datetime(2026, 1, 1, tzinfo=UTC))
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=10,
+        bootstrap_aids_per_ip=10,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=100,
+                max_requests_per_minute=100,
+                kel_budget=2,
+                kel_window_seconds=30,
+            ),
+        ),
+    )
+
+    with habbing.openHab(name="kel-rollover-ephemeral", temp=True, transferable=False) as (_, ephemeral):
+        register_aid(contract, "/onboarding", ephemeral)
+
+        # Send 2 requests to reach the kel_window_seconds limit
+        start_session(contract, ephemeral)
+        start_session(contract, ephemeral)
+
+        rejected = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+        )
+        assert rejected.status_code == 429
+        assert rejected.json["title"] == "Account key event budget exceeded"
+
+        # Advance clock by 31 seconds to reset the limit window 
+        clock.value += timedelta(seconds=31)
+        accepted = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+        )
+
+    assert accepted.status_code == 200
+
+
+def test_session_start_request_rate_limit_is_scoped_per_account(contract_factory):
+    """Verify one account exhausting request rate does not throttle another account."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=10,
+        bootstrap_aids_per_ip=10,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=100,
+                max_requests_per_minute=2,
+                kel_budget=100,
+                kel_window_seconds=300,
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="rate-isolated-account-a", temp=True, transferable=False) as (_, first),
+        habbing.openHab(name="rate-isolated-account-b", temp=True, transferable=False) as (_, second),
+    ):
+        register_aid(contract, "/onboarding", first)
+        register_aid(contract, "/onboarding", second)
+
+        start_session(contract, first, account_aid="AID_RATE_A", account_alias="alpha-a")
+        start_session(contract, first, account_aid="AID_RATE_A", account_alias="alpha-a")
+        rejected = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(
+                first,
+                route="/onboarding/session/start",
+                payload=start_payload(account_aid="AID_RATE_A", account_alias="alpha-a"),
+            ),
+        )
+        assert rejected.status_code == 429
+        assert rejected.json["title"] == "Account request rate limit exceeded"
+
+        accepted = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(
+                second,
+                route="/onboarding/session/start",
+                payload=start_payload(account_aid="AID_RATE_B", account_alias="alpha-b"),
+            ),
+        )
+
+    assert accepted.status_code == 200
+
+
 def test_session_start_rejects_account_alias_over_limit(contract_factory):
     """Verify onboarding rejects a new session when the alias already has the max onboarded accounts."""
     contract = contract_factory(
         bootstrap_accounts_per_ip=100,
         bootstrap_aids_per_ip=100,
+        bootstrap_account_options=("1-of-1",),
         account_profiles=(
             AccountProfile(
                 tier="trial",
@@ -633,6 +782,7 @@ def test_session_start_rejects_alias_when_existing_account_is_pending(contract_f
     contract = contract_factory(
         bootstrap_accounts_per_ip=100,
         bootstrap_aids_per_ip=100,
+        bootstrap_account_options=("1-of-1",),
         account_profiles=(
             AccountProfile(
                 tier="trial",
@@ -732,6 +882,7 @@ def test_account_request_rate_soft_warning_thresholds_before_hard_limit(contract
     contract = contract_factory(
         bootstrap_accounts_per_ip=100,
         bootstrap_aids_per_ip=100,
+        bootstrap_account_options=("1-of-1",),
         account_profiles=(
             AccountProfile(
                 tier="trial",
@@ -783,6 +934,7 @@ def test_account_kel_budget_soft_warning_thresholds_before_hard_limit(contract_f
     contract = contract_factory(
         bootstrap_accounts_per_ip=100,
         bootstrap_aids_per_ip=100,
+        bootstrap_account_options=("1-of-1",),
         account_profiles=(
             AccountProfile(
                 tier="trial",

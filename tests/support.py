@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from falcon import testing
@@ -196,6 +197,28 @@ def make_config(tmp_path, *, index: int = 0, **overrides: Any) -> Config:
     }
     data.update(overrides)
     return Config(**data)
+
+
+def freeze_boot_time(monkeypatch, current: datetime):
+    import kfboot.boot_exchanger as boot_exchanger
+
+    class FrozenDateTime:
+        value = current
+
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return cls.value.replace(tzinfo=None)
+            if cls.value.tzinfo is None:
+                return cls.value.replace(tzinfo=tz)
+            return cls.value.astimezone(tz)
+
+        @classmethod
+        def fromisoformat(cls, value: str):
+            return datetime.fromisoformat(value)
+
+    monkeypatch.setattr(boot_exchanger, "datetime", FrozenDateTime)
+    return FrozenDateTime
 
 
 def start_payload(**overrides: Any) -> dict[str, Any]:

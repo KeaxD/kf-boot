@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any
 
 
 def _env(name: str, default: str | None = None) -> str:
@@ -274,6 +273,13 @@ class Config:
                     raise ValueError(f"Duplicate account profile code '{profile.code}'.")
                 normalized_profiles.append(profile)
                 seen_codes.add(profile.code)
+            # Check that all supported options have a corresponding account profile
+            missing_codes = tuple(code for code in supported_options if code not in seen_codes)
+            if missing_codes:
+                raise ValueError(
+                    "Missing account profile code(s) for supported bootstrap option(s): "
+                    f"{', '.join(missing_codes)}."
+                )
             account_profiles = tuple(normalized_profiles)
         else:
             # If no explicit account profiles were provided, generate default profiles based on the supported bootstrap options

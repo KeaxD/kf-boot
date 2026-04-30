@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from hashlib import blake2b
 from typing import Any
 
@@ -14,6 +14,7 @@ from kfboot.basing import (
     ACCOUNT_STATE_PAUSED,
     ACCOUNT_STATE_PENDING_ONBOARDING,
     ACCOUNT_STATE_EXPIRED,
+    AccountRecord,
     SESSION_STATE_ACCOUNT_CREATED,
     SESSION_STATE_CANCELLED,
     SESSION_STATE_COMPLETED,
