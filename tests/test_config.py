@@ -73,7 +73,7 @@ def test_config_from_env_parses_account_profiles(monkeypatch):
     # Set up a single account profile with code "1-of-1" 
     monkeypatch.setenv(
         "KF_BOOT_ACCOUNT_PROFILES",
-        "trial|1-of-1|10|5|4|30",
+        "trial|1-of-1|10|5|4",
     )
 
     monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
@@ -162,7 +162,7 @@ def test_config_from_env_rejects_account_profile_code_not_supported_by_witness_b
     )
     monkeypatch.setenv(
         "KF_BOOT_ACCOUNT_PROFILES",
-        "org|3-of-4|2|10|100|300",
+        "org|3-of-4|2|10|100",
     )
     monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
     monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example")
