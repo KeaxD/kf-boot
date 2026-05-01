@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import monotonic
+
+from keri import help
 
 try:
     import requests
 except ImportError:  # pragma: no cover - exercised only in thin local test envs
     requests = None
 
+logger = help.ogler.getLogger(__name__)
 
 class BootError(RuntimeError):
     """Raised when a boot API call fails."""
@@ -66,8 +70,15 @@ class BootClient:
         self, method: str, path: str, json: dict | None = None
     ):
         if requests is None:
+            logger.error(
+                "Boot API client cannot make request because requests library is not available",
+            )
             raise BootError("requests is required to call the downstream boot API")
         url = f"{self.base_url}{path}"
+        start = monotonic()
+        logger.debug(
+            "Boot API request starting",
+        )
         try:
             response = requests.request(
                 method,
@@ -76,10 +87,21 @@ class BootClient:
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
+            elapsed_ms = int((monotonic() - start) * 1000)
+            logger.warning(
+                "BOOT API request failed due to request exception error: `{exc}`",
+            )
             raise BootError(f"Boot API request failed: {exc}") from exc
 
+        elapsed_ms = int((monotonic() - start) * 1000)
         if response.status_code >= 400:
             description = response.text.strip() or f"HTTP {response.status_code}"
+            logger.warning(
+                "BOOT API request failed: `{description}`",
+            )
             raise BootError(description, status_code=response.status_code)
 
+        logger.info(
+            "BOOT API request succeeded: `{description}`",
+        )
         return response

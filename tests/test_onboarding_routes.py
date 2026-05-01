@@ -559,8 +559,7 @@ def test_session_start_enforces_account_request_rate_limit(contract_factory):
                 code="1-of-1",
                 max_accounts=1,
                 max_requests_per_minute=2,
-                kel_budget=100,
-                kel_window_seconds=300,
+                kel_budget=100
             ),
         ),
     )
@@ -597,8 +596,7 @@ def test_session_start_request_rate_limit_resets_after_minute(contract_factory, 
                 code="1-of-1",
                 max_accounts=100,
                 max_requests_per_minute=2,
-                kel_budget=100,
-                kel_window_seconds=300,
+                kel_budget=100
             ),
         ),
     )
@@ -629,9 +627,8 @@ def test_session_start_request_rate_limit_resets_after_minute(contract_factory, 
     assert accepted.status_code == 200
 
 
-def test_session_start_kel_budget_resets_after_profile_window(contract_factory, monkeypatch):
-    """Tests KEL budget enforcement clears when the profile KEL window rolls over."""
-    clock = freeze_boot_time(monkeypatch, datetime(2026, 1, 1, tzinfo=UTC))
+def test_session_start_kel_budget_exhausts_fixed_quota(contract_factory, monkeypatch):
+    """Tests fixed KEL budgets are enforced without resetting over time."""
     contract = contract_factory(
         bootstrap_accounts_per_ip=10,
         bootstrap_aids_per_ip=10,
@@ -643,15 +640,14 @@ def test_session_start_kel_budget_resets_after_profile_window(contract_factory, 
                 max_accounts=100,
                 max_requests_per_minute=100,
                 kel_budget=2,
-                kel_window_seconds=30,
             ),
         ),
     )
 
-    with habbing.openHab(name="kel-rollover-ephemeral", temp=True, transferable=False) as (_, ephemeral):
+    with habbing.openHab(name="kel-exhaustion-ephemeral", temp=True, transferable=False) as (_, ephemeral):
         register_aid(contract, "/onboarding", ephemeral)
 
-        # Send 2 requests to reach the kel_window_seconds limit
+        # Send 2 requests to exhaust the account's fixed KEL budget
         start_session(contract, ephemeral)
         start_session(contract, ephemeral)
 
@@ -660,18 +656,9 @@ def test_session_start_kel_budget_resets_after_profile_window(contract_factory, 
             "/onboarding",
             build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
         )
-        assert rejected.status_code == 429
-        assert rejected.json["title"] == "Account key event budget exceeded"
 
-        # Advance clock by 31 seconds to reset the limit window 
-        clock.value += timedelta(seconds=31)
-        accepted = post_cesr(
-            contract,
-            "/onboarding",
-            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
-        )
-
-    assert accepted.status_code == 200
+    assert rejected.status_code == 429
+    assert rejected.json["title"] == "Account key event budget exceeded"
 
 
 def test_session_start_request_rate_limit_is_scoped_per_account(contract_factory):
@@ -686,8 +673,7 @@ def test_session_start_request_rate_limit_is_scoped_per_account(contract_factory
                 code="1-of-1",
                 max_accounts=100,
                 max_requests_per_minute=2,
-                kel_budget=100,
-                kel_window_seconds=300,
+                kel_budget=100
             ),
         ),
     )
@@ -738,8 +724,7 @@ def test_session_start_rejects_account_alias_over_limit(contract_factory):
                 code="1-of-1",
                 max_accounts=1,
                 max_requests_per_minute=100,
-                kel_budget=100,
-                kel_window_seconds=300,
+                kel_budget=100
             ),
         ),
     )
@@ -789,8 +774,7 @@ def test_session_start_rejects_alias_when_existing_account_is_pending(contract_f
                 code="1-of-1",
                 max_accounts=1,
                 max_requests_per_minute=100,
-                kel_budget=100,
-                kel_window_seconds=300,
+                kel_budget=100
             ),
         ),
     )
@@ -889,8 +873,7 @@ def test_account_request_rate_soft_warning_thresholds_before_hard_limit(contract
                 code="1-of-1",
                 max_accounts=1,
                 max_requests_per_minute=10,
-                kel_budget=100,
-                kel_window_seconds=300,
+                kel_budget=100
             ),
         ),
     )
@@ -941,8 +924,7 @@ def test_account_kel_budget_soft_warning_thresholds_before_hard_limit(contract_f
                 code="1-of-1",
                 max_accounts=1,
                 max_requests_per_minute=100,
-                kel_budget=10,
-                kel_window_seconds=300,
+                kel_budget=10
             ),
         ),
     )

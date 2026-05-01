@@ -519,8 +519,7 @@ def test_account_witnesses_route_enforces_kel_budget(contract_factory):
                 code="1-of-1",
                 max_accounts=1,
                 max_requests_per_minute=100,
-                kel_budget=4,
-                kel_window_seconds=300,
+                kel_budget=4
             ),
         ),
     )
@@ -577,8 +576,7 @@ def test_account_kel_budget_is_scoped_per_account(contract_factory):
                 code="1-of-1",
                 max_accounts=100,
                 max_requests_per_minute=100,
-                kel_budget=4,
-                kel_window_seconds=300,
+                kel_budget=4
             ),
         ),
     )
@@ -665,16 +663,14 @@ def test_account_routes_enforce_persisted_witness_profile_code(contract_factory)
                 code="1-of-1",
                 max_accounts=100,
                 max_requests_per_minute=100,
-                kel_budget=100,
-                kel_window_seconds=300,
+                kel_budget=100
             ),
             AccountProfile(
                 tier="org",
                 code="3-of-4",
                 max_accounts=100,
                 max_requests_per_minute=4,
-                kel_budget=100,
-                kel_window_seconds=300,
+                kel_budget=100
             ),
         ),
     )
@@ -735,8 +731,7 @@ def test_account_route_request_rate_soft_warnings_before_hard_limit(contract_fac
                 code="1-of-1",
                 max_accounts=1,
                 max_requests_per_minute=10,
-                kel_budget=100,
-                kel_window_seconds=300,
+                kel_budget=100
             ),
         ),
     )
