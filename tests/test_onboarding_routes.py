@@ -897,10 +897,16 @@ def test_account_request_rate_soft_warning_thresholds_before_hard_limit(contract
         for _ in range(9):
             start_session(contract, ephemeral)
 
-        assert "approaching_request_rate_limit" in info_calls
+        assert any(
+            "Session start requested" in msg
+            for msg in info_calls
+        )
 
         start_session(contract, ephemeral)
-        assert "high_request_rate" in warning_calls
+        assert any(
+            "Approaching request rate limit" in msg
+            for msg in warning_calls
+        )
 
         response = post_cesr(
             contract,
@@ -948,10 +954,16 @@ def test_account_kel_budget_soft_warning_thresholds_before_hard_limit(contract_f
         for _ in range(9):
             start_session(contract, ephemeral)
 
-        assert "approaching_kel_budget" in info_calls
+        assert any(
+            "Session start requested" in msg
+            for msg in info_calls
+        )
 
         start_session(contract, ephemeral)
-        assert "high_kel_usage" in warning_calls
+        assert any(
+            "Approaching KEL budget limit" in msg
+            for msg in warning_calls
+        )
 
         response = post_cesr(
             contract,

@@ -728,6 +728,13 @@ class BootExchanger(Exchanger):
                 logger.info(
                     f"Account expired at {account.expires_at} for account AID {account.account_aid}",
                 )
+                # Begin account resources teardown for exprired account
+                try:
+                    self.teardown_account_resources(account_aid=account.account_aid, account=account)
+                except BootError as exc:
+                    logger.warning(
+                        f"Resource teardown failed for expired account {account.account_aid}: {exc}"
+                    )
 
     def take_reply(self) -> bytes | None:
         if not self.reply_streams:
@@ -1216,9 +1223,9 @@ class BootExchanger(Exchanger):
         window["count"] += 1
         ratio = window["count"] / max(profile.max_requests_per_minute, 1)
         if ratio >= 0.95:
-            logger.warning("high_request_rate")
+            logger.warning(f"Approaching request rate limit for account {account_aid}, current rate: 95%")
         elif ratio >= 0.85:
-            logger.info("approaching_request_rate_limit")
+            logger.info(f"Approaching request rate limit for account {account_aid}, current rate: 85%")
 
     def _enforce_account_kel_budget(self, account_aid: str, profile: Any) -> None:
         """Enforce a fixed per-account KEL event quota on onboarding and account routes."""
@@ -1243,9 +1250,9 @@ class BootExchanger(Exchanger):
         self._account_kel_usage[account_aid] = count
         ratio = count / max(profile.kel_budget, 1)
         if ratio >= 0.95:
-            logger.warning("high_kel_usage")
+            logger.warning(f"Approaching KEL budget limit for account {account_aid}, current rate: 95%")
         elif ratio >= 0.85:
-            logger.info("approaching_kel_budget")
+            logger.info(f"Approaching KEL budget limit for account {account_aid}, current rate: 85%")
 
     def _ensure_capacity(self, *, kind: str, requested: int) -> None:
         if requested <= 0:
@@ -1424,6 +1431,73 @@ class BootExchanger(Exchanger):
         logger.info(
             f"Session resources teardown completed for session {session.session_id}"
         )
+
+    def teardown_account_resources(self, *, account_aid: str, account=None) -> None:
+        """Teardown account resources (Witnesses and Watchers) without deleting the account.
+        It gets triggered when an account is marked as 'expired'
+        """
+        sessions = self.ctx.store.list_sessions_for_account(account_aid)
+        errors: list[BootError] = []
+        watcher_ids = self._collect_account_resource_ids(
+            kind="watcher",
+            account_aid=account_aid,
+            account=account,
+            sessions=sessions,
+        )
+        witness_ids = self._collect_account_resource_ids(
+            kind="witness",
+            account_aid=account_aid,
+            account=account,
+            sessions=sessions,
+        )
+        logger.info(
+            f"Resources teardown started for account AID {account_aid}"
+        )
+
+        for watcher_id in watcher_ids:
+            try:
+                self._delete_hosted_resource(
+                    kind="watcher",
+                    eid=watcher_id,
+                    account=account,
+                    tolerate_missing_remote=True,
+                )
+            except BootError as exc:
+                errors.append(exc)
+                logger.warning(
+                    f"Teardown of watcher resource failed for watcher {watcher_id}: {exc}"
+                )
+
+        for witness_id in witness_ids:
+            try:
+                self._delete_hosted_resource(
+                    kind="witness",
+                    eid=witness_id,
+                    account=account,
+                    tolerate_missing_remote=True,
+                )
+            except BootError as exc:
+                errors.append(exc)
+                logger.warning(
+                    f"Teardown of witness resource failed for witness {witness_id}: {exc}"
+                )
+
+        # Clear account bindings
+        if account is not None:
+            account.watcher_eid = ""
+            account.witness_eids = []
+            account.session_id = ""
+            self.ctx.store.save_account(account)
+
+        if errors:
+            first = errors[0]
+            detail = "; ".join(str(error) for error in errors)
+            logger.warning(
+                f"Account resources teardown completed with errors ({len(errors)}) for account AID {account_aid}: {detail}"
+            )
+            raise BootError(detail, status_code=first.status_code)
+
+        logger.info(f"Resources teardown completed for account AID {account_aid}")
 
     def delete_account(self, *, account_aid: str, account=None) -> None:
         sessions = self.ctx.store.list_sessions_for_account(account_aid)

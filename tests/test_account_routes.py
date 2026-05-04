@@ -783,7 +783,10 @@ def test_account_route_request_rate_soft_warnings_before_hard_limit(contract_fac
             build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
         )
         assert response.status_code == 200
-        assert "approaching_request_rate_limit" in info_calls
+        assert any(
+            "Approaching request rate limit for account" in msg
+            for msg in info_calls
+        )
 
         # The following request should hit the high-warning threshold (10/10 total requests)
         response = post_cesr(
@@ -792,7 +795,10 @@ def test_account_route_request_rate_soft_warnings_before_hard_limit(contract_fac
             build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
         )
         assert response.status_code == 200
-        assert "high_request_rate" in warning_calls
+        assert any(
+            "Approaching request rate limit for account" in msg
+            for msg in warning_calls
+        )
 
         # The following request exceeds the max_requests_per_minute limit and should be rejected
         response = post_cesr(
@@ -870,3 +876,58 @@ def test_account_routes_reject_paused_or_expired_accounts(onboarded_bundle, stat
     # Assert that the request is rejected with the appropriate status code and message
     assert response.status_code == 409
     assert response.json["title"] == title
+
+def test_expire_accounts_triggers_resource_teardown(contract_factory, monkeypatch):
+    """Ensure expired accounts trigger cleanup of allocated resources."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+    )
+
+    # Create an onboarded account with resources
+    account = contract.ctx.store.build_account(
+        account_aid="AID_EXPIRED",
+        account_alias="beta",
+        witness_profile_code="1-of-1",
+        witness_count=1,
+        toad=1,
+        watcher_required=True,
+        region_id="test-region",
+        region_name="Test Region",
+        session_id="SESSION123",
+        witness_eids=["WITNESS123"],
+        watcher_eid="WATCHER123",
+        tier="trial",
+        onboarded=True,
+    )
+    account.status = ACCOUNT_STATE_ONBOARDED
+    account.expires_at = "2000-01-01T00:00:00+00:00"
+    contract.ctx.store.save_account(account)
+
+    cleaned: list[tuple] = []
+
+    def fake_teardown(*, account_aid: str, account=None) -> None:
+        # Simulate what teardown_account_resources would do
+        account.watcher_eid = ""
+        account.witness_eids = []
+        account.session_id = ""
+        contract.ctx.store.save_account(account)
+        cleaned.append((account_aid, account))
+
+    monkeypatch.setattr(contract.ctx.exchanger, "teardown_account_resources", fake_teardown)
+
+    # Run expiration logic
+    contract.ctx.exchanger.expire_accounts()
+
+    expired = contract.ctx.store.get_account("AID_EXPIRED")
+    assert expired is not None
+    assert expired.status == ACCOUNT_STATE_EXPIRED
+
+    # Ensure teardown was invoked exactly once with correct args
+    assert cleaned == [("AID_EXPIRED", expired)]
+
+    # Assert that resources were actually cleared
+    assert expired.watcher_eid == ""
+    assert expired.witness_eids == []
+    assert expired.session_id == ""
+

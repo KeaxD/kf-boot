@@ -98,6 +98,6 @@ class BootClient:
             raise BootError(description, status_code=response.status_code)
 
         logger.info(
-            f"BOOT API request succeeded: `{description}`",
+            f"BOOT API request succeeded: `{response}`",
         )
         return response
