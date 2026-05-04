@@ -178,7 +178,7 @@ class SessionStartHandler(RouteHandler):
                 account_tier=profile.tier,
             )
             logger.info(
-                "Session created for account {account_aid}",
+                f"Session created for account {account_aid}",
             )
 
         self.exchanger.provision_session_resources(session=session)
@@ -268,7 +268,6 @@ class AccountCreateHandler(RouteHandler):
             return
 
         try:
-            account_record_created = account is None
             if account is None:
                 account = self.exchanger.ctx.store.build_account(
                     account_aid=account_aid,
@@ -379,7 +378,7 @@ class CompleteHandler(RouteHandler):
         self.exchanger.ctx.store.save_session(session)
         self.exchanger.ctx.store.save_account(account)
         logger.info(
-            "Onboarding completed for account AID {account_aid}"
+            f"Onboarding completed for account AID {account_aid}"
         )
         self.exchanger.reply_account(self.resource, recipient=sender, session=session)
 
@@ -843,7 +842,7 @@ class BootExchanger(Exchanger):
                 description="This account has expired and must be renewed or deleted before accessing account routes.",
             )
         if account.status != ACCOUNT_STATE_ONBOARDED:
-            logger.warning(f"Account {account.account_aid} is not onboarded and cannot accesss approved account routes")
+            logger.warning(f"Account {account.account_aid} is not onboarded and cannot access approved account routes")
             raise falcon.HTTPConflict(
                 title="Account not onboarded",
                 description="Approved-account routes require an onboarded account principal.",
@@ -1116,7 +1115,7 @@ class BootExchanger(Exchanger):
         stream.extend(self.host_hab.exchange(route=route, payload=payload, recipient=recipient or None))
         self.reply_streams.append(bytes(stream))
         logger.debug(
-            "Reply queued for route {route} to recipient {recipient}",
+            f"Reply queued for route {route} to recipient {recipient}",
         )
 
     def processEvent(self, serder, tsgs=None, cigars=None, ptds=None, essrs=None, **kwa):
@@ -1145,7 +1144,7 @@ class BootExchanger(Exchanger):
         # TODO - we may want to enforce some limits even without account context
         if not account_aid or profile is None:
             logger.debug(
-                "No account context found for route {route}"
+                f"No account context found for route {route}"
             )
             return
 
@@ -1310,7 +1309,7 @@ class BootExchanger(Exchanger):
         session.updated_at = now_iso()
         self.ctx.store.save_session(session)
         logger.info(
-            "Witness backends selected for session {session.session_id}"
+            f"Witness backends selected for session {session.session_id}"
         )
         return backends
 
@@ -1419,7 +1418,7 @@ class BootExchanger(Exchanger):
             first = errors[0]
             detail = "; ".join(str(error) for error in errors)
             logger.warning(
-                f"Session resource teardown completed with errors ({len(errors)})for session {session.session_id}: {detail}"
+                f"Session resource teardown completed with errors ({len(errors)}) for session {session.session_id}: {detail}"
             )
             raise BootError(detail, status_code=first.status_code)
         logger.info(

@@ -86,18 +86,18 @@ class BootClient:
             )
         except requests.RequestException as exc:
             logger.warning(
-                "BOOT API request failed due to request exception error: `{exc}`",
+                f"BOOT API request failed due to request exception error: `{exc}`",
             )
             raise BootError(f"Boot API request failed: {exc}") from exc
 
         if response.status_code >= 400:
             description = response.text.strip() or f"HTTP {response.status_code}"
             logger.warning(
-                "BOOT API request failed: `{description}`",
+                f"BOOT API request failed: `{description}`",
             )
             raise BootError(description, status_code=response.status_code)
 
         logger.info(
-            "BOOT API request succeeded: `{description}`",
+            f"BOOT API request succeeded: `{description}`",
         )
         return response

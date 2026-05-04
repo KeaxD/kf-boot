@@ -120,9 +120,6 @@ def create_app(config: Config | None = None, *, temp: bool = False) -> tuple[fal
             nsith="1",
             ncount=1,
         )
-    logger.info(
-        "App host hab created",
-    )
 
     ctx = Context(
         config=config,
