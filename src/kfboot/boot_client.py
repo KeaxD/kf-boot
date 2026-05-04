@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from time import monotonic
 
 from keri import help
 
@@ -75,7 +74,6 @@ class BootClient:
             )
             raise BootError("requests is required to call the downstream boot API")
         url = f"{self.base_url}{path}"
-        start = monotonic()
         logger.debug(
             "Boot API request starting",
         )
@@ -87,13 +85,11 @@ class BootClient:
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
-            elapsed_ms = int((monotonic() - start) * 1000)
             logger.warning(
                 "BOOT API request failed due to request exception error: `{exc}`",
             )
             raise BootError(f"Boot API request failed: {exc}") from exc
 
-        elapsed_ms = int((monotonic() - start) * 1000)
         if response.status_code >= 400:
             description = response.text.strip() or f"HTTP {response.status_code}"
             logger.warning(

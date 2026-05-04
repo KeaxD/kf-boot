@@ -111,7 +111,6 @@ def create_app(config: Config | None = None, *, temp: bool = False) -> tuple[fal
 
     hby = Habery(name=config.keri_name, temp=temp, headDirPath=config.keri_dir, cf=cf)
     host_hab = hby.habByName(config.boot_hab_name)
-    host_hab_created = False
     if host_hab is None:
         host_hab = hby.makeHab(
             name=config.boot_hab_name,
@@ -121,7 +120,6 @@ def create_app(config: Config | None = None, *, temp: bool = False) -> tuple[fal
             nsith="1",
             ncount=1,
         )
-        host_hab_created = True
     logger.info(
         "App host hab created",
     )
