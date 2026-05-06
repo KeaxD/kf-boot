@@ -6,12 +6,11 @@ from datetime import datetime
 from hashlib import blake2b
 from typing import Any
 
+import falcon
 from keri import help
 
 from kfboot.basing import (
     SESSION_STATE_FAILED,
-    SESSION_STATE_CANCELLED,
-    SESSION_STATE_EXPIRED,
     SESSION_STATE_WITNESS_POOL_ALLOCATED,
     TERMINAL_SESSION_STATES,
     SessionRecord,
@@ -24,7 +23,7 @@ from kfboot.store import (
     parsePublicUrl,
 )
 
-from kfboot.utils import optionalStr, bootError
+from kfboot.utils import bootErrorToHTTTP
 
 logger = help.ogler.getLogger(__name__)
 
@@ -132,7 +131,7 @@ class Provisioner:
             logger.warning(
                 f"Boot API error during session resource provisioning: {exc}"
             )
-            raise bootError(exc)
+            raise bootErrorToHTTTP(exc)
         except Exception as exc:
             logger.exception(
                 f"Unexpected error during session resource provisioning: {exc}"

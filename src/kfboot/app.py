@@ -49,10 +49,10 @@ class Context:
     watcher_boot: BootClient
     habery: Habery
     host_hab: Any
-    kramer: Kramer
-    kvy: Kevery
-    parser: Parser
-    exchanger: BootExchanger
+    kramer: Kramer | None
+    kvy: Kevery | None
+    parser: Parser | None
+    exchanger: BootExchanger | None
 
     def close(self, *, clear: bool = False) -> None:
         logger.info(
@@ -131,10 +131,10 @@ def create_app(config: Config | None = None, *, temp: bool = False) -> tuple[fal
         watcher_boot=BootClient(config.wat_boot_url),
         habery=hby,
         host_hab=host_hab,
-        kramer=None,  # type: ignore[arg-type]
-        kvy=None,  # type: ignore[arg-type]
-        parser=None,  # type: ignore[arg-type]
-        exchanger=None,  # type: ignore[arg-type]
+        kramer=None,
+        kvy=None,
+        parser=None,
+        exchanger=None,
     )
 
     exchanger = BootExchanger(

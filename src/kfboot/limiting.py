@@ -14,7 +14,6 @@ class Limiter:
     def __init__(self, ctx):
         self.ctx = ctx
         self._account_request_windows: dict[str, dict[str, Any]] = {}
-        self._account_kel_usage: dict[str, int] = {}
 
     def enforceAccountQuotas(self, serder) -> None:
         """Apply account quota enforcement for onboarding and account-side requests."""

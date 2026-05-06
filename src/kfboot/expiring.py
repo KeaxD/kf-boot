@@ -22,7 +22,7 @@ class Expirer:
         self.provisioner = provisioner
 
     def expireSessions(self) -> None:
-        for session in self.ctx.store.expire_sessions():
+        for session in self.ctx.store.expireSessions():
             logger.info(
                 f"Session expired for session {session.session_id}"
             )

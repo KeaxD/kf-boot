@@ -1,5 +1,12 @@
 # utils.py
+
+from __future__ import annotations
+
+from typing import Any
 import falcon
+
+from kfboot.boot_client import BootError
+
 
 def extractExnPayload(serder) -> dict[str, Any]:
     payload = serder.ked.get("a", {})
@@ -20,7 +27,7 @@ def requiredStr(payload: dict[str, Any], key: str) -> str:
         description=f"{key} is required.",
     )
 
-def bootError(exc: BootError) -> falcon.HTTPError:
+def bootErrorToHTTTP(exc: BootError) -> falcon.HTTPError:
     if exc.status_code == 400:
         return falcon.HTTPBadRequest(
             title="Boot API rejected request",

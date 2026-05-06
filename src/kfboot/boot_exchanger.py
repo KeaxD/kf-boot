@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
-from hashlib import blake2b
 from typing import Any
 
 import falcon
@@ -20,24 +18,20 @@ from kfboot.basing import (
     SESSION_STATE_COMPLETED,
     SESSION_STATE_EXPIRED,
     SESSION_STATE_FAILED,
-    SESSION_STATE_WITNESS_POOL_ALLOCATED,
     TERMINAL_SESSION_STATES,
     SessionRecord,
 )
 from kfboot.boot_client import BootError
 from kfboot.store import (
     accountFailed,
-    makeRecord,
     nowIso,
-    parsePublicUrl,
     resourcesToApi,
-    sessionFailed,
 )
 from kfboot.limiting import Limiter
 from kfboot.admitting import Admitter
 from kfboot.provisioning import Provisioner
 from kfboot.expiring import Expirer
-from kfboot.utils import extractExnPayload, optionalStr, requiredStr, bootError
+from kfboot.utils import extractExnPayload, optionalStr, requiredStr, bootErrorToHTTTP
 
 logger = help.ogler.getLogger(__name__)
 
@@ -52,6 +46,10 @@ class BootContext:
     habery: Any
 
 
+class RouteHandlerError(RuntimeError):
+    """Raised when route handler code fails unexpectedly."""
+
+
 class RouteHandler:
     resource: str = ""
 
@@ -59,16 +57,36 @@ class RouteHandler:
         self.exchanger = exchanger
 
     def verify(self, serder, **kwa) -> bool:
+        try:
+            return self.verifyEvent(serder, **kwa)
+        except falcon.HTTPError:
+            raise
+        except Exception as exc:
+            logger.exception("Unhandled verifier error for route %s", self.resource)
+            raise RouteHandlerError(f"Unhandled verifier error for {self.resource}") from exc
+
+    def verifyEvent(self, serder, **kwa) -> bool:
         return True
 
     def handle(self, serder, **kwa):
+        try:
+            return self.handleEvent(serder, **kwa)
+        except falcon.HTTPError:
+            raise
+        except Exception as exc:
+            # Prevents internal error to be swallowed and turned into a misleading 401 Request rejected response
+            # Unexpected handler failuers now surfaces as a 500 Route handler failed
+            logger.exception("Unhandled handler error for route %s", self.resource)
+            raise RouteHandlerError(f"Unhandled handler error for {self.resource}") from exc
+
+    def handleEvent(self, serder, **kwa):
         raise NotImplementedError
 
 
 class SessionStartHandler(RouteHandler):
     resource = "/onboarding/session/start"
 
-    def handle(self, serder, **kwa):
+    def handleEvent(self, serder, **kwa):
         sender = serder.pre
         payload = extractExnPayload(serder)
         option = self.exchanger.accountOption(payload.get("chosen_profile_code", ""))
@@ -174,7 +192,7 @@ class SessionStartHandler(RouteHandler):
         except BootError as exc:
             # mark session failed, attempt teardown, then map to HTTP error
             self.exchanger.expirer.failSession(session=session, reason=str(exc), teardown=True)
-            raise bootError(exc)
+            raise bootErrorToHTTTP(exc)
         except Exception as exc:
             # unexpected error: mark session failed and re-raise
             self.exchanger.expirer.failSession(session=session, reason=str(exc), teardown=True)
@@ -186,7 +204,7 @@ class SessionStartHandler(RouteHandler):
 class SessionStatusHandler(RouteHandler):
     resource = "/onboarding/session/status"
 
-    def handle(self, serder, **kwa):
+    def handleEvent(self, serder, **kwa):
         sender = serder.pre
         session = self.exchanger.requireSession(requiredStr(extractExnPayload(serder), "session_id"))
         self.exchanger.requireOnboardingPrincipal(sender=sender, session=session)
@@ -201,7 +219,7 @@ class SessionStatusHandler(RouteHandler):
 class AccountCreateHandler(RouteHandler):
     resource = "/onboarding/account/create"
 
-    def handle(self, serder, **kwa):
+    def handleEvent(self, serder, **kwa):
         sender = serder.pre
         payload = extractExnPayload(serder)
         session = self.exchanger.requireSession(requiredStr(payload, "session_id"))
@@ -316,7 +334,7 @@ class AccountCreateHandler(RouteHandler):
 class CompleteHandler(RouteHandler):
     resource = "/onboarding/complete"
 
-    def handle(self, serder, **kwa):
+    def handleEvent(self, serder, **kwa):
         sender = serder.pre
         payload = extractExnPayload(serder)
         session = self.exchanger.requireSession(requiredStr(payload, "session_id"))
@@ -383,7 +401,7 @@ class CompleteHandler(RouteHandler):
 class CancelHandler(RouteHandler):
     resource = "/onboarding/cancel"
 
-    def handle(self, serder, **kwa):
+    def handleEvent(self, serder, **kwa):
         sender = serder.pre
         payload = extractExnPayload(serder)
         session = self.exchanger.requireSession(requiredStr(payload, "session_id"))
@@ -412,7 +430,7 @@ class CancelHandler(RouteHandler):
                 logger.warning(
                     f"Session cancellation failed during resource teardown for session {session.session_id}"
                 )
-                raise bootError(exc)
+                raise bootErrorToHTTTP(exc)
 
             session.state = SESSION_STATE_CANCELLED
             session.updated_at = nowIso()
@@ -434,7 +452,7 @@ class CancelHandler(RouteHandler):
 class AccountWitnessesHandler(RouteHandler):
     resource = "/account/witnesses"
 
-    def handle(self, serder, **kwa):
+    def handleEvent(self, serder, **kwa):
         sender = serder.pre
         self.exchanger.requireOnboardedAccount(sender, extractExnPayload(serder))
         rows = resourcesToApi(
@@ -449,7 +467,7 @@ class AccountWitnessesHandler(RouteHandler):
 class AccountWatchersHandler(RouteHandler):
     resource = "/account/watchers"
 
-    def handle(self, serder, **kwa):
+    def handleEvent(self, serder, **kwa):
         sender = serder.pre
         self.exchanger.requireOnboardedAccount(sender, extractExnPayload(serder))
         rows = resourcesToApi(
@@ -464,7 +482,7 @@ class AccountWatchersHandler(RouteHandler):
 class AccountWatcherStatusHandler(RouteHandler):
     resource = "/account/watchers/status"
 
-    def handle(self, serder, **kwa):
+    def handleEvent(self, serder, **kwa):
         sender = serder.pre
         payload = extractExnPayload(serder)
         self.exchanger.requireOnboardedAccount(sender, payload)
@@ -486,7 +504,7 @@ class AccountWatcherStatusHandler(RouteHandler):
             logger.warning(
                 f"Query for watcher status failed for watcher {watcher_id} due to boot API error: {exc}"
             )
-            raise bootError(exc)
+            raise bootErrorToHTTTP(exc)
 
         derived_status = _watcherStatusLabel(status)
         if derived_status:
@@ -509,7 +527,7 @@ class AccountWatcherStatusHandler(RouteHandler):
 class AccountWitnessDeleteHandler(RouteHandler):
     resource = "/account/witnesses/delete"
 
-    def handle(self, serder, **kwa):
+    def handleEvent(self, serder, **kwa):
         sender = serder.pre
         payload = extractExnPayload(serder)
         account = self.exchanger.requireOnboardedAccount(sender, payload)
@@ -534,7 +552,7 @@ class AccountWitnessDeleteHandler(RouteHandler):
             logger.warning(
                 f"Account witness delete failed for witness {witness_id} from {sender}: {exc}"
             )
-            raise bootError(exc)
+            raise bootErrorToHTTTP(exc)
 
         self.exchanger.queueReply(
             self.resource,
@@ -546,7 +564,7 @@ class AccountWitnessDeleteHandler(RouteHandler):
 class AccountWatcherDeleteHandler(RouteHandler):
     resource = "/account/watchers/delete"
 
-    def handle(self, serder, **kwa):
+    def handleEvent(self, serder, **kwa):
         sender = serder.pre
         payload = extractExnPayload(serder)
         account = self.exchanger.requireOnboardedAccount(sender, payload)
@@ -571,7 +589,7 @@ class AccountWatcherDeleteHandler(RouteHandler):
             logger.warning(
                 f"Account watcher delete failed for watcher {watcher_id} from {sender}: {str(exc)}"
             )
-            raise bootError(exc)
+            raise bootErrorToHTTTP(exc)
 
         self.exchanger.queueReply(
             self.resource,
@@ -583,7 +601,7 @@ class AccountWatcherDeleteHandler(RouteHandler):
 class AccountDeleteHandler(RouteHandler):
     resource = "/account/delete"
 
-    def handle(self, serder, **kwa):
+    def handleEvent(self, serder, **kwa):
         sender = serder.pre
         payload = extractExnPayload(serder)
         account_aid = optionalStr(payload, "account_aid") or sender
@@ -621,7 +639,7 @@ class AccountDeleteHandler(RouteHandler):
             logger.warning(
                 f"Account delete failed for account AID {account_aid}: {exc}"
             )
-            raise bootError(exc)
+            raise bootErrorToHTTTP(exc)
 
         logger.info(
             f"Account deleted for account AID {sender}"
@@ -853,6 +871,13 @@ class BootExchanger(Exchanger):
             logger.warning(
                 f"Exchange event processing failed with HTTP error: {exc}"
             )
+            return None
+        except RouteHandlerError as exc:
+            self.last_error = falcon.HTTPInternalServerError(
+                title="Route handler failed",
+                description="The boot service could not process this route.",
+            )
+            logger.exception("Exchange route handler failed: %s", exc)
             return None
 
 

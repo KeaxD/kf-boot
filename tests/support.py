@@ -200,7 +200,8 @@ def make_config(tmp_path, *, index: int = 0, **overrides: Any) -> Config:
 
 
 def freeze_boot_time(monkeypatch, current: datetime):
-    import kfboot.boot_exchanger as boot_exchanger
+    import kfboot.expiring as expiring
+    import kfboot.limiting as limiting
     import kfboot.store as store
     
     class FrozenDateTime:
@@ -218,7 +219,8 @@ def freeze_boot_time(monkeypatch, current: datetime):
         def fromisoformat(cls, value: str):
             return datetime.fromisoformat(value)
 
-    monkeypatch.setattr(boot_exchanger, "datetime", FrozenDateTime)
+    monkeypatch.setattr(expiring, "datetime", FrozenDateTime)
+    monkeypatch.setattr(limiting, "datetime", FrozenDateTime)
     monkeypatch.setattr(store, "datetime", FrozenDateTime)
     return FrozenDateTime
 

@@ -72,7 +72,7 @@ class Store:
     def close(self) -> None:
         self.baser.close()
 
-    def expire_sessions(self, *, now: str | None = None) -> list[SessionRecord]:
+    def expireSessions(self, *, now: str | None = None) -> list[SessionRecord]:
         current = _parseDt(now or nowIso())
         expired: list[SessionRecord] = []
         for _, record in self.baser.sessions.getTopItemIter(keys=()):

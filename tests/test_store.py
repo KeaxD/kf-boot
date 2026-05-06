@@ -143,7 +143,7 @@ def test_expire_sessions_marks_only_non_terminal_records(store):
     terminal.expires_at = "2024-01-01T00:00:00+00:00"
     store.saveSession(terminal)
 
-    expired = store.expire_sessions(now="2024-01-01T00:00:01+00:00")
+    expired = store.expireSessions(now="2024-01-01T00:00:01+00:00")
 
     assert store.getSession(open_session.session_id).state == SESSION_STATE_EXPIRED
     assert store.getSession(terminal.session_id).state == SESSION_STATE_COMPLETED

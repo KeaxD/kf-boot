@@ -3,9 +3,6 @@ from keri import help
 import falcon
 from typing import Any 
 
-from kfboot.utils import optionalStr
-from kfboot.config import ONBOARDING_ROUTES
-
 from kfboot.basing import (
     ACCOUNT_STATE_ONBOARDED,
     ACCOUNT_STATE_PENDING_ONBOARDING,
