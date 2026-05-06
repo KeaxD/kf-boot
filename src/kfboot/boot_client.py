@@ -24,18 +24,18 @@ class BootClient:
     base_url: str
     timeout: int = 10
 
-    def allocate_witness(self, account_aid: str) -> dict:
+    def allocateWitness(self, account_aid: str) -> dict:
         """Allocate a hosted witness for the permanent account AID."""
 
         return self._json("POST", "/witnesses", json={"aid": account_aid})
 
-    def create_witness(self, cid: str) -> dict:
-        return self.allocate_witness(cid)
+    def createWitness(self, cid: str) -> dict:
+        return self.allocateWitness(cid)
 
-    def delete_witness(self, eid: str) -> None:
+    def deleteWitness(self, eid: str) -> None:
         self._empty("DELETE", f"/witnesses/{eid}")
 
-    def allocate_watcher(self, account_aid: str, oobi: str | None = None) -> dict:
+    def allocateWatcher(self, account_aid: str, oobi: str | None = None) -> dict:
         """Allocate a hosted watcher for the permanent account AID."""
 
         payload = {"aid": account_aid}
@@ -43,13 +43,13 @@ class BootClient:
             payload["oobi"] = oobi
         return self._json("POST", "/watchers", json=payload)
 
-    def create_watcher(self, cid: str, oobi: str | None = None) -> dict:
-        return self.allocate_watcher(cid, oobi=oobi)
+    def createWatcher(self, cid: str, oobi: str | None = None) -> dict:
+        return self.allocateWatcher(cid, oobi=oobi)
 
-    def delete_watcher(self, eid: str) -> None:
+    def deleteWatcher(self, eid: str) -> None:
         self._empty("DELETE", f"/watchers/{eid}")
 
-    def watcher_status(self, eid: str) -> dict:
+    def watcherStatus(self, eid: str) -> dict:
         return self._json("GET", f"/watchers/{eid}/status")
 
     def _json(self, method: str, path: str, json: dict | None = None) -> dict:

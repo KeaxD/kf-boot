@@ -62,7 +62,7 @@ class Provisioner:
                     logger.info(
                         f"Witness allocation start for session {session.session_id}"
                     )
-                    created = self._witnessClient(backend.id).allocate_witness(session.account_aid)
+                    created = self._witnessClient(backend.id).allocateWitness(session.account_aid)
                     record = makeRecord(
                         kind="witness",
                         eid=str(created.get("eid", "")),
@@ -104,7 +104,7 @@ class Provisioner:
                 logger.info(
                     f"Watcher allocation start for session {session.session_id}"
                 )
-                created = self.ctx.watcher_boot.allocate_watcher(session.account_aid, oobi=oobi)
+                created = self.ctx.watcher_boot.allocateWatcher(session.account_aid, oobi=oobi)
                 record = makeRecord(
                     kind="watcher",
                     eid=str(created.get("eid", "")),
@@ -556,9 +556,9 @@ class Provisioner:
             self._persistOwnerState(session=session, account=account)
             return
         if kind == "witness":
-            delete_remote = self._witnessClientForRecord(record).delete_witness
+            delete_remote = self._witnessClientForRecord(record).deleteWitness
         else:
-            delete_remote = self.ctx.watcher_boot.delete_watcher
+            delete_remote = self.ctx.watcher_boot.deleteWatcher
         logger.info(
             f"Resource deletion started for {kind} with EID {eid}",
         )

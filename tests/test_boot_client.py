@@ -60,8 +60,8 @@ def test_allocate_methods_send_expected_requests(monkeypatch):
 
     client = BootClient("http://boot.local", timeout=7)
 
-    assert client.allocate_witness("AID1") == {"eid": "W1"}
-    assert client.allocate_watcher("AID1", oobi="oobi://watcher") == {"eid": "WA1"}
+    assert client.allocateWitness("AID1") == {"eid": "W1"}
+    assert client.allocateWatcher("AID1", oobi="oobi://watcher") == {"eid": "WA1"}
     assert requests.calls == [
         {
             "method": "POST",
@@ -89,8 +89,8 @@ def test_legacy_create_methods_delegate_to_session_allocation_helpers(monkeypatc
 
     client = BootClient("http://boot.local")
 
-    assert client.create_witness("AID1") == {"eid": "W1"}
-    assert client.create_watcher("AID1") == {"eid": "WA1"}
+    assert client.createWitness("AID1") == {"eid": "W1"}
+    assert client.createWatcher("AID1") == {"eid": "WA1"}
     assert requests.calls == [
         {
             "method": "POST",
@@ -107,12 +107,12 @@ def test_legacy_create_methods_delegate_to_session_allocation_helpers(monkeypatc
     ]
 
 
-def test_create_watcher_omits_oobi_when_not_provided(monkeypatch):
+def test_createWatcher_omits_oobi_when_not_provided(monkeypatch):
     requests = RecordingRequests(responses=[FakeResponse(json_data={"eid": "WA1"})])
     monkeypatch.setattr(boot_client_module, "requests", requests)
 
     client = BootClient("http://boot.local")
-    client.create_watcher("AID1")
+    client.createWatcher("AID1")
 
     assert requests.calls == [
         {
@@ -142,9 +142,9 @@ def test_delete_and_status_methods_send_expected_requests(monkeypatch):
 
     client = BootClient("http://boot.local")
 
-    assert client.delete_witness("W1") is None
-    assert client.delete_watcher("WA1") is None
-    assert client.watcher_status("WA1") == {
+    assert client.deleteWitness("W1") is None
+    assert client.deleteWatcher("WA1") is None
+    assert client.watcherStatus("WA1") == {
         "watcher_id": "WA1",
         "controller_id": "AID1",
         "summary": {"total_witnesses": 1, "responsive_witnesses": 1},
@@ -176,7 +176,7 @@ def test_http_error_preserves_status_and_body(monkeypatch):
     monkeypatch.setattr(boot_client_module, "requests", requests)
 
     with pytest.raises(BootError) as excinfo:
-        BootClient("http://boot.local").create_witness("AID1")
+        BootClient("http://boot.local").createWitness("AID1")
 
     assert str(excinfo.value) == "already exists"
     assert excinfo.value.status_code == 409
@@ -187,7 +187,7 @@ def test_http_error_without_body_uses_status_fallback(monkeypatch):
     monkeypatch.setattr(boot_client_module, "requests", requests)
 
     with pytest.raises(BootError) as excinfo:
-        BootClient("http://boot.local").delete_watcher("WA1")
+        BootClient("http://boot.local").deleteWatcher("WA1")
 
     assert str(excinfo.value) == "HTTP 503"
     assert excinfo.value.status_code == 503
@@ -200,7 +200,7 @@ def test_invalid_json_response_raisesbootError_with_status(monkeypatch):
     monkeypatch.setattr(boot_client_module, "requests", requests)
 
     with pytest.raises(BootError) as excinfo:
-        BootClient("http://boot.local").watcher_status("WA1")
+        BootClient("http://boot.local").watcherStatus("WA1")
 
     assert "Invalid JSON from boot API" in str(excinfo.value)
     assert excinfo.value.status_code == 200
@@ -211,7 +211,7 @@ def test_request_exception_raisesbootError(monkeypatch):
     monkeypatch.setattr(boot_client_module, "requests", requests)
 
     with pytest.raises(BootError) as excinfo:
-        BootClient("http://boot.local").create_watcher("AID1")
+        BootClient("http://boot.local").createWatcher("AID1")
 
     assert str(excinfo.value) == "Boot API request failed: boom"
     assert excinfo.value.status_code is None
@@ -221,7 +221,7 @@ def test_missing_requests_dependency_raisesbootError(monkeypatch):
     monkeypatch.setattr(boot_client_module, "requests", None)
 
     with pytest.raises(BootError) as excinfo:
-        BootClient("http://boot.local").create_witness("AID1")
+        BootClient("http://boot.local").createWitness("AID1")
 
     assert str(excinfo.value) == "requests is required to call the downstream boot API"
     assert excinfo.value.status_code is None

@@ -32,7 +32,7 @@ class FakeWitnessBoot:
         self.create_error = create_error
         self.delete_error = delete_error
 
-    def create_witness(self, cid: str) -> dict[str, Any]:
+    def createWitness(self, cid: str) -> dict[str, Any]:
         self.create_calls += 1
         self.create_cids.append(cid)
         if self.create_error is not None:
@@ -47,10 +47,10 @@ class FakeWitnessBoot:
             "status": "allocated",
         }
 
-    def allocate_witness(self, account_aid: str) -> dict[str, Any]:
-        return self.create_witness(account_aid)
+    def allocateWitness(self, account_aid: str) -> dict[str, Any]:
+        return self.createWitness(account_aid)
 
-    def delete_witness(self, eid: str) -> None:
+    def deleteWitness(self, eid: str) -> None:
         self.delete_calls.append(eid)
         if self.delete_error is not None:
             raise self.delete_error
@@ -83,7 +83,7 @@ class FakeWatcherBoot:
             },
         }
 
-    def create_watcher(self, cid: str, oobi: str | None = None) -> dict[str, Any]:
+    def createWatcher(self, cid: str, oobi: str | None = None) -> dict[str, Any]:
         self.create_calls += 1
         self.create_cids.append(cid)
         self.create_oobis.append(oobi)
@@ -99,15 +99,15 @@ class FakeWatcherBoot:
             "oobi": oobi or "",
         }
 
-    def allocate_watcher(self, account_aid: str, oobi: str | None = None) -> dict[str, Any]:
-        return self.create_watcher(account_aid, oobi=oobi)
+    def allocateWatcher(self, account_aid: str, oobi: str | None = None) -> dict[str, Any]:
+        return self.createWatcher(account_aid, oobi=oobi)
 
-    def delete_watcher(self, eid: str) -> None:
+    def deleteWatcher(self, eid: str) -> None:
         self.delete_calls.append(eid)
         if self.delete_error is not None:
             raise self.delete_error
 
-    def watcher_status(self, eid: str) -> dict[str, Any]:
+    def watcherStatus(self, eid: str) -> dict[str, Any]:
         self.status_calls.append(eid)
         if self.status_error is not None:
             raise self.status_error

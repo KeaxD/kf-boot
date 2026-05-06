@@ -53,7 +53,7 @@ def test_approved_account_routes_return_resources_update_status_and_delete_recor
     assert [row["eid"] for row in watchers_reply.ked["a"]["watchers"]] == [watcher_id]
     assert "boot_url" not in watchers_reply.ked["a"]["watchers"][0]
 
-    watcher_status = post_cesr(
+    watcherStatus = post_cesr(
         contract,
         "/account",
         build_exn(
@@ -62,7 +62,7 @@ def test_approved_account_routes_return_resources_update_status_and_delete_recor
             payload={"account_aid": account.pre, "watcher_eid": watcher_id},
         ),
     )
-    _, status_reply = assert_reply_frame(contract, watcher_status, route="/account/watchers/status")
+    _, status_reply = assert_reply_frame(contract, watcherStatus, route="/account/watchers/status")
     assert status_reply.ked["a"]["watcher"]["status"] == "connected"
     assert contract.ctx.store.getResource("watcher", watcher_id).status == "connected"
     assert contract.ctx.watcher_boot.status_calls == [watcher_id]
@@ -223,7 +223,7 @@ def test_account_delete_failure_keeps_remaining_state_retryable(onboarded_bundle
         ),
     ],
 )
-def test_account_watcher_status_derives_non_happy_path_labels(
+def test_account_watcherStatus_derives_non_happy_path_labels(
     onboarded_bundle,
     status_response,
     expected_status,

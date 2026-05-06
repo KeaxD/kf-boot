@@ -499,7 +499,7 @@ class AccountWatcherStatusHandler(RouteHandler):
             raise falcon.HTTPNotFound(title="Watcher not found")
 
         try:
-            status = self.exchanger.ctx.watcher_boot.watcher_status(watcher_id)
+            status = self.exchanger.ctx.watcher_boot.watcherStatus(watcher_id)
         except BootError as exc:
             logger.warning(
                 f"Query for watcher status failed for watcher {watcher_id} due to boot API error: {exc}"
