@@ -32,7 +32,7 @@ def test_approved_account_routes_return_resources_update_status_and_delete_recor
     account = onboarded_bundle["account"]
     witness_id = onboarded_bundle["witness_ids"][0]
     watcher_id = onboarded_bundle["watcher_id"]
-    witness_record = contract.ctx.store.get_resource("witness", witness_id)
+    witness_record = contract.ctx.store.getResource("witness", witness_id)
 
     witnesses = post_cesr(
         contract,
@@ -64,7 +64,7 @@ def test_approved_account_routes_return_resources_update_status_and_delete_recor
     )
     _, status_reply = assert_reply_frame(contract, watcher_status, route="/account/watchers/status")
     assert status_reply.ked["a"]["watcher"]["status"] == "connected"
-    assert contract.ctx.store.get_resource("watcher", watcher_id).status == "connected"
+    assert contract.ctx.store.getResource("watcher", watcher_id).status == "connected"
     assert contract.ctx.watcher_boot.status_calls == [watcher_id]
 
     witness_delete = post_cesr(
@@ -84,8 +84,8 @@ def test_approved_account_routes_return_resources_update_status_and_delete_recor
     assert witness_delete_reply.ked["a"]["account_aid"] == account.pre
     assert witness_delete_reply.ked["a"]["witness_id"] == witness_id
     assert witness_delete_reply.ked["a"]["deleted"] is True
-    assert contract.ctx.store.get_resource("witness", witness_id) is None
-    assert contract.ctx.store.get_account(account.pre).witness_eids == []
+    assert contract.ctx.store.getResource("witness", witness_id) is None
+    assert contract.ctx.store.getAccount(account.pre).witness_eids == []
 
     watcher_delete = post_cesr(
         contract,
@@ -100,8 +100,8 @@ def test_approved_account_routes_return_resources_update_status_and_delete_recor
     assert watcher_delete_reply.ked["a"]["account_aid"] == account.pre
     assert watcher_delete_reply.ked["a"]["watcher_id"] == watcher_id
     assert watcher_delete_reply.ked["a"]["deleted"] is True
-    assert contract.ctx.store.get_resource("watcher", watcher_id) is None
-    assert contract.ctx.store.get_account(account.pre).watcher_eid == ""
+    assert contract.ctx.store.getResource("watcher", watcher_id) is None
+    assert contract.ctx.store.getAccount(account.pre).watcher_eid == ""
     assert total_witness_delete_calls(contract.ctx) == [witness_id]
     for backend_id, boot in contract.ctx.witness_boots.items():
         expected = [witness_id] if backend_id == witness_record.backend_id else []
@@ -115,7 +115,7 @@ def test_account_delete_route_removes_account_state_and_is_idempotent(onboarded_
     session_id = onboarded_bundle["session_id"]
     witness_ids = onboarded_bundle["witness_ids"]
     watcher_id = onboarded_bundle["watcher_id"]
-    contract.ctx.store.add_binding(account.pre, "cid-to-delete")
+    contract.ctx.store.addBinding(account.pre, "cid-to-delete")
 
     first = post_cesr(
         contract,
@@ -130,11 +130,11 @@ def test_account_delete_route_removes_account_state_and_is_idempotent(onboarded_
     assert first_reply.ked["a"]["account_aid"] == account.pre
     assert first_reply.ked["a"]["deleted"] is True
     assert contract.ctx.store.baser.bindings.get(keys=(account.pre, "cid-to-delete")) is None
-    assert contract.ctx.store.get_account(account.pre) is None
-    assert contract.ctx.store.get_session(session_id) is None
-    assert contract.ctx.store.get_resource("watcher", watcher_id) is None
+    assert contract.ctx.store.getAccount(account.pre) is None
+    assert contract.ctx.store.getSession(session_id) is None
+    assert contract.ctx.store.getResource("watcher", watcher_id) is None
     for witness_id in witness_ids:
-        assert contract.ctx.store.get_resource("witness", witness_id) is None
+        assert contract.ctx.store.getResource("witness", witness_id) is None
     assert total_witness_delete_calls(contract.ctx) == witness_ids
     assert contract.ctx.watcher_boot.delete_calls == [watcher_id]
 
@@ -150,8 +150,8 @@ def test_account_delete_route_removes_account_state_and_is_idempotent(onboarded_
     _, second_reply = assert_reply_frame(contract, second, route="/account/delete")
     assert second_reply.ked["a"]["account_aid"] == account.pre
     assert second_reply.ked["a"]["deleted"] is True
-    assert contract.ctx.store.get_account(account.pre) is None
-    assert contract.ctx.store.get_session(session_id) is None
+    assert contract.ctx.store.getAccount(account.pre) is None
+    assert contract.ctx.store.getSession(session_id) is None
     assert total_witness_delete_calls(contract.ctx) == witness_ids
     assert contract.ctx.watcher_boot.delete_calls == [watcher_id]
 
@@ -162,7 +162,7 @@ def test_account_delete_failure_keeps_remaining_state_retryable(onboarded_bundle
     session_id = onboarded_bundle["session_id"]
     witness_id = onboarded_bundle["witness_ids"][0]
     watcher_id = onboarded_bundle["watcher_id"]
-    witness_record = contract.ctx.store.get_resource("witness", witness_id)
+    witness_record = contract.ctx.store.getResource("witness", witness_id)
     witness_boot = contract.ctx.witness_boots[witness_record.backend_id]
     witness_boot.delete_error = BootError("simulated witness delete failure", status_code=503)
 
@@ -178,14 +178,14 @@ def test_account_delete_failure_keeps_remaining_state_retryable(onboarded_bundle
 
     assert failed.status_code == 502
     assert failed.json["title"] == "Boot API call failed"
-    account_record = contract.ctx.store.get_account(account.pre)
+    account_record = contract.ctx.store.getAccount(account.pre)
     assert account_record is not None
     assert account_record.status == ACCOUNT_STATE_ONBOARDED
     assert account_record.watcher_eid == ""
     assert account_record.witness_eids == [witness_id]
-    assert contract.ctx.store.get_session(session_id) is not None
-    assert contract.ctx.store.get_resource("watcher", watcher_id) is None
-    assert contract.ctx.store.get_resource("witness", witness_id) is not None
+    assert contract.ctx.store.getSession(session_id) is not None
+    assert contract.ctx.store.getResource("watcher", watcher_id) is None
+    assert contract.ctx.store.getResource("witness", witness_id) is not None
     assert contract.ctx.watcher_boot.delete_calls == [watcher_id]
     assert witness_boot.delete_calls == [witness_id]
 
@@ -202,9 +202,9 @@ def test_account_delete_failure_keeps_remaining_state_retryable(onboarded_bundle
 
     _, retry_reply = assert_reply_frame(contract, retry, route="/account/delete")
     assert retry_reply.ked["a"]["deleted"] is True
-    assert contract.ctx.store.get_account(account.pre) is None
-    assert contract.ctx.store.get_session(session_id) is None
-    assert contract.ctx.store.get_resource("witness", witness_id) is None
+    assert contract.ctx.store.getAccount(account.pre) is None
+    assert contract.ctx.store.getSession(session_id) is None
+    assert contract.ctx.store.getResource("witness", witness_id) is None
     assert contract.ctx.watcher_boot.delete_calls == [watcher_id]
     assert witness_boot.delete_calls == [witness_id, witness_id]
 
@@ -250,14 +250,14 @@ def test_account_watcher_status_derives_non_happy_path_labels(
     _, reply = assert_reply_frame(contract, response, route="/account/watchers/status")
     assert reply.ked["a"]["watcher_id"] == watcher_id
     assert reply.ked["a"]["watcher"]["status"] == expected_status
-    assert contract.ctx.store.get_resource("watcher", watcher_id).status == expected_status
+    assert contract.ctx.store.getResource("watcher", watcher_id).status == expected_status
 
 
 def test_witness_delete_routes_to_the_persisted_backend_id(onboarded_bundle):
     contract = onboarded_bundle["contract"]
     account = onboarded_bundle["account"]
     witness_id = onboarded_bundle["witness_ids"][0]
-    record = contract.ctx.store.get_resource("witness", witness_id)
+    record = contract.ctx.store.getResource("witness", witness_id)
     target_backend = next(
         backend
         for backend in reversed(contract.ctx.config.witness_backends)
@@ -266,7 +266,7 @@ def test_witness_delete_routes_to_the_persisted_backend_id(onboarded_bundle):
     record.backend_id = target_backend.id
     record.boot_url = target_backend.boot_url
     record.url = target_backend.public_url
-    contract.ctx.store.save_resource(record)
+    contract.ctx.store.saveResource(record)
 
     response = post_cesr(
         contract,
@@ -289,7 +289,7 @@ def test_witness_delete_routes_legacy_records_by_public_url_when_backend_fields_
     contract = onboarded_bundle["contract"]
     account = onboarded_bundle["account"]
     witness_id = onboarded_bundle["witness_ids"][0]
-    record = contract.ctx.store.get_resource("witness", witness_id)
+    record = contract.ctx.store.getResource("witness", witness_id)
     expected_backend_id = record.backend_id
 
     for boot in contract.ctx.witness_boots.values():
@@ -297,7 +297,7 @@ def test_witness_delete_routes_legacy_records_by_public_url_when_backend_fields_
 
     record.backend_id = ""
     record.boot_url = ""
-    contract.ctx.store.save_resource(record)
+    contract.ctx.store.saveResource(record)
 
     response = post_cesr(
         contract,
@@ -399,7 +399,7 @@ def test_approved_account_routes_require_an_onboarded_account(pending_account_bu
 
     assert response.status_code == 409
     assert response.json["title"] == "Account not onboarded"
-    assert contract.ctx.store.get_account(account.pre).status == ACCOUNT_STATE_PENDING_ONBOARDING
+    assert contract.ctx.store.getAccount(account.pre).status == ACCOUNT_STATE_PENDING_ONBOARDING
 
 
 @pytest.mark.parametrize(
@@ -553,7 +553,7 @@ def test_account_routes_enforce_persisted_witness_profile_code(contract_factory)
             account_aid=account.pre,
         )
 
-        record = contract.ctx.store.get_account(account.pre)
+        record = contract.ctx.store.getAccount(account.pre)
         assert record.witness_profile_code == "3-of-4"
 
         accepted = post_cesr(
@@ -578,16 +578,16 @@ def test_expire_accounts_transitions_onboarded_account_to_expired(onboarded_bund
     """Ensure onboarded accounts are moved to expired status when their expiry date passes."""
     contract = onboarded_bundle["contract"]
     account = onboarded_bundle["account"]
-    record = contract.ctx.store.get_account(account.pre)
+    record = contract.ctx.store.getAccount(account.pre)
     
     # Set the account expiry date to the past to trigger expiration
     record.expires_at = "2000-01-01T00:00:00+00:00"
-    contract.ctx.store.save_account(record)
+    contract.ctx.store.saveAccount(record)
 
     # Manually trigger the expiration process
     contract.ctx.exchanger.expirer.expireAccounts()
 
-    updated = contract.ctx.store.get_account(account.pre)
+    updated = contract.ctx.store.getAccount(account.pre)
     assert updated is not None
     assert updated.status == ACCOUNT_STATE_EXPIRED
 
@@ -596,9 +596,9 @@ def test_account_route_expires_past_due_account_on_ingress(onboarded_bundle):
     """Tests account requests trigger lifecycle expiry before route handling."""
     contract = onboarded_bundle["contract"]
     account = onboarded_bundle["account"]
-    record = contract.ctx.store.get_account(account.pre)
+    record = contract.ctx.store.getAccount(account.pre)
     record.expires_at = "2000-01-01T00:00:00+00:00"
-    contract.ctx.store.save_account(record)
+    contract.ctx.store.saveAccount(record)
 
     response = post_cesr(
         contract,
@@ -606,7 +606,7 @@ def test_account_route_expires_past_due_account_on_ingress(onboarded_bundle):
         build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
     )
 
-    updated = contract.ctx.store.get_account(account.pre)
+    updated = contract.ctx.store.getAccount(account.pre)
     assert updated is not None
     assert updated.status == ACCOUNT_STATE_EXPIRED
     assert response.status_code == 409
@@ -624,11 +624,11 @@ def test_account_routes_reject_paused_or_expired_accounts(onboarded_bundle, stat
     """Ensure paused or expired accounts cannot use account routes."""
     contract = onboarded_bundle["contract"]
     account = onboarded_bundle["account"]
-    record = contract.ctx.store.get_account(account.pre)
+    record = contract.ctx.store.getAccount(account.pre)
 
     # Set status to paused or expired to trigger rejection of account routes
     record.status = status
-    contract.ctx.store.save_account(record)
+    contract.ctx.store.saveAccount(record)
 
     response = post_cesr(
         contract,
@@ -648,7 +648,7 @@ def test_expire_accounts_triggers_resource_teardown(contract_factory, monkeypatc
     )
 
     # Create an onboarded account with resources
-    account = contract.ctx.store.build_account(
+    account = contract.ctx.store.buildAccount(
         account_aid="AID_EXPIRED",
         account_alias="beta",
         witness_profile_code="1-of-1",
@@ -665,16 +665,16 @@ def test_expire_accounts_triggers_resource_teardown(contract_factory, monkeypatc
     )
     account.status = ACCOUNT_STATE_ONBOARDED
     account.expires_at = "2000-01-01T00:00:00+00:00"
-    contract.ctx.store.save_account(account)
+    contract.ctx.store.saveAccount(account)
 
     cleaned: list[tuple] = []
 
     def fake_teardown(*, account_aid: str, account=None) -> None:
-        # Simulate what teardown_account_resources would do
+        # Simulate what teardown_accountResources would do
         account.watcher_eid = ""
         account.witness_eids = []
         account.session_id = ""
-        contract.ctx.store.save_account(account)
+        contract.ctx.store.saveAccount(account)
         cleaned.append((account_aid, account))
 
     monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownAccountResources", fake_teardown)
@@ -682,7 +682,7 @@ def test_expire_accounts_triggers_resource_teardown(contract_factory, monkeypatc
     # Run expiration logic
     contract.ctx.exchanger.expirer.expireAccounts()
 
-    expired = contract.ctx.store.get_account("AID_EXPIRED")
+    expired = contract.ctx.store.getAccount("AID_EXPIRED")
     assert expired is not None
     assert expired.status == ACCOUNT_STATE_EXPIRED
 

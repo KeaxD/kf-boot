@@ -44,7 +44,7 @@ class Admitter:
         if not client_ip:
             return
 
-        active = self.ctx.store.list_active_sessions_for_ip(client_ip)
+        active = self.ctx.store.listActiveSessionsForIp(client_ip)
         active_accounts = {record.account_aid for record in active if record.account_aid}
         active_ephemerals = {record.ephemeral_aid for record in active if record.ephemeral_aid}
 
@@ -78,7 +78,7 @@ class Admitter:
 
         # Check account alias limits when provided
         if profile is not None and account_alias:
-            alias_accounts = self.ctx.store.list_accounts_for_alias(account_alias)
+            alias_accounts = self.ctx.store.listAccountsForAlias(account_alias)
             # Count accounts that are pending onboarding or already onboarded
             pending_and_onboarded = [
                 record
@@ -86,7 +86,7 @@ class Admitter:
                 if record.status in {ACCOUNT_STATE_PENDING_ONBOARDING, ACCOUNT_STATE_ONBOARDED}
             ]
             # Add any active sessions for the alias
-            active_alias_sessions = self.ctx.store.list_active_sessions_for_alias(account_alias)
+            active_alias_sessions = self.ctx.store.listActiveSessionsForAlias(account_alias)
             active_alias_session_count = len(
                 [
                     session

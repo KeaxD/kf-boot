@@ -6,7 +6,7 @@ from typing import Any
 
 from kfboot.utils import _payload, _optional_str
 from kfboot.config import ONBOARDING_ROUTES, ACCOUNT_ROUTES 
-from kfboot.store import now_iso
+from kfboot.store import nowIso
 
 logger = help.ogler.getLogger(__name__)
 
@@ -42,7 +42,7 @@ class Limiter:
         """Enforce per-account request limits on onboarding and account routes."""
         
         # Get the current time and the request window for this account
-        now = datetime.fromisoformat(now_iso())
+        now = datetime.fromisoformat(nowIso())
         window = self._account_request_windows.setdefault(
             account_aid,
             {"start": now, "count": 0},
@@ -81,7 +81,7 @@ class Limiter:
         if profile.kel_budget <= 0:
             return
 
-        account = self.ctx.store.get_account(account_aid)
+        account = self.ctx.store.getAccount(account_aid)
         if account is None:
             logger.info(
                 f"Account does not exist yet, skipping enforcing KEL budget"
@@ -104,7 +104,7 @@ class Limiter:
 
         count += 1
         account.kel_used = count
-        self.ctx.store.save_account(account)
+        self.ctx.store.saveAccount(account)
         ratio = count / max(profile.kel_budget, 1)
         if ratio >= 0.95:
             logger.warning(f"Approaching KEL budget limit for account {account_aid}, current rate: 95%")
@@ -125,7 +125,7 @@ class Limiter:
         # For other onboarding routes, resolve the account AID and profile from the session context
         session_id = _optional_str(payload, "session_id")
         if session_id:
-            session = self.ctx.store.get_session(session_id)
+            session = self.ctx.store.getSession(session_id)
             if session is not None:
                 profile = self.ctx.config.account_profile(session.chosen_profile_code)
                 account_aid = session.account_aid or _optional_str(payload, "account_aid")
@@ -135,7 +135,7 @@ class Limiter:
         if route in ACCOUNT_ROUTES:
             # Account routes are authenticated by the account AID sender.
             account_aid = sender
-            account = self.ctx.store.get_account(account_aid)
+            account = self.ctx.store.getAccount(account_aid)
             profile = self.ctx.config.account_profile(account.witness_profile_code) if account is not None else None
             return account_aid, profile
 

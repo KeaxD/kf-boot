@@ -19,9 +19,9 @@ from kfboot.basing import (
 
 from kfboot.boot_client import BootError
 from kfboot.store import (
-    make_record,
-    now_iso,
-    parse_public_url,
+    makeRecord,
+    nowIso,
+    parsePublicUrl,
 )
 
 from kfboot.utils import _optional_str, _payload, _boot_error
@@ -64,7 +64,7 @@ class Provisioner:
                         f"Witness allocation start for session {session.session_id}"
                     )
                     created = self._witnessClient(backend.id).allocate_witness(session.account_aid)
-                    record = make_record(
+                    record = makeRecord(
                         kind="witness",
                         eid=str(created.get("eid", "")),
                         backend_id=backend.id,
@@ -80,17 +80,17 @@ class Provisioner:
                         oobis=list(created.get("oobis", []) or []),
                         status=str(created.get("status", "") or "allocated"),
                     )
-                    self.ctx.store.add_resource(record)
+                    self.ctx.store.addResource(record)
                     session.witness_eids.append(record.eid)
-                    session.updated_at = now_iso()
-                    self.ctx.store.save_session(session)
+                    session.updated_at = nowIso()
+                    self.ctx.store.saveSession(session)
                     logger.info(
                         f"Witness allocated for session {session.session_id}: witness {record.eid}"
                     )
 
                 session.state = SESSION_STATE_WITNESS_POOL_ALLOCATED
-                session.updated_at = now_iso()
-                self.ctx.store.save_session(session)
+                session.updated_at = nowIso()
+                self.ctx.store.saveSession(session)
                 logger.info(
                     f"Witness pool allocated for session {session.session_id}: witness EIDs {session.witness_eids}"
                 )
@@ -100,13 +100,13 @@ class Provisioner:
                     f"Watcher requested for session {session.session_id}"
                 )
                 self._ensureCapacity(kind="watcher", requested=1)
-                first_witness = self.ctx.store.get_resource("witness", session.witness_eids[0])
+                first_witness = self.ctx.store.getResource("witness", session.witness_eids[0])
                 oobi = first_witness.oobis[0] if first_witness and first_witness.oobis else None
                 logger.info(
                     f"Watcher allocation start for session {session.session_id}"
                 )
                 created = self.ctx.watcher_boot.allocate_watcher(session.account_aid, oobi=oobi)
-                record = make_record(
+                record = makeRecord(
                     kind="watcher",
                     eid=str(created.get("eid", "")),
                     cid="",
@@ -121,10 +121,10 @@ class Provisioner:
                     oobis=list(created.get("oobis", []) or []),
                     status=str(created.get("status", "") or "created"),
                 )
-                self.ctx.store.add_resource(record)
+                self.ctx.store.addResource(record)
                 session.watcher_eid = record.eid
-                session.updated_at = now_iso()
-                self.ctx.store.save_session(session)
+                session.updated_at = nowIso()
+                self.ctx.store.saveSession(session)
                 logger.info(
                     f"Watcher allocated for session {session.session_id}: watcher {record.eid}"
                 )
@@ -142,7 +142,7 @@ class Provisioner:
     def _ensureCapacity(self, *, kind: str, requested: int) -> None:
         if requested <= 0:
             return
-        count = self.ctx.store.count_resources(kind)
+        count = self.ctx.store.countResources(kind)
         limit = (
             self.ctx.config.witness_limit
             if kind == "witness"
@@ -198,8 +198,8 @@ class Provisioner:
             seed=session.session_id,
         )
         session.witness_backend_ids = [backend.id for backend in backends]
-        session.updated_at = now_iso()
-        self.ctx.store.save_session(session)
+        session.updated_at = nowIso()
+        self.ctx.store.saveSession(session)
         logger.info(
             f"Witness backends selected for session {session.session_id}"
         )
@@ -255,7 +255,7 @@ class Provisioner:
             matches = [
                 backend
                 for backend in self.ctx.config.witness_backends
-                if parse_public_url(backend.public_url) == (record.public_host, record.public_port)
+                if parsePublicUrl(backend.public_url) == (record.public_host, record.public_port)
             ]
             if len(matches) == 1:
                 return self._witnessClient(matches[0].id)
@@ -321,7 +321,7 @@ class Provisioner:
         """Teardown account resources (Witnesses and Watchers) without deleting the account.
         It gets triggered when an account is marked as 'expired'
         """
-        sessions = self.ctx.store.list_sessions_for_account(account_aid)
+        sessions = self.ctx.store.listSessionsForAccount(account_aid)
         errors: list[BootError] = []
         watcher_ids = self._collectAccountResourceIDs(
             kind="watcher",
@@ -372,7 +372,7 @@ class Provisioner:
             account.watcher_eid = ""
             account.witness_eids = []
             account.session_id = ""
-            self.ctx.store.save_account(account)
+            self.ctx.store.saveAccount(account)
 
         if errors:
             first = errors[0]
@@ -385,7 +385,7 @@ class Provisioner:
         logger.info(f"Resources teardown completed for account AID {account_aid}")
 
     def deleteAccount(self, *, account_aid: str, account=None) -> None:
-        sessions = self.ctx.store.list_sessions_for_account(account_aid)
+        sessions = self.ctx.store.listSessionsForAccount(account_aid)
         errors: list[BootError] = []
         watcher_ids = self._collectAccountResourceIDs(
             kind="watcher",
@@ -438,10 +438,10 @@ class Provisioner:
             )
             raise BootError(detail, status_code=first.status_code)
 
-        self.ctx.store.delete_bindings_for_principal(account_aid)
-        self.ctx.store.delete_account(account_aid)
+        self.ctx.store.deleteBindingsForPrincipal(account_aid)
+        self.ctx.store.deleteAccount(account_aid)
         for session in sessions:
-            self.ctx.store.delete_session(session.session_id)
+            self.ctx.store.deleteSession(session.session_id)
         logger.info(
             f"Account deletion completed for account AID {account_aid}"
             f" with {len(sessions)} sessions, {len(watcher_ids)} watchers, and {len(witness_ids)} witnesses deleted"
@@ -474,7 +474,7 @@ class Provisioner:
 
         candidates.extend(
             record.eid
-            for record in self.ctx.store.list_resources_for_account(
+            for record in self.ctx.store.listResourcesForAccount(
                 kind=kind,
                 account_aid=account_aid,
             )
@@ -482,7 +482,7 @@ class Provisioner:
         for session in sessions:
             candidates.extend(
                 record.eid
-                for record in self.ctx.store.list_resources_for_session(
+                for record in self.ctx.store.listResourcesForSession(
                     kind=kind,
                     session_id=session.session_id,
                 )
@@ -513,7 +513,7 @@ class Provisioner:
 
         candidates.extend(
             record.eid
-            for record in self.ctx.store.list_resources_for_session(
+            for record in self.ctx.store.listResourcesForSession(
                 kind=kind,
                 session_id=session.session_id,
             )
@@ -539,7 +539,7 @@ class Provisioner:
         if not eid:
             return
 
-        record = self.ctx.store.get_resource(kind, eid)
+        record = self.ctx.store.getResource(kind, eid)
         if record is None:
             logger.info(
                 f"Resource record not found for deletion for {kind} with EID {eid}"
@@ -574,7 +574,7 @@ class Provisioner:
             logger.info(
                 f"Resource not found during deletion for {kind} with EID {eid}, but tolerated: {exc}",
             )
-        self.ctx.store.delete_resource(kind, eid)
+        self.ctx.store.deleteResource(kind, eid)
         if session is not None:
             if kind == "witness":
                 session.witness_eids = [item for item in session.witness_eids if item != eid]
@@ -594,10 +594,10 @@ class Provisioner:
 
     def _persistOwnerState(self, *, session: SessionRecord | None = None, account=None) -> None:
         if session is not None:
-            session.updated_at = now_iso()
-            self.ctx.store.save_session(session)
+            session.updated_at = nowIso()
+            self.ctx.store.saveSession(session)
         if account is not None:
-            self.ctx.store.save_account(account)
+            self.ctx.store.saveAccount(account)
 
     def _teardownFailedSessionResources(
         self,
@@ -610,8 +610,8 @@ class Provisioner:
             self.teardownSessionResources(session=session, account=account)
         except BootError as exc:
             session.failure_reason = f"{failure_reason} Cleanup failed: {exc}"
-            session.updated_at = now_iso()
-            self.ctx.store.save_session(session)
+            session.updated_at = nowIso()
+            self.ctx.store.saveSession(session)
             logger.warning(
                 f"Session resource teardown failed for {session.session_id}: {exc}",
             )

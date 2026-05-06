@@ -19,48 +19,48 @@ from kfboot.basing import (
 )
 
 
-def now_iso() -> str:
+def nowIso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def parse_public_url(url: str) -> tuple[str, int | None]:
+def parsePublicUrl(url: str) -> tuple[str, int | None]:
     parts = urlsplit(url)
     return parts.hostname or "", parts.port
 
 
-def _sort_value(value: Any) -> Any:
+def _sortValue(value: Any) -> Any:
     if value is None:
         return ""
     return value
 
 
-def _resource_value(record: Any, field: str, default: Any = "") -> Any:
+def _resourceValue(record: Any, field: str, default: Any = "") -> Any:
     return getattr(record, field, default)
 
 
-def _resource_to_api(record: ResourceRecord, *, include_boot_url: bool = False) -> dict[str, Any]:
+def _resourceToApi(record: ResourceRecord, *, include_boot_url: bool = False) -> dict[str, Any]:
     data = {
-        "kind": _resource_value(record, "kind", ""),
-        "eid": _resource_value(record, "eid", ""),
-        "cid": _resource_value(record, "cid", ""),
-        "name": _resource_value(record, "name", ""),
-        "identifier_alias": _resource_value(record, "identifier_alias", ""),
-        "region_id": _resource_value(record, "region_id", ""),
-        "region_name": _resource_value(record, "region_name", ""),
-        "url": _resource_value(record, "url", ""),
-        "boot_url": _resource_value(record, "boot_url", ""),
-        "public_host": _resource_value(record, "public_host", ""),
-        "public_port": _resource_value(record, "public_port", None),
-        "status": _resource_value(record, "status", ""),
-        "created_at": _resource_value(record, "created_at", ""),
+        "kind": _resourceValue(record, "kind", ""),
+        "eid": _resourceValue(record, "eid", ""),
+        "cid": _resourceValue(record, "cid", ""),
+        "name": _resourceValue(record, "name", ""),
+        "identifier_alias": _resourceValue(record, "identifier_alias", ""),
+        "region_id": _resourceValue(record, "region_id", ""),
+        "region_name": _resourceValue(record, "region_name", ""),
+        "url": _resourceValue(record, "url", ""),
+        "boot_url": _resourceValue(record, "boot_url", ""),
+        "public_host": _resourceValue(record, "public_host", ""),
+        "public_port": _resourceValue(record, "public_port", None),
+        "status": _resourceValue(record, "status", ""),
+        "created_at": _resourceValue(record, "created_at", ""),
     }
     if not include_boot_url:
         data.pop("boot_url", None)
-    data["oobis"] = list(_resource_value(record, "oobis", []) or [])
-    if _resource_value(record, "kind", "") == "witness":
-        data["witness_url"] = _resource_value(record, "url", "")
-    elif _resource_value(record, "kind", "") == "watcher":
-        data["watcher_url"] = _resource_value(record, "url", "")
+    data["oobis"] = list(_resourceValue(record, "oobis", []) or [])
+    if _resourceValue(record, "kind", "") == "witness":
+        data["witness_url"] = _resourceValue(record, "url", "")
+    elif _resourceValue(record, "kind", "") == "watcher":
+        data["watcher_url"] = _resourceValue(record, "url", "")
     return data
 
 
@@ -73,19 +73,19 @@ class Store:
         self.baser.close()
 
     def expire_sessions(self, *, now: str | None = None) -> list[SessionRecord]:
-        current = _parse_dt(now or now_iso())
+        current = _parseDt(now or nowIso())
         expired: list[SessionRecord] = []
         for _, record in self.baser.sessions.getTopItemIter(keys=()):
             if record.state in TERMINAL_SESSION_STATES:
                 continue
-            if _parse_dt(record.expires_at) <= current:
+            if _parseDt(record.expires_at) <= current:
                 record.state = SESSION_STATE_EXPIRED
                 record.updated_at = current.isoformat()
-                self.save_session(record)
+                self.saveSession(record)
                 expired.append(record)
         return expired
 
-    def create_session(
+    def createSession(
         self,
         *,
         ephemeral_aid: str,
@@ -100,10 +100,10 @@ class Store:
         toad: int,
         account_tier: str,
     ) -> SessionRecord:
-        created_at = now_iso()
-        expires_at = (_parse_dt(created_at) + timedelta(seconds=self.session_ttl_seconds)).isoformat()
+        created_at = nowIso()
+        expires_at = (_parseDt(created_at) + timedelta(seconds=self.session_ttl_seconds)).isoformat()
         record = SessionRecord(
-            session_id=_new_session_id(),
+            session_id=_newSessionId(),
             ephemeral_aid=ephemeral_aid,
             account_aid=account_aid,
             account_alias=account_alias,
@@ -120,25 +120,25 @@ class Store:
             toad=toad,
             account_tier=account_tier,
         )
-        self.save_session(record)
+        self.saveSession(record)
         return record
 
-    def save_session(self, record: SessionRecord) -> None:
+    def saveSession(self, record: SessionRecord) -> None:
         self.baser.sessions.pin(keys=(record.session_id,), val=record)
 
-    def refresh_session_lease(self, record: SessionRecord, *, now: str | None = None) -> None:
-        current = _parse_dt(now or now_iso())
+    def refreshSessionLease(self, record: SessionRecord, *, now: str | None = None) -> None:
+        current = _parseDt(now or nowIso())
         record.updated_at = current.isoformat()
         if record.state not in TERMINAL_SESSION_STATES:
             record.expires_at = (
                 current + timedelta(seconds=self.session_ttl_seconds)
             ).isoformat()
-        self.save_session(record)
+        self.saveSession(record)
 
-    def get_session(self, session_id: str) -> SessionRecord | None:
+    def getSession(self, session_id: str) -> SessionRecord | None:
         return self.baser.sessions.get(keys=(session_id,))
 
-    def find_active_session_for_ephemeral(self, ephemeral_aid: str) -> SessionRecord | None:
+    def findActiveSessionForEphemeral(self, ephemeral_aid: str) -> SessionRecord | None:
         latest: SessionRecord | None = None
         for _, record in self.baser.sessions.getTopItemIter(keys=()):
             if record.ephemeral_aid != ephemeral_aid:
@@ -147,7 +147,7 @@ class Store:
                 latest = record
         return latest
 
-    def find_session_for_account(self, account_aid: str) -> SessionRecord | None:
+    def findSessionForAccount(self, account_aid: str) -> SessionRecord | None:
         latest: SessionRecord | None = None
         for _, record in self.baser.sessions.getTopItemIter(keys=()):
             if record.account_aid != account_aid:
@@ -156,37 +156,37 @@ class Store:
                 latest = record
         return latest
 
-    def list_sessions_for_account(self, account_aid: str) -> list[SessionRecord]:
+    def listSessionsForAccount(self, account_aid: str) -> list[SessionRecord]:
         rows = []
         for _, record in self.baser.sessions.getTopItemIter(keys=()):
             if record.account_aid != account_aid:
                 continue
             rows.append(record)
-        rows.sort(key=lambda record: _sort_value(record.created_at), reverse=True)
+        rows.sort(key=lambda record: _sortValue(record.created_at), reverse=True)
         return rows
 
-    def save_account(self, record: AccountRecord) -> None:
+    def saveAccount(self, record: AccountRecord) -> None:
         self.baser.accounts.pin(keys=(record.account_aid,), val=record)
 
-    def get_account(self, account_aid: str) -> AccountRecord | None:
+    def getAccount(self, account_aid: str) -> AccountRecord | None:
         return self.baser.accounts.get(keys=(account_aid,))
 
-    def delete_account(self, account_aid: str) -> None:
+    def deleteAccount(self, account_aid: str) -> None:
         self.baser.accounts.rem(keys=(account_aid,))
 
-    def list_accounts(self) -> list[AccountRecord]:
+    def listAccounts(self) -> list[AccountRecord]:
         return [record for _, record in self.baser.accounts.getTopItemIter(keys=())]
 
-    def list_accounts_for_alias(self, account_alias: str) -> list[AccountRecord]:
+    def listAccountsForAlias(self, account_alias: str) -> list[AccountRecord]:
         """Return a list of AccountRecords matching the given account alias"""
         rows: list[AccountRecord] = []
         for _, record in self.baser.accounts.getTopItemIter(keys=()):
             if record.account_alias == account_alias:
                 rows.append(record)
-        rows.sort(key=lambda record: _sort_value(record.created_at), reverse=True)
+        rows.sort(key=lambda record: _sortValue(record.created_at), reverse=True)
         return rows
 
-    def list_active_sessions_for_ip(self, client_ip: str) -> list[SessionRecord]:
+    def listActiveSessionsForIp(self, client_ip: str) -> list[SessionRecord]:
         rows = []
         for _, record in self.baser.sessions.getTopItemIter(keys=()):
             if record.state in TERMINAL_SESSION_STATES:
@@ -194,10 +194,10 @@ class Store:
             if record.client_ip != client_ip:
                 continue
             rows.append(record)
-        rows.sort(key=lambda record: _sort_value(record.created_at), reverse=True)
+        rows.sort(key=lambda record: _sortValue(record.created_at), reverse=True)
         return rows
 
-    def list_active_sessions_for_alias(self, account_alias: str) -> list[SessionRecord]:
+    def listActiveSessionsForAlias(self, account_alias: str) -> list[SessionRecord]:
         """Return a list of active SessionRecords matching the given account alias"""
         rows = []
         for _, record in self.baser.sessions.getTopItemIter(keys=()):
@@ -206,16 +206,16 @@ class Store:
             if record.account_alias != account_alias:
                 continue
             rows.append(record)
-        rows.sort(key=lambda record: _sort_value(record.created_at), reverse=True)
+        rows.sort(key=lambda record: _sortValue(record.created_at), reverse=True)
         return rows
 
-    def add_binding(self, principal: str, cid: str) -> None:
+    def addBinding(self, principal: str, cid: str) -> None:
         self.baser.bindings.pin(
             keys=(principal, cid),
             val=BindingRecord(principal=principal, cid=cid),
         )
 
-    def delete_bindings_for_principal(self, principal: str) -> None:
+    def deleteBindingsForPrincipal(self, principal: str) -> None:
         matches = [
             keys
             for keys, _record in self.baser.bindings.getTopItemIter(keys=())
@@ -224,64 +224,64 @@ class Store:
         for keys in matches:
             self.baser.bindings.rem(keys=keys)
 
-    def add_resource(self, record: ResourceRecord) -> None:
+    def addResource(self, record: ResourceRecord) -> None:
         self.baser.resources.pin(keys=(record.kind, record.eid), val=record)
 
-    def save_resource(self, record: ResourceRecord) -> None:
-        self.add_resource(record)
+    def saveResource(self, record: ResourceRecord) -> None:
+        self.addResource(record)
 
-    def get_resource(self, kind: str, eid: str) -> ResourceRecord | None:
+    def getResource(self, kind: str, eid: str) -> ResourceRecord | None:
         return self.baser.resources.get(keys=(kind, eid))
 
-    def get_resources(self, kind: str, eids: Iterable[str]) -> list[ResourceRecord]:
+    def getResources(self, kind: str, eids: Iterable[str]) -> list[ResourceRecord]:
         rows = []
         for eid in eids:
-            record = self.get_resource(kind, eid)
+            record = self.getResource(kind, eid)
             if record is not None:
                 rows.append(record)
         return rows
 
-    def delete_resource(self, kind: str, eid: str) -> None:
+    def deleteResource(self, kind: str, eid: str) -> None:
         self.baser.resources.rem(keys=(kind, eid))
 
-    def delete_session(self, session_id: str) -> None:
+    def deleteSession(self, session_id: str) -> None:
         self.baser.sessions.rem(keys=(session_id,))
 
-    def count_resources(self, kind: str) -> int:
+    def countResources(self, kind: str) -> int:
         return sum(1 for _, _ in self.baser.resources.getTopItemIter(keys=(kind,), topive=True))
 
-    def list_resources_for_account(self, *, kind: str, account_aid: str) -> list[ResourceRecord]:
+    def listResourcesForAccount(self, *, kind: str, account_aid: str) -> list[ResourceRecord]:
         rows = []
         for _, record in self.baser.resources.getTopItemIter(keys=(kind,), topive=True):
-            if _resource_value(record, "principal", "") == account_aid:
+            if _resourceValue(record, "principal", "") == account_aid:
                 rows.append(record)
-        rows.sort(key=lambda record: _sort_value(_resource_value(record, "created_at", "")), reverse=True)
+        rows.sort(key=lambda record: _sortValue(_resourceValue(record, "created_at", "")), reverse=True)
         return rows
 
-    def list_resources_for_session(self, *, kind: str, session_id: str) -> list[ResourceRecord]:
+    def listResourcesForSession(self, *, kind: str, session_id: str) -> list[ResourceRecord]:
         rows = []
         for _, record in self.baser.resources.getTopItemIter(keys=(kind,), topive=True):
-            if _resource_value(record, "session_id", "") == session_id:
+            if _resourceValue(record, "session_id", "") == session_id:
                 rows.append(record)
-        rows.sort(key=lambda record: _sort_value(_resource_value(record, "created_at", "")), reverse=True)
+        rows.sort(key=lambda record: _sortValue(_resourceValue(record, "created_at", "")), reverse=True)
         return rows
 
-    def bind_resources_to_account(self, *, session: SessionRecord, account_aid: str) -> None:
+    def bindResourcesToAccount(self, *, session: SessionRecord, account_aid: str) -> None:
         # Witnesses and watchers are allocated for the onboarding session first,
         # then become durable account resources when account creation succeeds.
-        for record in self.get_resources("witness", session.witness_eids):
+        for record in self.getResources("witness", session.witness_eids):
             record.principal = account_aid
             record.cid = account_aid
-            self.save_resource(record)
+            self.saveResource(record)
 
         if session.watcher_eid:
-            watcher = self.get_resource("watcher", session.watcher_eid)
+            watcher = self.getResource("watcher", session.watcher_eid)
             if watcher is not None:
                 watcher.principal = account_aid
                 watcher.cid = account_aid
-                self.save_resource(watcher)
+                self.saveResource(watcher)
 
-    def session_payload(self, session: SessionRecord) -> dict[str, Any]:
+    def sessionPayload(self, session: SessionRecord) -> dict[str, Any]:
         return {
             "session_id": session.session_id,
             "ephemeral_aid": session.ephemeral_aid,
@@ -303,7 +303,7 @@ class Store:
             "failure_reason": session.failure_reason,
         }
 
-    def account_payload(self, account: AccountRecord) -> dict[str, Any]:
+    def accountPayload(self, account: AccountRecord) -> dict[str, Any]:
         return {
             "account_aid": account.account_aid,
             "account_alias": account.account_alias,
@@ -324,7 +324,7 @@ class Store:
             "watcher_eid": account.watcher_eid,
         }
 
-    def build_account(
+    def buildAccount(
         self,
         *,
         account_aid: str,
@@ -342,7 +342,7 @@ class Store:
         expires_at: str = "",
         onboarded: bool = False,
     ) -> AccountRecord:
-        created_at = now_iso()
+        created_at = nowIso()
         return AccountRecord(
             account_aid=account_aid,
             account_alias=account_alias,
@@ -363,7 +363,7 @@ class Store:
         )
 
 
-def make_record(
+def makeRecord(
     *,
     kind: str,
     eid: str,
@@ -380,7 +380,7 @@ def make_record(
     oobis: list[str],
     status: str = "",
 ) -> ResourceRecord:
-    public_host, public_port = parse_public_url(public_url)
+    public_host, public_port = parsePublicUrl(public_url)
     return ResourceRecord(
         kind=kind,
         eid=eid,
@@ -398,35 +398,35 @@ def make_record(
         public_port=public_port,
         oobis=list(oobis),
         status=status,
-        created_at=now_iso(),
+        created_at=nowIso(),
     )
 
 
-def resources_to_api(
+def resourcesToApi(
     records: Iterable[ResourceRecord],
     *,
     include_boot_url: bool = False,
 ) -> list[dict[str, Any]]:
-    return [_resource_to_api(record, include_boot_url=include_boot_url) for record in records]
+    return [_resourceToApi(record, include_boot_url=include_boot_url) for record in records]
 
 
-def session_failed(session: SessionRecord, reason: str) -> SessionRecord:
+def sessionFailed(session: SessionRecord, reason: str) -> SessionRecord:
     session.state = "failed"
-    session.updated_at = now_iso()
+    session.updated_at = nowIso()
     session.failure_reason = reason
     return session
 
 
-def account_failed(account: AccountRecord | None) -> AccountRecord | None:
+def accountFailed(account: AccountRecord | None) -> AccountRecord | None:
     if account is None:
         return None
     account.status = ACCOUNT_STATE_FAILED
     return account
 
 
-def _parse_dt(value: str) -> datetime:
+def _parseDt(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
-def _new_session_id() -> str:
+def _newSessionId() -> str:
     return f"sess_{secrets.token_urlsafe(12)}"

@@ -26,12 +26,12 @@ from kfboot.basing import (
 )
 from kfboot.boot_client import BootError
 from kfboot.store import (
-    account_failed,
-    make_record,
-    now_iso,
-    parse_public_url,
-    resources_to_api,
-    session_failed,
+    accountFailed,
+    makeRecord,
+    nowIso,
+    parsePublicUrl,
+    resourcesToApi,
+    sessionFailed,
 )
 from kfboot.limiting import Limiter
 from kfboot.admitting import Admitter
@@ -106,7 +106,7 @@ class SessionStartHandler(RouteHandler):
                 description="This boot service requires one hosted watcher per onboarded account.",
             )
 
-        account = self.exchanger.ctx.store.get_account(account_aid)
+        account = self.exchanger.ctx.store.getAccount(account_aid)
         if account is not None and account.status == ACCOUNT_STATE_ONBOARDED:
             logger.warning(
                 f"Session start rejected because account {account_aid} is already onboarded"
@@ -117,7 +117,7 @@ class SessionStartHandler(RouteHandler):
             )
 
         session = None
-        session_for_account = self.exchanger.ctx.store.find_session_for_account(account_aid)
+        session_for_account = self.exchanger.ctx.store.findSessionForAccount(account_aid)
         if session_for_account is not None and session_for_account.state not in TERMINAL_SESSION_STATES:
             if session_for_account.ephemeral_aid != sender:
                 logger.warning(
@@ -129,7 +129,7 @@ class SessionStartHandler(RouteHandler):
                     description="A different onboarding principal already owns the active session for this account AID.",
                 )
             session = session_for_account
-        elif (existing := self.exchanger.ctx.store.find_active_session_for_ephemeral(sender)) is not None:
+        elif (existing := self.exchanger.ctx.store.findActiveSessionForEphemeral(sender)) is not None:
             session = existing
 
         if session is not None:
@@ -152,7 +152,7 @@ class SessionStartHandler(RouteHandler):
                 account_alias=alias,
                 profile=self.exchanger.ctx.config.account_profile(option["code"]),
             )
-            session = self.exchanger.ctx.store.create_session(
+            session = self.exchanger.ctx.store.createSession(
                 ephemeral_aid=sender,
                 account_aid=account_aid,
                 account_alias=alias,
@@ -236,7 +236,7 @@ class AccountCreateHandler(RouteHandler):
                 description="Witness or watcher allocation is incomplete for this session.",
             )
 
-        account = self.exchanger.ctx.store.get_account(account_aid)
+        account = self.exchanger.ctx.store.getAccount(account_aid)
         
         # Check account state before attempting to create or update account records
         if account is not None and account.status in {ACCOUNT_STATE_PAUSED, ACCOUNT_STATE_EXPIRED}:
@@ -266,7 +266,7 @@ class AccountCreateHandler(RouteHandler):
 
         try:
             if account is None:
-                account = self.exchanger.ctx.store.build_account(
+                account = self.exchanger.ctx.store.buildAccount(
                     account_aid=account_aid,
                     account_alias=_optional_str(payload, "account_alias") or session.account_alias,
                     witness_profile_code=session.chosen_profile_code,
@@ -290,10 +290,10 @@ class AccountCreateHandler(RouteHandler):
 
             session.account_aid = account_aid
             session.state = SESSION_STATE_ACCOUNT_CREATED
-            session.updated_at = now_iso()
+            session.updated_at = nowIso()
 
-            self.exchanger.ctx.store.save_account(account)
-            self.exchanger.ctx.store.bind_resources_to_account(session=session, account_aid=account_aid)
+            self.exchanger.ctx.store.saveAccount(account)
+            self.exchanger.ctx.store.bindResourcesToAccount(session=session, account_aid=account_aid)
             self.exchanger.expirer.refreshSessionLease(session)
             logger.info(
                 f"Account {account.status} for account AID {account_aid}",
@@ -336,7 +336,7 @@ class CompleteHandler(RouteHandler):
                 description="This onboarding session is already bound to a different account AID.",
             )
 
-        account = self.exchanger.ctx.store.get_account(account_aid)
+        account = self.exchanger.ctx.store.getAccount(account_aid)
         if account is None:
             logger.warning(
                 f"Onboarding rejected due to account record not found for account AID {account_aid}"
@@ -369,11 +369,11 @@ class CompleteHandler(RouteHandler):
             )
 
         session.state = SESSION_STATE_COMPLETED
-        session.updated_at = now_iso()
+        session.updated_at = nowIso()
         account.status = ACCOUNT_STATE_ONBOARDED
-        account.onboarded_at = now_iso()
-        self.exchanger.ctx.store.save_session(session)
-        self.exchanger.ctx.store.save_account(account)
+        account.onboarded_at = nowIso()
+        self.exchanger.ctx.store.saveSession(session)
+        self.exchanger.ctx.store.saveAccount(account)
         logger.info(
             f"Onboarding completed for account AID {account_aid}"
         )
@@ -400,7 +400,7 @@ class CancelHandler(RouteHandler):
                 description="A completed onboarding session cannot be cancelled.",
             )
         if session.state != SESSION_STATE_CANCELLED:
-            account = self.exchanger.ctx.store.get_account(session.account_aid) if session.account_aid else None
+            account = self.exchanger.ctx.store.getAccount(session.account_aid) if session.account_aid else None
             try:
                 self.exchanger.provisioner.teardownSessionResources(session=session, account=account)
             except BootError as exc:
@@ -415,15 +415,15 @@ class CancelHandler(RouteHandler):
                 raise _boot_error(exc)
 
             session.state = SESSION_STATE_CANCELLED
-            session.updated_at = now_iso()
-            self.exchanger.ctx.store.save_session(session)
+            session.updated_at = nowIso()
+            self.exchanger.ctx.store.saveSession(session)
             logger.info(
                 f"Session cancelled for session {session.session_id}"
             )
 
-            failed = account_failed(account)
+            failed = accountFailed(account)
             if failed is not None:
-                self.exchanger.ctx.store.save_account(failed)
+                self.exchanger.ctx.store.saveAccount(failed)
                 logger.info(
                     f"Account failed due to session cancellation for account AID {account.account_aid}"
                 )
@@ -437,8 +437,8 @@ class AccountWitnessesHandler(RouteHandler):
     def handle(self, serder, **kwa):
         sender = serder.pre
         self.exchanger.requireOnboardedAccount(sender, _payload(serder))
-        rows = resources_to_api(
-            self.exchanger.ctx.store.list_resources_for_account(kind="witness", account_aid=sender)
+        rows = resourcesToApi(
+            self.exchanger.ctx.store.listResourcesForAccount(kind="witness", account_aid=sender)
         )
         logger.info(
             f"Query response for witnesses for account AID {sender}: {rows}"
@@ -452,8 +452,8 @@ class AccountWatchersHandler(RouteHandler):
     def handle(self, serder, **kwa):
         sender = serder.pre
         self.exchanger.requireOnboardedAccount(sender, _payload(serder))
-        rows = resources_to_api(
-            self.exchanger.ctx.store.list_resources_for_account(kind="watcher", account_aid=sender)
+        rows = resourcesToApi(
+            self.exchanger.ctx.store.listResourcesForAccount(kind="watcher", account_aid=sender)
         )
         logger.info(
             f"Query response for watchers for account AID {sender}: {rows}"
@@ -473,7 +473,7 @@ class AccountWatcherStatusHandler(RouteHandler):
         logger.info(
             f"Query status for watcher {watcher_id} from {sender}"
         )
-        record = self.exchanger.ctx.store.get_resource("watcher", watcher_id)
+        record = self.exchanger.ctx.store.getResource("watcher", watcher_id)
         if record is None or record.principal != sender:
             logger.warning(
                 f"Query for watcher status failed because watcher {watcher_id} was not found"
@@ -491,12 +491,12 @@ class AccountWatcherStatusHandler(RouteHandler):
         derived_status = _watcherStatusLabel(status)
         if derived_status:
             record.status = derived_status
-            self.exchanger.ctx.store.save_resource(record)
+            self.exchanger.ctx.store.saveResource(record)
             logger.info(
                 f"Watcher status updated for watcher {watcher_id} to {derived_status} from {sender}"
             )
 
-        watcher = resources_to_api([record])[0]
+        watcher = resourcesToApi([record])[0]
         if isinstance(status, dict):
             watcher.update(status)
         self.exchanger.queueReply(
@@ -517,7 +517,7 @@ class AccountWitnessDeleteHandler(RouteHandler):
         logger.info(
             f"Account witness delete requested for witness {witness_id} from {sender}"
         )
-        record = self.exchanger.ctx.store.get_resource("witness", witness_id)
+        record = self.exchanger.ctx.store.getResource("witness", witness_id)
         if record is None or record.principal != sender:
             logger.warning(
                 f"Account witness delete request failed because witness {witness_id} was not found"
@@ -554,7 +554,7 @@ class AccountWatcherDeleteHandler(RouteHandler):
         logger.info(
             f"Account watcher delete requested for watcher {watcher_id} from {sender}"
         )
-        record = self.exchanger.ctx.store.get_resource("watcher", watcher_id)
+        record = self.exchanger.ctx.store.getResource("watcher", watcher_id)
         if record is None or record.principal != sender:
             logger.warning(
                 f"Account watcher delete request failed because watcher {watcher_id} was not found"
@@ -599,7 +599,7 @@ class AccountDeleteHandler(RouteHandler):
                 description="The authenticated sender must match account_aid.",
             )
 
-        account = self.exchanger.ctx.store.get_account(sender)
+        account = self.exchanger.ctx.store.getAccount(sender)
         
         # Check account state
         if account is not None and account.status not in {
@@ -695,7 +695,7 @@ class BootExchanger(Exchanger):
         return option
 
     def requireSession(self, session_id: str) -> SessionRecord:
-        session = self.ctx.store.get_session(session_id)
+        session = self.ctx.store.getSession(session_id)
         if session is None:
             logger.warning(
                 f"Session not found for session ID {session_id}"
@@ -768,7 +768,7 @@ class BootExchanger(Exchanger):
                 title="Account principal mismatch",
                 description="The authenticated sender must match account_aid.",
             )
-        account = self.ctx.store.get_account(sender)
+        account = self.ctx.store.getAccount(sender)
         if account is None:
             logger.warning(
                 f"Account not found for authenticated sender {sender}"
@@ -805,25 +805,25 @@ class BootExchanger(Exchanger):
     def replyAccount(self, route: str, *, recipient: str, session: SessionRecord) -> None:
         payload = self.sessionPayload(session)
         if session.account_aid:
-            account = self.ctx.store.get_account(session.account_aid)
+            account = self.ctx.store.getAccount(session.account_aid)
             if account is not None:
-                payload["account"] = self.ctx.store.account_payload(account)
+                payload["account"] = self.ctx.store.accountPayload(account)
         self.queueReply(route, recipient, payload)
 
     def sessionPayload(self, session: SessionRecord) -> dict[str, Any]:
-        witnesses = resources_to_api(
-            self.ctx.store.get_resources("witness", session.witness_eids),
+        witnesses = resourcesToApi(
+            self.ctx.store.getResources("witness", session.witness_eids),
             include_boot_url=True,
         )
         watcher = None
         if session.watcher_eid:
-            rows = resources_to_api(
-                self.ctx.store.get_resources("watcher", [session.watcher_eid]),
+            rows = resourcesToApi(
+                self.ctx.store.getResources("watcher", [session.watcher_eid]),
                 include_boot_url=True,
             )
             watcher = rows[0] if rows else None
 
-        payload = self.ctx.store.session_payload(session)
+        payload = self.ctx.store.sessionPayload(session)
         payload["session"] = dict(payload)
         payload["witnesses"] = witnesses
         payload["watcher"] = watcher
