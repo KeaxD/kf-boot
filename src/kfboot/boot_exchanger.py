@@ -37,7 +37,7 @@ from kfboot.limiting import Limiter
 from kfboot.admitting import Admitter
 from kfboot.provisioning import Provisioner
 from kfboot.expiring import Expirer
-from kfboot.utils import _payload, _optional_str, _required_str, _boot_error
+from kfboot.utils import extractExnPayload, optionalStr, requiredStr, bootError
 
 logger = help.ogler.getLogger(__name__)
 
@@ -70,11 +70,11 @@ class SessionStartHandler(RouteHandler):
 
     def handle(self, serder, **kwa):
         sender = serder.pre
-        payload = _payload(serder)
+        payload = extractExnPayload(serder)
         option = self.exchanger.accountOption(payload.get("chosen_profile_code", ""))
-        account_aid = _required_str(payload, "account_aid")
-        alias = _optional_str(payload, "account_alias")
-        region_id = _optional_str(payload, "region_id") or self.exchanger.ctx.config.region_id
+        account_aid = requiredStr(payload, "account_aid")
+        alias = optionalStr(payload, "account_alias")
+        region_id = optionalStr(payload, "region_id") or self.exchanger.ctx.config.region_id
         watcher_required = bool(
             payload.get("watcher_required", self.exchanger.ctx.config.bootstrap_watcher_required)
         )
@@ -174,7 +174,7 @@ class SessionStartHandler(RouteHandler):
         except BootError as exc:
             # mark session failed, attempt teardown, then map to HTTP error
             self.exchanger.expirer.failSession(session=session, reason=str(exc), teardown=True)
-            raise _boot_error(exc)
+            raise bootError(exc)
         except Exception as exc:
             # unexpected error: mark session failed and re-raise
             self.exchanger.expirer.failSession(session=session, reason=str(exc), teardown=True)
@@ -188,7 +188,7 @@ class SessionStatusHandler(RouteHandler):
 
     def handle(self, serder, **kwa):
         sender = serder.pre
-        session = self.exchanger.requireSession(_required_str(_payload(serder), "session_id"))
+        session = self.exchanger.requireSession(requiredStr(extractExnPayload(serder), "session_id"))
         self.exchanger.requireOnboardingPrincipal(sender=sender, session=session)
         self.exchanger.expirer.refreshSessionLease(session)
         logger.info(
@@ -203,12 +203,12 @@ class AccountCreateHandler(RouteHandler):
 
     def handle(self, serder, **kwa):
         sender = serder.pre
-        payload = _payload(serder)
-        session = self.exchanger.requireSession(_required_str(payload, "session_id"))
+        payload = extractExnPayload(serder)
+        session = self.exchanger.requireSession(requiredStr(payload, "session_id"))
         self.exchanger.requireOpenSession(session)
         self.exchanger.requireEphemeralPrincipal(sender=sender, session=session)
 
-        account_aid = _required_str(payload, "account_aid")
+        account_aid = requiredStr(payload, "account_aid")
         logger.info(
             f"Account creation requested for account {account_aid} in session {session.session_id}",
         )
@@ -268,7 +268,7 @@ class AccountCreateHandler(RouteHandler):
             if account is None:
                 account = self.exchanger.ctx.store.buildAccount(
                     account_aid=account_aid,
-                    account_alias=_optional_str(payload, "account_alias") or session.account_alias,
+                    account_alias=optionalStr(payload, "account_alias") or session.account_alias,
                     witness_profile_code=session.chosen_profile_code,
                     witness_count=session.witness_count,
                     toad=session.toad,
@@ -282,7 +282,7 @@ class AccountCreateHandler(RouteHandler):
                     onboarded=False,
                 )
             else:
-                account.account_alias = _optional_str(payload, "account_alias") or account.account_alias
+                account.account_alias = optionalStr(payload, "account_alias") or account.account_alias
                 account.status = ACCOUNT_STATE_PENDING_ONBOARDING
                 account.witness_eids = list(session.witness_eids)
                 account.watcher_eid = session.watcher_eid
@@ -318,12 +318,12 @@ class CompleteHandler(RouteHandler):
 
     def handle(self, serder, **kwa):
         sender = serder.pre
-        payload = _payload(serder)
-        session = self.exchanger.requireSession(_required_str(payload, "session_id"))
+        payload = extractExnPayload(serder)
+        session = self.exchanger.requireSession(requiredStr(payload, "session_id"))
         self.exchanger.requireOpenSession(session, allow_completed=True)
         self.exchanger.requireEphemeralPrincipal(sender=sender, session=session)
 
-        account_aid = _required_str(payload, "account_aid")
+        account_aid = requiredStr(payload, "account_aid")
         logger.info(
             f"Onboarding completed for account AID {account_aid}",
         )
@@ -385,8 +385,8 @@ class CancelHandler(RouteHandler):
 
     def handle(self, serder, **kwa):
         sender = serder.pre
-        payload = _payload(serder)
-        session = self.exchanger.requireSession(_required_str(payload, "session_id"))
+        payload = extractExnPayload(serder)
+        session = self.exchanger.requireSession(requiredStr(payload, "session_id"))
         self.exchanger.requireEphemeralPrincipal(sender=sender, session=session)
         logger.info(
             f"Session cancellation requested for session {session.session_id}"
@@ -412,7 +412,7 @@ class CancelHandler(RouteHandler):
                 logger.warning(
                     f"Session cancellation failed during resource teardown for session {session.session_id}"
                 )
-                raise _boot_error(exc)
+                raise bootError(exc)
 
             session.state = SESSION_STATE_CANCELLED
             session.updated_at = nowIso()
@@ -436,7 +436,7 @@ class AccountWitnessesHandler(RouteHandler):
 
     def handle(self, serder, **kwa):
         sender = serder.pre
-        self.exchanger.requireOnboardedAccount(sender, _payload(serder))
+        self.exchanger.requireOnboardedAccount(sender, extractExnPayload(serder))
         rows = resourcesToApi(
             self.exchanger.ctx.store.listResourcesForAccount(kind="witness", account_aid=sender)
         )
@@ -451,7 +451,7 @@ class AccountWatchersHandler(RouteHandler):
 
     def handle(self, serder, **kwa):
         sender = serder.pre
-        self.exchanger.requireOnboardedAccount(sender, _payload(serder))
+        self.exchanger.requireOnboardedAccount(sender, extractExnPayload(serder))
         rows = resourcesToApi(
             self.exchanger.ctx.store.listResourcesForAccount(kind="watcher", account_aid=sender)
         )
@@ -466,10 +466,10 @@ class AccountWatcherStatusHandler(RouteHandler):
 
     def handle(self, serder, **kwa):
         sender = serder.pre
-        payload = _payload(serder)
+        payload = extractExnPayload(serder)
         self.exchanger.requireOnboardedAccount(sender, payload)
 
-        watcher_id = _optional_str(payload, "watcher_eid") or _required_str(payload, "watcher_id")
+        watcher_id = optionalStr(payload, "watcher_eid") or requiredStr(payload, "watcher_id")
         logger.info(
             f"Query status for watcher {watcher_id} from {sender}"
         )
@@ -486,7 +486,7 @@ class AccountWatcherStatusHandler(RouteHandler):
             logger.warning(
                 f"Query for watcher status failed for watcher {watcher_id} due to boot API error: {exc}"
             )
-            raise _boot_error(exc)
+            raise bootError(exc)
 
         derived_status = _watcherStatusLabel(status)
         if derived_status:
@@ -511,9 +511,9 @@ class AccountWitnessDeleteHandler(RouteHandler):
 
     def handle(self, serder, **kwa):
         sender = serder.pre
-        payload = _payload(serder)
+        payload = extractExnPayload(serder)
         account = self.exchanger.requireOnboardedAccount(sender, payload)
-        witness_id = _optional_str(payload, "witness_eid") or _required_str(payload, "witness_id")
+        witness_id = optionalStr(payload, "witness_eid") or requiredStr(payload, "witness_id")
         logger.info(
             f"Account witness delete requested for witness {witness_id} from {sender}"
         )
@@ -534,7 +534,7 @@ class AccountWitnessDeleteHandler(RouteHandler):
             logger.warning(
                 f"Account witness delete failed for witness {witness_id} from {sender}: {exc}"
             )
-            raise _boot_error(exc)
+            raise bootError(exc)
 
         self.exchanger.queueReply(
             self.resource,
@@ -548,9 +548,9 @@ class AccountWatcherDeleteHandler(RouteHandler):
 
     def handle(self, serder, **kwa):
         sender = serder.pre
-        payload = _payload(serder)
+        payload = extractExnPayload(serder)
         account = self.exchanger.requireOnboardedAccount(sender, payload)
-        watcher_id = _optional_str(payload, "watcher_eid") or _required_str(payload, "watcher_id")
+        watcher_id = optionalStr(payload, "watcher_eid") or requiredStr(payload, "watcher_id")
         logger.info(
             f"Account watcher delete requested for watcher {watcher_id} from {sender}"
         )
@@ -571,7 +571,7 @@ class AccountWatcherDeleteHandler(RouteHandler):
             logger.warning(
                 f"Account watcher delete failed for watcher {watcher_id} from {sender}: {str(exc)}"
             )
-            raise _boot_error(exc)
+            raise bootError(exc)
 
         self.exchanger.queueReply(
             self.resource,
@@ -585,8 +585,8 @@ class AccountDeleteHandler(RouteHandler):
 
     def handle(self, serder, **kwa):
         sender = serder.pre
-        payload = _payload(serder)
-        account_aid = _optional_str(payload, "account_aid") or sender
+        payload = extractExnPayload(serder)
+        account_aid = optionalStr(payload, "account_aid") or sender
         logger.info(
             f"Account delete requested for account AID {account_aid}"
         )
@@ -621,7 +621,7 @@ class AccountDeleteHandler(RouteHandler):
             logger.warning(
                 f"Account delete failed for account AID {account_aid}: {exc}"
             )
-            raise _boot_error(exc)
+            raise bootError(exc)
 
         logger.info(
             f"Account deleted for account AID {sender}"
@@ -758,7 +758,7 @@ class BootExchanger(Exchanger):
             raise falcon.HTTPConflict(title="Session completed")
 
     def requireOnboardedAccount(self, sender: str, payload: dict[str, Any]) -> AccountRecord:
-        account_aid = _optional_str(payload, "account_aid")
+        account_aid = optionalStr(payload, "account_aid")
         if account_aid and account_aid != sender:
             logger.warning(
                 f"Account principal mismatch, authenticated sender {sender} does not match"

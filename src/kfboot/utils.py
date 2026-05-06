@@ -1,18 +1,18 @@
 # utils.py
 import falcon
 
-def _payload(serder) -> dict[str, Any]:
+def extractExnPayload(serder) -> dict[str, Any]:
     payload = serder.ked.get("a", {})
     return payload if isinstance(payload, dict) else {}
 
 
-def _optional_str(payload: dict[str, Any], key: str) -> str:
+def optionalStr(payload: dict[str, Any], key: str) -> str:
     value = payload.get(key, "")
     return value.strip() if isinstance(value, str) else ""
 
 
-def _required_str(payload: dict[str, Any], key: str) -> str:
-    value = _optional_str(payload, key)
+def requiredStr(payload: dict[str, Any], key: str) -> str:
+    value = optionalStr(payload, key)
     if value:
         return value
     raise falcon.HTTPBadRequest(
@@ -20,7 +20,7 @@ def _required_str(payload: dict[str, Any], key: str) -> str:
         description=f"{key} is required.",
     )
 
-def _boot_error(exc: BootError) -> falcon.HTTPError:
+def bootError(exc: BootError) -> falcon.HTTPError:
     if exc.status_code == 400:
         return falcon.HTTPBadRequest(
             title="Boot API rejected request",

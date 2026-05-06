@@ -4,7 +4,7 @@ import falcon
 from keri import help
 from typing import Any
 
-from kfboot.utils import _payload, _optional_str
+from kfboot.utils import extractExnPayload, optionalStr
 from kfboot.config import ONBOARDING_ROUTES, ACCOUNT_ROUTES 
 from kfboot.store import nowIso
 
@@ -25,7 +25,7 @@ class Limiter:
             return
 
         # Check account context for the request
-        payload = _payload(serder)
+        payload = extractExnPayload(serder)
         account_aid, profile = self._accountContextForRoute(serder, payload)
         # TODO - we may want to enforce some limits even without account context
         if not account_aid or profile is None:
@@ -118,17 +118,17 @@ class Limiter:
 
         # For onboarding start, return the account AID and profile based on session context
         if route == "/onboarding/session/start":
-            account_aid = _optional_str(payload, "account_aid")
+            account_aid = optionalStr(payload, "account_aid")
             profile = self.ctx.config.account_profile(payload.get("chosen_profile_code", ""))
             return account_aid, profile
 
         # For other onboarding routes, resolve the account AID and profile from the session context
-        session_id = _optional_str(payload, "session_id")
+        session_id = optionalStr(payload, "session_id")
         if session_id:
             session = self.ctx.store.getSession(session_id)
             if session is not None:
                 profile = self.ctx.config.account_profile(session.chosen_profile_code)
-                account_aid = session.account_aid or _optional_str(payload, "account_aid")
+                account_aid = session.account_aid or optionalStr(payload, "account_aid")
                 return account_aid, profile
 
         # For account routes, resolve the account AID and profile based on the authenticated sender

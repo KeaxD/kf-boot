@@ -193,7 +193,7 @@ def test_http_error_without_body_uses_status_fallback(monkeypatch):
     assert excinfo.value.status_code == 503
 
 
-def test_invalid_json_response_raises_boot_error_with_status(monkeypatch):
+def test_invalid_json_response_raisesbootError_with_status(monkeypatch):
     requests = RecordingRequests(
         responses=[FakeResponse(status_code=200, json_error=ValueError("bad json"))]
     )
@@ -206,7 +206,7 @@ def test_invalid_json_response_raises_boot_error_with_status(monkeypatch):
     assert excinfo.value.status_code == 200
 
 
-def test_request_exception_raises_boot_error(monkeypatch):
+def test_request_exception_raisesbootError(monkeypatch):
     requests = RecordingRequests(error=RecordingRequests.RequestException("boom"))
     monkeypatch.setattr(boot_client_module, "requests", requests)
 
@@ -217,7 +217,7 @@ def test_request_exception_raises_boot_error(monkeypatch):
     assert excinfo.value.status_code is None
 
 
-def test_missing_requests_dependency_raises_boot_error(monkeypatch):
+def test_missing_requests_dependency_raisesbootError(monkeypatch):
     monkeypatch.setattr(boot_client_module, "requests", None)
 
     with pytest.raises(BootError) as excinfo:

@@ -24,7 +24,7 @@ from kfboot.store import (
     parsePublicUrl,
 )
 
-from kfboot.utils import _optional_str, _payload, _boot_error
+from kfboot.utils import optionalStr, bootError
 
 logger = help.ogler.getLogger(__name__)
 
@@ -132,7 +132,7 @@ class Provisioner:
             logger.warning(
                 f"Boot API error during session resource provisioning: {exc}"
             )
-            raise _boot_error(exc)
+            raise bootError(exc)
         except Exception as exc:
             logger.exception(
                 f"Unexpected error during session resource provisioning: {exc}"

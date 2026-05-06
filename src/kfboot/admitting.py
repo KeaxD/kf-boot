@@ -3,7 +3,7 @@ from keri import help
 import falcon
 from typing import Any 
 
-from kfboot.utils import _optional_str, _payload
+from kfboot.utils import optionalStr
 from kfboot.config import ONBOARDING_ROUTES
 
 from kfboot.basing import (

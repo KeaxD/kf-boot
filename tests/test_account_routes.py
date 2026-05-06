@@ -482,7 +482,7 @@ def test_account_resource_routes_return_404_for_missing_resources(onboarded_bund
         (503, 502, "Boot API call failed"),
     ],
 )
-def test_account_routes_map_downstream_boot_errors_to_http_statuses(
+def test_account_routes_map_downstreambootErrors_to_http_statuses(
     onboarded_bundle,
     status_code,
     expected_status,
