@@ -1,0 +1,618 @@
+# provisioning.py
+from __future__ import annotations
+
+import falcon
+from datetime import datetime
+from hashlib import blake2b
+from typing import Any
+
+from keri import help
+
+from kfboot.basing import (
+    SESSION_STATE_FAILED,
+    SESSION_STATE_CANCELLED,
+    SESSION_STATE_EXPIRED,
+    SESSION_STATE_WITNESS_POOL_ALLOCATED,
+    TERMINAL_SESSION_STATES,
+    SessionRecord,
+)
+
+from kfboot.boot_client import BootError
+from kfboot.store import (
+    make_record,
+    now_iso,
+    parse_public_url,
+)
+
+from kfboot.utils import _optional_str, _payload, _boot_error
+
+logger = help.ogler.getLogger(__name__)
+
+
+class Provisioner:
+    def __init__(self, ctx, exchanger):
+        self.ctx = ctx
+        self.exchanger = exchanger
+
+    def provisionSessionResources(self, *, session: SessionRecord) -> None:
+        if session.state in TERMINAL_SESSION_STATES:
+            if session.state == SESSION_STATE_FAILED:
+                logger.warning(
+                    f"Session in failed state during resource provisioning"
+                )
+                raise falcon.HTTPConflict(
+                    title="Session failed",
+                    description=session.failure_reason or "The onboarding session is in a failed state.",
+                )
+            logger.info(
+                f"Session in terminal state {session.state} during resource provisioning"
+            )
+            return
+
+        try:
+            missing_witnesses = max(session.witness_count - len(session.witness_eids), 0)
+            if missing_witnesses:
+                logger.info(
+                    f"Witness(es) requested for session {session.session_id}"
+                    f" with {missing_witnesses} missing witness(es)"
+                )
+                self._ensureCapacity(kind="witness", requested=missing_witnesses)
+                planned_backends = self._plannedWitnessBackends(session=session)
+                start_index = len(session.witness_eids)
+                for index, backend in enumerate(planned_backends[start_index:], start=start_index):
+                    logger.info(
+                        f"Witness allocation start for session {session.session_id}"
+                    )
+                    created = self._witnessClient(backend.id).allocate_witness(session.account_aid)
+                    record = make_record(
+                        kind="witness",
+                        eid=str(created.get("eid", "")),
+                        backend_id=backend.id,
+                        cid="",
+                        principal="",
+                        session_id=session.session_id,
+                        name=str(created.get("name", "") or f"witness-{index + 1}"),
+                        identifier_alias=session.account_alias,
+                        region_id=session.region_id,
+                        region_name=session.region_name,
+                        public_url=backend.public_url,
+                        boot_url=backend.boot_url,
+                        oobis=list(created.get("oobis", []) or []),
+                        status=str(created.get("status", "") or "allocated"),
+                    )
+                    self.ctx.store.add_resource(record)
+                    session.witness_eids.append(record.eid)
+                    session.updated_at = now_iso()
+                    self.ctx.store.save_session(session)
+                    logger.info(
+                        f"Witness allocated for session {session.session_id}: witness {record.eid}"
+                    )
+
+                session.state = SESSION_STATE_WITNESS_POOL_ALLOCATED
+                session.updated_at = now_iso()
+                self.ctx.store.save_session(session)
+                logger.info(
+                    f"Witness pool allocated for session {session.session_id}: witness EIDs {session.witness_eids}"
+                )
+
+            if session.watcher_required and not session.watcher_eid:
+                logger.info(
+                    f"Watcher requested for session {session.session_id}"
+                )
+                self._ensureCapacity(kind="watcher", requested=1)
+                first_witness = self.ctx.store.get_resource("witness", session.witness_eids[0])
+                oobi = first_witness.oobis[0] if first_witness and first_witness.oobis else None
+                logger.info(
+                    f"Watcher allocation start for session {session.session_id}"
+                )
+                created = self.ctx.watcher_boot.allocate_watcher(session.account_aid, oobi=oobi)
+                record = make_record(
+                    kind="watcher",
+                    eid=str(created.get("eid", "")),
+                    cid="",
+                    principal="",
+                    session_id=session.session_id,
+                    name=str(created.get("name", "") or "watcher"),
+                    identifier_alias=session.account_alias,
+                    region_id=session.region_id,
+                    region_name=session.region_name,
+                    public_url=self.ctx.config.wat_public_url,
+                    boot_url=self.ctx.watcher_boot.base_url,
+                    oobis=list(created.get("oobis", []) or []),
+                    status=str(created.get("status", "") or "created"),
+                )
+                self.ctx.store.add_resource(record)
+                session.watcher_eid = record.eid
+                session.updated_at = now_iso()
+                self.ctx.store.save_session(session)
+                logger.info(
+                    f"Watcher allocated for session {session.session_id}: watcher {record.eid}"
+                )
+        except BootError as exc:
+            logger.warning(
+                f"Boot API error during session resource provisioning: {exc}"
+            )
+            raise _boot_error(exc)
+        except Exception as exc:
+            logger.exception(
+                f"Unexpected error during session resource provisioning: {exc}"
+            )
+            raise
+
+    def _ensureCapacity(self, *, kind: str, requested: int) -> None:
+        if requested <= 0:
+            return
+        count = self.ctx.store.count_resources(kind)
+        limit = (
+            self.ctx.config.witness_limit
+            if kind == "witness"
+            else self.ctx.config.watcher_limit
+        )
+        
+        # Log warnings if the projected resource count approaches or exceeds the limit,
+        # but still allow the request to proceed until the hard limit is reached
+        projected = count + requested
+        ratio = projected / max(limit, 1)
+        if ratio >= 0.95:
+            logger.warning(
+                f"Projected {kind} usage is at 95% of capacity limit",
+            )
+        elif ratio >= 0.85:
+            logger.info(
+                f"Projected {kind} usage is at 85% of capacity limit",
+            )
+        elif ratio >= 0.7:
+            logger.info(
+                f"Projected {kind} usage is at 70% of capacity limit",
+            )
+        if projected > limit:
+            logger.error(
+                f"Capacity for {kind} exceeded: cannot provision {requested} as it would exceed the limit of {limit}"
+                f" with current count at {count}"
+            )
+            raise falcon.HTTPConflict(
+                title="Capacity exceeded",
+                description=(
+                    f"{kind} limit is {limit}, current count is {count}, "
+                    f"requested {requested} additional"
+                ),
+            )
+
+    def _plannedWitnessBackends(self, *, session: SessionRecord) -> list[Any]:
+        if session.witness_backend_ids:
+            if len(session.witness_backend_ids) != session.witness_count:
+                logger.error(
+                    "Session witness backend selection does not match witness count",
+                )
+                raise BootError(
+                    "Session witness backend selection does not match the configured witness count.",
+                    status_code=503,
+                )
+            logger.debug(
+                "Witness backends already selected for session",
+            )
+            return [self._witnessBackend(backend_id) for backend_id in session.witness_backend_ids]
+
+        backends = self._selectWitnessBackends(
+            count=session.witness_count,
+            seed=session.session_id,
+        )
+        session.witness_backend_ids = [backend.id for backend in backends]
+        session.updated_at = now_iso()
+        self.ctx.store.save_session(session)
+        logger.info(
+            f"Witness backends selected for session {session.session_id}"
+        )
+        return backends
+
+    def _selectWitnessBackends(self, *, count: int, seed: str) -> list[Any]:
+        ordered = sorted(self.ctx.config.witness_backends, key=lambda backend: backend.id)
+        if count > len(ordered):
+            logger.error(
+                f"Witness backend selection failed due to insufficient backends: {count} requested but only {len(ordered)} available"
+            )
+            raise BootError(
+                f"Witness profile requires {count} backends but only {len(ordered)} are configured.",
+                status_code=503,
+            )
+        if count <= 0:
+            return []
+
+        digest = blake2b(seed.encode("utf-8"), digest_size=8).digest()
+        start = int.from_bytes(digest, "big") % len(ordered)
+        return [ordered[(start + index) % len(ordered)] for index in range(count)]
+
+    def _witnessBackend(self, backend_id: str) -> Any:
+        for backend in self.ctx.config.witness_backends:
+            if backend.id == backend_id:
+                return backend
+        raise BootError(f"Witness backend '{backend_id}' is not configured.", status_code=503)
+
+    def _witnessClient(self, backend_id: str) -> Any:
+        client = self.ctx.witness_boots.get(backend_id)
+        if client is None:
+            raise BootError(f"Witness backend '{backend_id}' is not configured.", status_code=503)
+        return client
+
+    def _witnessClientForRecord(self, record) -> Any:
+        if record.backend_id:
+            return self._witnessClient(record.backend_id)
+
+        if record.boot_url:
+            for backend in self.ctx.config.witness_backends:
+                if backend.boot_url == record.boot_url:
+                    return self._witnessClient(backend.id)
+
+        public_url = (record.url or "").rstrip("/")
+        if public_url:
+            matches = [
+                backend for backend in self.ctx.config.witness_backends if backend.public_url == public_url
+            ]
+            if len(matches) == 1:
+                return self._witnessClient(matches[0].id)
+
+        if record.public_host:
+            matches = [
+                backend
+                for backend in self.ctx.config.witness_backends
+                if parse_public_url(backend.public_url) == (record.public_host, record.public_port)
+            ]
+            if len(matches) == 1:
+                return self._witnessClient(matches[0].id)
+
+        if len(self.ctx.witness_boots) == 1:
+            return next(iter(self.ctx.witness_boots.values()))
+
+        raise BootError(
+            f"No witness backend matches stored routing data for witness '{record.eid}'.",
+            status_code=503,
+        )
+
+    def teardownSessionResources(self, *, session: SessionRecord, account=None) -> None:
+        errors: list[BootError] = []
+        watcher_ids = self._collectSessionResourceIDs(kind="watcher", session=session, account=account)
+        witness_ids = self._collectSessionResourceIDs(kind="witness", session=session, account=account)
+        logger.info(
+            f"Session resource teardown started for session {session.session_id}"
+        )
+
+        for watcher_id in watcher_ids:
+            try:
+                self.deleteHostedResource(
+                    kind="watcher",
+                    eid=watcher_id,
+                    session=session,
+                    account=account,
+                    tolerate_missing_remote=True,
+                )
+            except BootError as exc:
+                errors.append(exc)
+                logger.warning(
+                    f"Failed to delete watcher {watcher_id} during teardown for session {session.session_id}"
+                )
+
+        for witness_id in witness_ids:
+            try:
+                self.deleteHostedResource(
+                    kind="witness",
+                    eid=witness_id,
+                    session=session,
+                    account=account,
+                    tolerate_missing_remote=True,
+                )
+            except BootError as exc:
+                errors.append(exc)
+                logger.warning(
+                    f"Failed to delete witness {witness_id} during teardown of session {session.session_id}"
+                )
+
+        if errors:
+            first = errors[0]
+            detail = "; ".join(str(error) for error in errors)
+            logger.warning(
+                f"Session resource teardown completed with errors ({len(errors)}) for session {session.session_id}: {detail}"
+            )
+            raise BootError(detail, status_code=first.status_code)
+        logger.info(
+            f"Session resources teardown completed for session {session.session_id}"
+        )
+
+    def teardownAccountResources(self, *, account_aid: str, account=None) -> None:
+        """Teardown account resources (Witnesses and Watchers) without deleting the account.
+        It gets triggered when an account is marked as 'expired'
+        """
+        sessions = self.ctx.store.list_sessions_for_account(account_aid)
+        errors: list[BootError] = []
+        watcher_ids = self._collectAccountResourceIDs(
+            kind="watcher",
+            account_aid=account_aid,
+            account=account,
+            sessions=sessions,
+        )
+        witness_ids = self._collectAccountResourceIDs(
+            kind="witness",
+            account_aid=account_aid,
+            account=account,
+            sessions=sessions,
+        )
+        logger.info(
+            f"Resources teardown started for account AID {account_aid}"
+        )
+
+        for watcher_id in watcher_ids:
+            try:
+                self.deleteHostedResource(
+                    kind="watcher",
+                    eid=watcher_id,
+                    account=account,
+                    tolerate_missing_remote=True,
+                )
+            except BootError as exc:
+                errors.append(exc)
+                logger.warning(
+                    f"Teardown of watcher resource failed for watcher {watcher_id}: {exc}"
+                )
+
+        for witness_id in witness_ids:
+            try:
+                self.deleteHostedResource(
+                    kind="witness",
+                    eid=witness_id,
+                    account=account,
+                    tolerate_missing_remote=True,
+                )
+            except BootError as exc:
+                errors.append(exc)
+                logger.warning(
+                    f"Teardown of witness resource failed for witness {witness_id}: {exc}"
+                )
+
+        # Clear account bindings
+        if account is not None:
+            account.watcher_eid = ""
+            account.witness_eids = []
+            account.session_id = ""
+            self.ctx.store.save_account(account)
+
+        if errors:
+            first = errors[0]
+            detail = "; ".join(str(error) for error in errors)
+            logger.warning(
+                f"Account resources teardown completed with errors ({len(errors)}) for account AID {account_aid}: {detail}"
+            )
+            raise BootError(detail, status_code=first.status_code)
+
+        logger.info(f"Resources teardown completed for account AID {account_aid}")
+
+    def deleteAccount(self, *, account_aid: str, account=None) -> None:
+        sessions = self.ctx.store.list_sessions_for_account(account_aid)
+        errors: list[BootError] = []
+        watcher_ids = self._collectAccountResourceIDs(
+            kind="watcher",
+            account_aid=account_aid,
+            account=account,
+            sessions=sessions,
+        )
+        witness_ids = self._collectAccountResourceIDs(
+            kind="witness",
+            account_aid=account_aid,
+            account=account,
+            sessions=sessions,
+        )
+        logger.info(
+            f"Account deletion started for account AID {account_aid}"
+        )
+        for watcher_id in watcher_ids:
+            try:
+                self.deleteHostedResource(
+                    kind="watcher",
+                    eid=watcher_id,
+                    account=account,
+                    tolerate_missing_remote=True,
+                )
+            except BootError as exc:
+                errors.append(exc)
+                logger.warning(
+                    f"Account deletion of watcher resource failed for watcher {watcher_id}: {exc}"
+                )
+
+        for witness_id in witness_ids:
+            try:
+                self.deleteHostedResource(
+                    kind="witness",
+                    eid=witness_id,
+                    account=account,
+                    tolerate_missing_remote=True,
+                )
+            except BootError as exc:
+                errors.append(exc)
+                logger.warning(
+                    f"Account deletion of witness resource failed for witness {witness_id}: {exc}"
+                )
+
+        if errors:
+            first = errors[0]
+            detail = "; ".join(str(error) for error in errors)
+            logger.warning(
+                f"Account deletion completed with errors ({len(errors)}) for account AID {account_aid}: {detail}"
+            )
+            raise BootError(detail, status_code=first.status_code)
+
+        self.ctx.store.delete_bindings_for_principal(account_aid)
+        self.ctx.store.delete_account(account_aid)
+        for session in sessions:
+            self.ctx.store.delete_session(session.session_id)
+        logger.info(
+            f"Account deletion completed for account AID {account_aid}"
+            f" with {len(sessions)} sessions, {len(watcher_ids)} watchers, and {len(witness_ids)} witnesses deleted"
+        )
+
+    def _collectAccountResourceIDs(
+        self,
+        *,
+        kind: str,
+        account_aid: str,
+        account=None,
+        sessions: list[SessionRecord] | None = None,
+    ) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        sessions = sessions or []
+
+        candidates: list[str] = []
+        if kind == "witness":
+            if account is not None:
+                candidates.extend(account.witness_eids)
+            for session in sessions:
+                candidates.extend(session.witness_eids)
+        else:
+            if account is not None and account.watcher_eid:
+                candidates.append(account.watcher_eid)
+            for session in sessions:
+                if session.watcher_eid:
+                    candidates.append(session.watcher_eid)
+
+        candidates.extend(
+            record.eid
+            for record in self.ctx.store.list_resources_for_account(
+                kind=kind,
+                account_aid=account_aid,
+            )
+        )
+        for session in sessions:
+            candidates.extend(
+                record.eid
+                for record in self.ctx.store.list_resources_for_session(
+                    kind=kind,
+                    session_id=session.session_id,
+                )
+            )
+
+        for eid in candidates:
+            if not eid or eid in seen:
+                continue
+            seen.add(eid)
+            ordered.append(eid)
+
+        return ordered
+
+    def _collectSessionResourceIDs(self, *, kind: str, session: SessionRecord, account=None) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+
+        candidates: list[str] = []
+        if kind == "witness":
+            candidates.extend(session.witness_eids)
+            if account is not None:
+                candidates.extend(account.witness_eids)
+        else:
+            if session.watcher_eid:
+                candidates.append(session.watcher_eid)
+            if account is not None and account.watcher_eid:
+                candidates.append(account.watcher_eid)
+
+        candidates.extend(
+            record.eid
+            for record in self.ctx.store.list_resources_for_session(
+                kind=kind,
+                session_id=session.session_id,
+            )
+        )
+
+        for eid in candidates:
+            if not eid or eid in seen:
+                continue
+            seen.add(eid)
+            ordered.append(eid)
+
+        return ordered
+
+    def deleteHostedResource(
+        self,
+        *,
+        kind: str,
+        eid: str,
+        session: SessionRecord | None = None,
+        account=None,
+        tolerate_missing_remote: bool = False,
+    ) -> None:
+        if not eid:
+            return
+
+        record = self.ctx.store.get_resource(kind, eid)
+        if record is None:
+            logger.info(
+                f"Resource record not found for deletion for {kind} with EID {eid}"
+            )
+            if session is not None:
+                if kind == "witness":
+                    session.witness_eids = [item for item in session.witness_eids if item != eid]
+                elif session.watcher_eid == eid:
+                    session.watcher_eid = ""
+            if account is not None:
+                if kind == "witness":
+                    account.witness_eids = [item for item in account.witness_eids if item != eid]
+                elif account.watcher_eid == eid:
+                    account.watcher_eid = ""
+            self._persistOwnerState(session=session, account=account)
+            return
+        if kind == "witness":
+            delete_remote = self._witnessClientForRecord(record).delete_witness
+        else:
+            delete_remote = self.ctx.watcher_boot.delete_watcher
+        logger.info(
+            f"Resource deletion started for {kind} with EID {eid}",
+        )
+        try:
+            delete_remote(eid)
+        except BootError as exc:
+            if not (tolerate_missing_remote and exc.status_code == 404):
+                logger.warning(
+                    f"Resource deletion failed for {kind} with EID {eid}: {exc}",
+                )
+                raise 
+            logger.info(
+                f"Resource not found during deletion for {kind} with EID {eid}, but tolerated: {exc}",
+            )
+        self.ctx.store.delete_resource(kind, eid)
+        if session is not None:
+            if kind == "witness":
+                session.witness_eids = [item for item in session.witness_eids if item != eid]
+            elif session.watcher_eid == eid:
+                session.watcher_eid = ""
+
+        if account is not None:
+            if kind == "witness":
+                account.witness_eids = [item for item in account.witness_eids if item != eid]
+            elif account.watcher_eid == eid:
+                account.watcher_eid = ""
+
+        self._persistOwnerState(session=session, account=account)
+        logger.info(
+            f"Resource deletion completed for {kind} with EID {eid}"
+        )
+
+    def _persistOwnerState(self, *, session: SessionRecord | None = None, account=None) -> None:
+        if session is not None:
+            session.updated_at = now_iso()
+            self.ctx.store.save_session(session)
+        if account is not None:
+            self.ctx.store.save_account(account)
+
+    def _teardownFailedSessionResources(
+        self,
+        *,
+        session: SessionRecord,
+        failure_reason: str,
+        account=None,
+    ) -> None:
+        try:
+            self.teardownSessionResources(session=session, account=account)
+        except BootError as exc:
+            session.failure_reason = f"{failure_reason} Cleanup failed: {exc}"
+            session.updated_at = now_iso()
+            self.ctx.store.save_session(session)
+            logger.warning(
+                f"Session resource teardown failed for {session.session_id}: {exc}",
+            )
+    

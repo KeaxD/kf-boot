@@ -14,7 +14,7 @@ from keri.kering import (
     ValidationError,
 )
 
-from kfboot.boot_exchanger import ACCOUNT_ROUTES, ONBOARDING_ROUTES
+from kfboot.config import ACCOUNT_ROUTES, ONBOARDING_ROUTES
 
 
 EVENT_ILKS = {Ilks.icp, Ilks.rot, Ilks.ixn, Ilks.dip, Ilks.drt}
@@ -59,10 +59,10 @@ class CesrSurfaceEnd:
         msg = bytearray(serder.raw)
         msg.extend(cr.attachments.encode("utf-8"))
 
-        self.ctx.exchanger.set_client_ip(req.remote_addr or "")
-        self.ctx.exchanger.expire_sessions()
-        self.ctx.exchanger.expire_accounts()
-        self.ctx.exchanger.clear_replies()
+        self.ctx.exchanger.setClientIp(req.remote_addr or "")
+        self.ctx.exchanger.expirer.expireSessions()
+        self.ctx.exchanger.expirer.expireAccounts()
+        self.ctx.exchanger.clearReplies()
 
         try:
             self.ctx.parser.parseOne(ims=msg, exc=self.ctx.exchanger, local=False)
@@ -88,7 +88,7 @@ class CesrSurfaceEnd:
         if serder.ilk in EVENT_ILKS:
             _require_accepted_keystate(habery=self.ctx.habery, serder=serder)
 
-        reply = self.ctx.exchanger.take_reply()
+        reply = self.ctx.exchanger.takeReply()
         if reply is not None:
             rep.content_type = CESR_CONTENT_TYPE
             rep.data = reply

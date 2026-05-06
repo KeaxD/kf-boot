@@ -104,6 +104,7 @@ class AccountRecord:
     tier: str = ""
     expires_at: str = ""
     pause_reason: str = ""
+    kel_used: int = 0
 
 
 class PlatformBaser(dbing.LMDBer):

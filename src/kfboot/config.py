@@ -33,6 +33,24 @@ def _normalize_url(value: str) -> str:
     return value.rstrip("/")
 
 
+ONBOARDING_ROUTES = {
+    "/onboarding/session/start",
+    "/onboarding/session/status",
+    "/onboarding/account/create",
+    "/onboarding/complete",
+    "/onboarding/cancel",
+}
+
+ACCOUNT_ROUTES = {
+    "/account/witnesses",
+    "/account/watchers",
+    "/account/watchers/status",
+    "/account/delete",
+    "/account/witnesses/delete",
+    "/account/watchers/delete",
+}
+
+
 # Account profile definitions are used to enforce per-tier limits and quotas.
 # Each profile maps a staging tier to a bootstrap code and runtime limits.
 @dataclass(frozen=True)

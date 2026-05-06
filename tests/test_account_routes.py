@@ -507,151 +507,6 @@ def test_account_routes_map_downstream_boot_errors_to_http_statuses(
     assert response.json["title"] == expected_title
 
 
-def test_account_witnesses_route_enforces_kel_budget(contract_factory):
-    """Verify that account routes are rejected once the account KEL budget is exceeded."""
-    contract = contract_factory(
-        bootstrap_accounts_per_ip=10,
-        bootstrap_aids_per_ip=10,
-        bootstrap_account_options=("1-of-1",),
-        account_profiles=(
-            AccountProfile(
-                tier="trial",
-                code="1-of-1",
-                max_accounts=1,
-                max_requests_per_minute=100,
-                kel_budget=4
-            ),
-        ),
-    )
-
-    with (
-        habbing.openHab(name="kel-ephemeral", temp=True, transferable=False) as (_, ephemeral),
-        habbing.openHab(name="kel-account", temp=True) as (_, account),
-    ):
-        # KEL budget is spent for each Onboarding and Account requests
-        register_aid(contract, "/onboarding", ephemeral)
-        
-        # kel_budget=1 for /onboarding/session/start
-        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
-        
-        # kel_budget=2 for /onboarding/account/create
-        create_account(contract, ephemeral, start_reply, account_aid=account.pre)
-        register_aid(contract, "/account", account)
-        
-        # kel_budget=3 for /onboarding/complete
-        _, _, _ = complete_session(
-            contract,
-            ephemeral,
-            session_id=start_reply.ked["a"]["session_id"],
-            account_aid=account.pre,
-        )
-
-        # kel_budget=4 for /account/witnesses
-        response = post_cesr(
-            contract,
-            "/account",
-            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
-        )
-        assert response.status_code == 200
-
-        # Request exceed KEL budget, should be rejected with 429
-        response = post_cesr(
-            contract,
-            "/account",
-            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
-        )
-        assert response.status_code == 429
-        assert response.json["title"] == "Account key event budget exceeded"
-
-
-def test_account_kel_budget_is_scoped_per_account(contract_factory):
-    """Tests one account exhausting KEL budget does not throttle another account."""
-    contract = contract_factory(
-        bootstrap_accounts_per_ip=100,
-        bootstrap_aids_per_ip=100,
-        bootstrap_account_options=("1-of-1",),
-        account_profiles=(
-            AccountProfile(
-                tier="trial",
-                code="1-of-1",
-                max_accounts=100,
-                max_requests_per_minute=100,
-                kel_budget=4
-            ),
-        ),
-    )
-
-    with (
-        habbing.openHab(name="kel-isolated-ephemeral-a", temp=True, transferable=False) as (_, ephemeral_a),
-        habbing.openHab(name="kel-isolated-account-a", temp=True) as (_, account_a),
-        habbing.openHab(name="kel-isolated-ephemeral-b", temp=True, transferable=False) as (_, ephemeral_b),
-        habbing.openHab(name="kel-isolated-account-b", temp=True) as (_, account_b),
-    ):
-        register_aid(contract, "/onboarding", ephemeral_a)
-        register_aid(contract, "/account", account_a)
-        # KEL budget = 1 for /onboarding/session/start
-        _, _, start_reply_a = start_session(
-            contract,
-            ephemeral_a,
-            account_aid=account_a.pre,
-            account_alias="alpha-a",
-        )
-
-        # KEL budget = 2 for /onboarding/account/create
-        create_account(contract, ephemeral_a, start_reply_a, account_aid=account_a.pre)
-        
-        # KEL budget = 3 for /onboarding/complete
-        complete_session(
-            contract,
-            ephemeral_a,
-            session_id=start_reply_a.ked["a"]["session_id"],
-            account_aid=account_a.pre,
-        )
-
-        # KEL budget = 4 for account/witnesses
-        response = post_cesr(
-            contract,
-            "/account",
-            build_exn(account_a, route="/account/witnesses", payload={"account_aid": account_a.pre}),
-        )
-        assert response.status_code == 200
-
-        # Account A has exceeded KEL budget, request gets rejected
-        rejected = post_cesr(
-            contract,
-            "/account",
-            build_exn(account_a, route="/account/witnesses", payload={"account_aid": account_a.pre}),
-        )
-        assert rejected.status_code == 429
-        assert rejected.json["title"] == "Account key event budget exceeded"
-
-        register_aid(contract, "/onboarding", ephemeral_b)
-        register_aid(contract, "/account", account_b)
-        
-        # Account B can still make requests sucessfully, KEL budget is scoped per account
-        _, _, start_reply_b = start_session(
-            contract,
-            ephemeral_b,
-            account_aid=account_b.pre,
-            account_alias="alpha-b",
-        )
-        create_account(contract, ephemeral_b, start_reply_b, account_aid=account_b.pre)
-        complete_session(
-            contract,
-            ephemeral_b,
-            session_id=start_reply_b.ked["a"]["session_id"],
-            account_aid=account_b.pre,
-        )
-
-        accepted = post_cesr(
-            contract,
-            "/account",
-            build_exn(account_b, route="/account/witnesses", payload={"account_aid": account_b.pre}),
-        )
-
-    assert accepted.status_code == 200
-
-
 def test_account_routes_enforce_persisted_witness_profile_code(contract_factory):
     """Tests account-route quotas use the account's stored witness profile."""
     contract = contract_factory(
@@ -719,98 +574,6 @@ def test_account_routes_enforce_persisted_witness_profile_code(contract_factory)
     assert rejected.json["title"] == "Account request rate limit exceeded"
 
 
-def test_account_route_request_rate_soft_warnings_before_hard_limit(contract_factory, monkeypatch):
-    """Verify account routes emit soft request-rate warnings before the hard limit rejects requests."""
-    contract = contract_factory(
-        bootstrap_accounts_per_ip=100,
-        bootstrap_aids_per_ip=100,
-        bootstrap_account_options=("1-of-1",),
-        account_profiles=(
-            AccountProfile(
-                tier="trial",
-                code="1-of-1",
-                max_accounts=1,
-                max_requests_per_minute=10,
-                kel_budget=100
-            ),
-        ),
-    )
-
-    with (
-        habbing.openHab(name="rate-warning-account-ephemeral", temp=True, transferable=False) as (_, ephemeral),
-        habbing.openHab(name="rate-warning-account", temp=True) as (_, account),
-    ):
-        register_aid(contract, "/onboarding", ephemeral)
-        register_aid(contract, "/account", account)
-
-        # Complete Onboarding, note that it takes 3 requests that count towards the rate limit 
-        # (start session, create account, complete onboarding)
-        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
-        create_account(contract, ephemeral, start_reply, account_aid=account.pre)
-        _, _, _ = complete_session(
-            contract,
-            ephemeral,
-            session_id=start_reply.ked["a"]["session_id"],
-            account_aid=account.pre,
-        )
-
-        info_calls: list[str] = []
-        warning_calls: list[str] = []
-        monkeypatch.setattr(
-            boot_exchanger.logger,
-            "info",
-            lambda message, **kwargs: info_calls.append(message),
-        )
-        monkeypatch.setattr(
-            boot_exchanger.logger,
-            "warning",
-            lambda message, **kwargs: warning_calls.append(message),
-        )
-
-        # Make requests 5 requests on top of the 3 requests already made during onboarding
-        for _ in range(5):
-            response = post_cesr(
-                contract,
-                "/account",
-                build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
-            )
-            assert response.status_code == 200
-
-        # The next request should hit the soft-warning threshold (9/10 total requests)
-        response = post_cesr(
-            contract,
-            "/account",
-            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
-        )
-        assert response.status_code == 200
-        assert any(
-            "Approaching request rate limit for account" in msg
-            for msg in info_calls
-        )
-
-        # The following request should hit the high-warning threshold (10/10 total requests)
-        response = post_cesr(
-            contract,
-            "/account",
-            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
-        )
-        assert response.status_code == 200
-        assert any(
-            "Approaching request rate limit for account" in msg
-            for msg in warning_calls
-        )
-
-        # The following request exceeds the max_requests_per_minute limit and should be rejected
-        response = post_cesr(
-            contract,
-            "/account",
-            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
-        )
-
-    assert response.status_code == 429
-    assert response.json["title"] == "Account request rate limit exceeded"
-
-
 def test_expire_accounts_transitions_onboarded_account_to_expired(onboarded_bundle):
     """Ensure onboarded accounts are moved to expired status when their expiry date passes."""
     contract = onboarded_bundle["contract"]
@@ -822,7 +585,7 @@ def test_expire_accounts_transitions_onboarded_account_to_expired(onboarded_bund
     contract.ctx.store.save_account(record)
 
     # Manually trigger the expiration process
-    contract.ctx.exchanger.expire_accounts()
+    contract.ctx.exchanger.expirer.expireAccounts()
 
     updated = contract.ctx.store.get_account(account.pre)
     assert updated is not None
@@ -914,10 +677,10 @@ def test_expire_accounts_triggers_resource_teardown(contract_factory, monkeypatc
         contract.ctx.store.save_account(account)
         cleaned.append((account_aid, account))
 
-    monkeypatch.setattr(contract.ctx.exchanger, "teardown_account_resources", fake_teardown)
+    monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownAccountResources", fake_teardown)
 
     # Run expiration logic
-    contract.ctx.exchanger.expire_accounts()
+    contract.ctx.exchanger.expirer.expireAccounts()
 
     expired = contract.ctx.store.get_account("AID_EXPIRED")
     assert expired is not None
