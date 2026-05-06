@@ -34,7 +34,7 @@ class CesrSurfaceEnd:
 
         rep.set_header("Cache-Control", "no-cache")
 
-        cr = _parse_cesr_http_request(req=req, surface=self.surface)
+        cr = _parseCesrHttpRequest(req=req, surface=self.surface)
         serder = serdering.SerderKERI(sad=cr.payload)
         route = str(serder.ked.get("r", "") or "")
         logger.info(
@@ -43,7 +43,7 @@ class CesrSurfaceEnd:
             f"sender_aid={serder.pre}\n"
             f"surface={self.surface}"
         )
-        self._validate_surface(serder)
+        self._validateSurface(serder)
         if serder.ilk == Ilks.exn and serder.pre not in self.ctx.habery.kevers:
             logger.warning(
                 "CESR request with unknown sender key state",
@@ -86,7 +86,7 @@ class CesrSurfaceEnd:
             ) from exc
 
         if serder.ilk in EVENT_ILKS:
-            _require_accepted_keystate(habery=self.ctx.habery, serder=serder)
+            _requireAcceptedKeystate(habery=self.ctx.habery, serder=serder)
 
         reply = self.ctx.exchanger.takeReply()
         if reply is not None:
@@ -119,7 +119,7 @@ class CesrSurfaceEnd:
             description="The authenticated request was not accepted by the boot service.",
         )
 
-    def _validate_surface(self, serder) -> None:
+    def _validateSurface(self, serder) -> None:
         if serder.ilk in EVENT_ILKS:
             return
 
@@ -147,7 +147,7 @@ class CesrSurfaceEnd:
         )
 
 
-def _parse_cesr_http_request(req: falcon.Request, *, surface: str) -> CesrRequest:
+def _parseCesrHttpRequest(req: falcon.Request, *, surface: str) -> CesrRequest:
     raw_content_type = req.get_header("content-type", default="") or ""
     parsed_content_type = (req.content_type or "").strip().lower()
     content_type = parsed_content_type or raw_content_type
@@ -204,7 +204,7 @@ def _parse_cesr_http_request(req: falcon.Request, *, surface: str) -> CesrReques
     )
 
 
-def _require_accepted_keystate(*, habery, serder) -> None:
+def _requireAcceptedKeystate(*, habery, serder) -> None:
     kever = habery.kevers.get(serder.pre)
     sn = int(getattr(serder, "sn", serder.ked.get("s", 0)) or 0)
 
