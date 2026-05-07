@@ -322,7 +322,6 @@ class Store:
             "created_at": account.created_at,
             "onboarded_at": account.onboarded_at,
             "expires_at": account.expires_at,
-            "pause_reason": account.pause_reason,
             "witness_profile_code": account.witness_profile_code,
             "witness_count": account.witness_count,
             "toad": account.toad,
