@@ -175,7 +175,7 @@ class Limiter:
         account = self.ctx.store.getAccount(account_aid)
         if account is None:
             logger.info(
-                f"Account does not exist yet, skipping enforcing KEL budget"
+                "Account does not exist yet, skipping enforcing KEL budget"
             )
             return
 

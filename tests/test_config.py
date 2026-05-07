@@ -60,6 +60,25 @@ def test_config_from_env_parses_witness_backend_pool(monkeypatch):
     assert config.bootstrap_account_options == ("1-of-1", "3-of-4")
 
 
+def test_config_from_env_uses_legacy_single_backend_fallback(monkeypatch):
+    """Tests the legacy single-backend environment variables still build a valid config."""
+    monkeypatch.delenv("KF_BOOT_WITNESS_BACKENDS", raising=False)
+    monkeypatch.delenv("KF_BOOT_ACCOUNT_PROFILES", raising=False)
+    monkeypatch.setenv("KF_BOOT_WIT_BOOT_URL", "http://boot.local/witness/")
+    monkeypatch.setenv("KF_BOOT_WIT_PUBLIC_URL", "https://witness.example/")
+    monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers/")
+    monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example/")
+    monkeypatch.setenv("KF_BOOT_BOOTSTRAP_WATCHER_REQUIRED", "false")
+
+    config = Config.from_env()
+
+    assert [backend.id for backend in config.witness_backends] == ["wit-1"]
+    assert config.wit_boot_url == "http://boot.local/witness"
+    assert config.wit_public_url == "https://witness.example"
+    assert config.bootstrap_account_options == ("1-of-1",)
+    assert config.bootstrap_watcher_required is False
+
+
 def test_config_from_env_parses_account_profiles(monkeypatch):
     """Test that account profiles are correctly parsed from env variables and can be retrieved"""
 

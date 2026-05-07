@@ -27,7 +27,7 @@ def requiredStr(payload: dict[str, Any], key: str) -> str:
         description=f"{key} is required.",
     )
 
-def bootErrorToHTTTP(exc: BootError) -> falcon.HTTPError:
+def bootErrorToHTTP(exc: BootError) -> falcon.HTTPError:
     if exc.status_code == 400:
         return falcon.HTTPBadRequest(
             title="Boot API rejected request",

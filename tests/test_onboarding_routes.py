@@ -5,7 +5,6 @@ from typing import Any
 from types import SimpleNamespace
 import falcon
 import pytest
-import kfboot.boot_exchanger as boot_exchanger
 from keri.app import habbing
 
 from kfboot.basing import (
@@ -42,7 +41,6 @@ from .support import (
     make_config,
 )
 from kfboot.store import Store
-from kfboot.limiting import Limiter
 
 
 def test_onboarding_flow_persists_state_transitions_and_bound_resources(contract):

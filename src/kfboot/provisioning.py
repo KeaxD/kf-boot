@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 import falcon
-from datetime import datetime
 from hashlib import blake2b
 from typing import Any
 
-import falcon
 from keri import help
 
 from kfboot.basing import (
@@ -23,7 +21,7 @@ from kfboot.store import (
     parsePublicUrl,
 )
 
-from kfboot.utils import bootErrorToHTTTP
+from kfboot.utils import bootErrorToHTTP
 
 logger = help.ogler.getLogger(__name__)
 
@@ -37,7 +35,7 @@ class Provisioner:
         if session.state in TERMINAL_SESSION_STATES:
             if session.state == SESSION_STATE_FAILED:
                 logger.warning(
-                    f"Session in failed state during resource provisioning"
+                    "Session in failed state during resource provisioning"
                 )
                 raise falcon.HTTPConflict(
                     title="Session failed",
@@ -131,7 +129,7 @@ class Provisioner:
             logger.warning(
                 f"Boot API error during session resource provisioning: {exc}"
             )
-            raise bootErrorToHTTTP(exc)
+            raise bootErrorToHTTP(exc)
         except Exception as exc:
             logger.exception(
                 f"Unexpected error during session resource provisioning: {exc}"

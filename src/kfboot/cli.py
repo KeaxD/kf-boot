@@ -77,7 +77,7 @@ def main() -> None:
     finally:
         ctx.close()
         logger.info(
-            f"Server stopped"
+            "Server stopped"
         )
 
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 import falcon
 import pytest
-import kfboot.boot_exchanger as boot_exchanger
 from keri.app import habbing
 
 from kfboot.basing import (
@@ -316,6 +315,61 @@ def test_witness_delete_routes_legacy_records_by_public_url_when_backend_fields_
     for backend_id, boot in contract.ctx.witness_boots.items():
         expected = [witness_id] if backend_id == expected_backend_id else []
         assert boot.delete_calls == expected
+
+
+def test_witness_delete_routes_legacy_records_by_public_host_and_port_when_url_is_missing(onboarded_bundle):
+    """Tests witness deletes can still resolve legacy records through host and port metadata."""
+    contract = onboarded_bundle["contract"]
+    account = onboarded_bundle["account"]
+    witness_id = onboarded_bundle["witness_ids"][0]
+    record = contract.ctx.store.getResource("witness", witness_id)
+    expected_backend_id = record.backend_id
+
+    for boot in contract.ctx.witness_boots.values():
+        boot.delete_calls.clear()
+
+    record.backend_id = ""
+    record.boot_url = ""
+    record.url = ""
+    contract.ctx.store.saveResource(record)
+
+    response = post_cesr(
+        contract,
+        "/account",
+        build_exn(
+            account,
+            route="/account/witnesses/delete",
+            payload={"account_aid": account.pre, "witness_eid": witness_id},
+        ),
+    )
+
+    _, reply = assert_reply_frame(contract, response, route="/account/witnesses/delete")
+    assert reply.ked["a"]["witness_id"] == witness_id
+    for backend_id, boot in contract.ctx.witness_boots.items():
+        expected = [witness_id] if backend_id == expected_backend_id else []
+        assert boot.delete_calls == expected
+
+
+def test_delete_hosted_resource_tolerates_missing_remote_404(onboarded_bundle):
+    """Tests a missing remote witness delete is treated as tolerated cleanup when requested."""
+    contract = onboarded_bundle["contract"]
+    account = onboarded_bundle["account"]
+    witness_id = onboarded_bundle["witness_ids"][0]
+    account_record = contract.ctx.store.getAccount(account.pre)
+    witness_record = contract.ctx.store.getResource("witness", witness_id)
+    witness_boot = contract.ctx.witness_boots[witness_record.backend_id]
+    witness_boot.delete_error = BootError("simulated witness not found", status_code=404)
+
+    contract.ctx.exchanger.provisioner.deleteHostedResource(
+        kind="witness",
+        eid=witness_id,
+        account=account_record,
+        tolerate_missing_remote=True,
+    )
+
+    assert contract.ctx.store.getResource("witness", witness_id) is None
+    assert contract.ctx.store.getAccount(account.pre).witness_eids == []
+    assert witness_boot.delete_calls == [witness_id]
 
 
 def test_account_witnesses_route_tolerates_legacy_resource_rows(onboarded_bundle, monkeypatch):

@@ -30,7 +30,7 @@ from kfboot.limiting import Limiter
 from kfboot.admitting import Admitter
 from kfboot.provisioning import Provisioner
 from kfboot.expiring import Expirer
-from kfboot.utils import extractExnPayload, optionalStr, requiredStr, bootErrorToHTTTP
+from kfboot.utils import extractExnPayload, optionalStr, requiredStr, bootErrorToHTTP
 
 logger = help.ogler.getLogger(__name__)
 
@@ -191,7 +191,7 @@ class SessionStartHandler(RouteHandler):
         except BootError as exc:
             # mark session failed, attempt teardown, then map to HTTP error
             self.exchanger.expirer.failSession(session=session, reason=str(exc), teardown=True)
-            raise bootErrorToHTTTP(exc)
+            raise bootErrorToHTTP(exc)
         except Exception as exc:
             # unexpected error: mark session failed and re-raise
             self.exchanger.expirer.failSession(session=session, reason=str(exc), teardown=True)
@@ -346,7 +346,7 @@ class CompleteHandler(RouteHandler):
         )
         if session.account_aid and session.account_aid != account_aid:
             logger.warning(
-                f"Onboarding rejected due to session already bound to a different account AID",
+                "Onboarding rejected due to session already bound to a different account AID",
             )
             raise falcon.HTTPConflict(
                 title="Session already bound",
@@ -410,7 +410,7 @@ class CancelHandler(RouteHandler):
         )
         if session.state == SESSION_STATE_COMPLETED:
             logger.warning(
-                f"Session cancellation rejected because session is already completed"
+                "Session cancellation rejected because session is already completed"
             )
             raise falcon.HTTPConflict(
                 title="Session completed",
@@ -429,7 +429,7 @@ class CancelHandler(RouteHandler):
                 logger.warning(
                     f"Session cancellation failed during resource teardown for session {session.session_id}"
                 )
-                raise bootErrorToHTTTP(exc)
+                raise bootErrorToHTTP(exc)
 
             session.state = SESSION_STATE_CANCELLED
             session.updated_at = nowIso()
@@ -503,7 +503,7 @@ class AccountWatcherStatusHandler(RouteHandler):
             logger.warning(
                 f"Query for watcher status failed for watcher {watcher_id} due to boot API error: {exc}"
             )
-            raise bootErrorToHTTTP(exc)
+            raise bootErrorToHTTP(exc)
 
         derived_status = _watcherStatusLabel(status)
         if derived_status:
@@ -551,7 +551,7 @@ class AccountWitnessDeleteHandler(RouteHandler):
             logger.warning(
                 f"Account witness delete failed for witness {witness_id} from {sender}: {exc}"
             )
-            raise bootErrorToHTTTP(exc)
+            raise bootErrorToHTTP(exc)
 
         self.exchanger.queueReply(
             self.resource,
@@ -588,7 +588,7 @@ class AccountWatcherDeleteHandler(RouteHandler):
             logger.warning(
                 f"Account watcher delete failed for watcher {watcher_id} from {sender}: {str(exc)}"
             )
-            raise bootErrorToHTTTP(exc)
+            raise bootErrorToHTTP(exc)
 
         self.exchanger.queueReply(
             self.resource,
@@ -637,7 +637,7 @@ class AccountDeleteHandler(RouteHandler):
             logger.warning(
                 f"Account delete failed for account AID {account_aid}: {exc}"
             )
-            raise bootErrorToHTTTP(exc)
+            raise bootErrorToHTTP(exc)
 
         logger.info(
             f"Account deleted for account AID {sender}"
@@ -749,7 +749,7 @@ class BootExchanger(Exchanger):
         if sender and sender == session.account_aid:
             return
         logger.warning(
-            f"Session account principal mismatch, the authenticated sender does not match the session's account AID"
+            "Session account principal mismatch, the authenticated sender does not match the session's account AID"
         )
         raise falcon.HTTPUnauthorized(
             title="Wrong account principal",
