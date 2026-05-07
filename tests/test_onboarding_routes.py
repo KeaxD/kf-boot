@@ -11,7 +11,6 @@ from keri.app import habbing
 from kfboot.basing import (
     ACCOUNT_STATE_FAILED,
     ACCOUNT_STATE_ONBOARDED,
-    ACCOUNT_STATE_PAUSED,
     ACCOUNT_STATE_EXPIRED,
     ACCOUNT_STATE_PENDING_ONBOARDING,
     SESSION_STATE_ACCOUNT_CREATED,
@@ -914,12 +913,11 @@ def test_session_start_rejects_alias_when_existing_account_is_pending(contract_f
 @pytest.mark.parametrize(
     ("status", "expected_reason"),
     [
-        (ACCOUNT_STATE_PAUSED, "paused"),
         (ACCOUNT_STATE_EXPIRED, "expired"),
     ],
 )
-def test_account_create_rejects_paused_or_expired_permanent_account(contract_factory, status, expected_reason):
-    """Verify that onboarding rejects account creation when the account is paused or expired."""
+def test_account_create_rejects_expired_permanent_account(contract_factory, status, expected_reason):
+    """Verify that onboarding rejects account creation when the account is expired."""
     contract = contract_factory(
         bootstrap_accounts_per_ip=100,
         bootstrap_aids_per_ip=100,
@@ -939,7 +937,7 @@ def test_account_create_rejects_paused_or_expired_permanent_account(contract_fac
         record = contract.ctx.store.getAccount(account.pre)
         assert record is not None
 
-        # Set the account status to paused/expired 
+        # Set the account status to expired
         record.status = status
         contract.ctx.store.saveAccount(record)
 

@@ -9,7 +9,6 @@ from keri.peer.exchanging import Exchanger
 
 from kfboot.basing import (
     ACCOUNT_STATE_ONBOARDED,
-    ACCOUNT_STATE_PAUSED,
     ACCOUNT_STATE_PENDING_ONBOARDING,
     ACCOUNT_STATE_EXPIRED,
     AccountRecord,
@@ -257,13 +256,13 @@ class AccountCreateHandler(RouteHandler):
         account = self.exchanger.ctx.store.getAccount(account_aid)
         
         # Check account state before attempting to create or update account records
-        if account is not None and account.status in {ACCOUNT_STATE_PAUSED, ACCOUNT_STATE_EXPIRED}:
+        if account is not None and account.status == ACCOUNT_STATE_EXPIRED:
             logger.warning(
-                f"Account creation rejected due to account {account_aid} being paused or expired",
+                f"Account creation rejected due to account {account_aid} being expired",
             )
             raise falcon.HTTPConflict(
                 title="Account not available",
-                description="The permanent account AID is currently paused or expired and cannot be reused for onboarding.",
+                description="The permanent account AID is currently expired and cannot be reused for onboarding.",
             )
         if account is not None and account.session_id not in {"", session.session_id}:
             logger.warning(
@@ -622,7 +621,6 @@ class AccountDeleteHandler(RouteHandler):
         # Check account state
         if account is not None and account.status not in {
             ACCOUNT_STATE_ONBOARDED,
-            ACCOUNT_STATE_PAUSED,
             ACCOUNT_STATE_EXPIRED,
         }:
             logger.warning(
@@ -794,12 +792,6 @@ class BootExchanger(Exchanger):
             raise falcon.HTTPNotFound(
                 title="Account not found",
                 description="No account exists for the authenticated sender.",
-            )
-        if account.status == ACCOUNT_STATE_PAUSED:
-            logger.warning(f"Account {account.account_aid} is paused and cannot access approved account routes")
-            raise falcon.HTTPConflict(
-                title="Account paused",
-                description="This account is currently paused and cannot access approved account routes.",
             )
         if account.status == ACCOUNT_STATE_EXPIRED:
             logger.warning(f"Account {account.account_aid} has expired and cannot access account routes")

@@ -9,7 +9,6 @@ from keri.app import habbing
 from kfboot.basing import (
     ACCOUNT_STATE_EXPIRED,
     ACCOUNT_STATE_ONBOARDED,
-    ACCOUNT_STATE_PAUSED,
     ACCOUNT_STATE_PENDING_ONBOARDING,
 )
 from kfboot.boot_client import BootError
@@ -619,17 +618,16 @@ def test_account_route_expires_past_due_account_on_ingress(onboarded_bundle):
 @pytest.mark.parametrize(
     ("status", "title"),
     [
-        (ACCOUNT_STATE_PAUSED, "Account paused"),
         (ACCOUNT_STATE_EXPIRED, "Account expired"),
     ],
 )
-def test_account_routes_reject_paused_or_expired_accounts(onboarded_bundle, status, title):
-    """Ensure paused or expired accounts cannot use account routes."""
+def test_account_routes_reject_expired_accounts(onboarded_bundle, status, title):
+    """Ensure expired accounts cannot use account routes."""
     contract = onboarded_bundle["contract"]
     account = onboarded_bundle["account"]
     record = contract.ctx.store.getAccount(account.pre)
 
-    # Set status to paused or expired to trigger rejection of account routes
+    # Set status to expired to trigger rejection of account routes
     record.status = status
     contract.ctx.store.saveAccount(record)
 
