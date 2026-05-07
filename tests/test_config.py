@@ -90,6 +90,23 @@ def test_config_from_env_parses_account_profiles(monkeypatch):
     assert config.account_profile("missing") is None
 
 
+def test_config_from_env_parses_onboarding_request_quota(monkeypatch):
+    """Assert config is reading the onboarding request quotas properly"""
+    monkeypatch.setenv(
+        "KF_BOOT_WITNESS_BACKENDS",
+        "wit-1|http://127.0.0.1:5631|https://boot.example.com:5632",
+    )
+    monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
+    monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example")
+    monkeypatch.setenv("KF_BOOT_BOOTSTRAP_ONBOARDING_REQUESTS_PER_MINUTE", "17")
+    monkeypatch.setenv("KF_BOOT_BOOTSTRAP_ONBOARDING_BLOCK_SECONDS", "45")
+
+    config = Config.from_env()
+
+    assert config.bootstrap_onboarding_requests_per_minute == 17
+    assert config.bootstrap_onboarding_block_seconds == 45
+
+
 def test_config_from_env_rejects_malformed_account_profiles(monkeypatch):
     """Tests that malformed account profile entries are rejected with a clear error message."""
 

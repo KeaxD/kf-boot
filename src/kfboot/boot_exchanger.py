@@ -863,7 +863,9 @@ class BootExchanger(Exchanger):
 
     def processEvent(self, serder, tsgs=None, cigars=None, ptds=None, essrs=None, **kwa):
         try:
-            # First enforce account quotas before processing the event
+            route = str(serder.ked.get("r", "") or "")
+            # First enforce quotas before processing the event.
+            self.limiter.enforceOnboardingRequestQuota(route=route, client_ip=self.client_ip)
             self.limiter.enforceAccountQuotas(serder)
             return super().processEvent(serder, tsgs=tsgs, cigars=cigars, ptds=ptds, essrs=essrs, **kwa)
         except falcon.HTTPError as exc:

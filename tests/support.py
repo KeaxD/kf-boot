@@ -192,6 +192,8 @@ def make_config(tmp_path, *, index: int = 0, **overrides: Any) -> Config:
         "bootstrap_watcher_required": True,
         "bootstrap_accounts_per_ip": 1,
         "bootstrap_aids_per_ip": 10,
+        "bootstrap_onboarding_requests_per_minute": 10,
+        "bootstrap_onboarding_block_seconds": 60,
         "session_ttl_seconds": 300,
         "witness_backends": witness_backends,
     }

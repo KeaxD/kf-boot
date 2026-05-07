@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import Any
-
+from types import SimpleNamespace
+import falcon
 import pytest
 import kfboot.boot_exchanger as boot_exchanger
 from keri.app import habbing
@@ -21,6 +22,7 @@ from kfboot.basing import (
     SESSION_STATE_WITNESS_POOL_ALLOCATED,
 )
 from kfboot.config import AccountProfile
+from kfboot.limiting import Limiter
 from .support import (
     FakeWatcherBoot,
     account_create_payload,
@@ -38,7 +40,10 @@ from .support import (
     total_witness_create_calls,
     total_witness_created_eids,
     total_witness_delete_calls,
+    make_config,
 )
+from kfboot.store import Store
+from kfboot.limiting import Limiter
 
 
 def test_onboarding_flow_persists_state_transitions_and_bound_resources(contract):
@@ -571,6 +576,8 @@ def test_session_start_enforces_account_request_rate_limit(contract_factory):
         start_session(contract, ephemeral)
         start_session(contract, ephemeral)
 
+        contract.ctx.exchanger.limiter = Limiter(contract.ctx)
+
         # The 3rd request exceeds the max_requests_per_minute limitand should be rejected
         response = post_cesr(
             contract,
@@ -677,6 +684,130 @@ def test_session_start_request_rate_limit_is_scoped_per_account(contract_factory
 
     assert accepted.status_code == 200
 
+
+def test_onboarding_request_quota_blocks_client_ip_for_configured_period(contract_factory, monkeypatch):
+    """Verify onboarding request throttles are enforced per client IP before account-specific quotas."""
+    clock = freeze_boot_time(monkeypatch, datetime(2026, 1, 1, tzinfo=UTC))
+    blocked_ip = "198.51.100.10"
+    other_ip = "198.51.100.11"
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=10,
+        bootstrap_aids_per_ip=10,
+        bootstrap_onboarding_requests_per_minute=2,
+        bootstrap_onboarding_block_seconds=30,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=100,
+                max_requests_per_minute=100,
+                kel_budget=100,
+            ),
+        ),
+    )
+
+    with habbing.openHab(name="onboarding-ip-quota", temp=True, transferable=False) as (_, ephemeral):
+        register_aid(contract, "/onboarding", ephemeral)
+
+        # Make 2 requests for onboarding
+        started = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+            remote_addr=blocked_ip,
+        )
+        _, start_reply = assert_reply_frame(contract, started, route="/onboarding/session/start")
+        session_id = start_reply.ked["a"]["session_id"]
+
+        accepted = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/status", payload={"session_id": session_id}),
+            remote_addr=blocked_ip,
+        )
+        assert accepted.status_code == 200
+
+        contract.ctx.exchanger.limiter = Limiter(contract.ctx)
+
+        # Third request gets rejected
+        rejected = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/status", payload={"session_id": session_id}),
+            remote_addr=blocked_ip,
+        )
+        assert rejected.status_code == 429
+        assert rejected.json["title"] == "Onboarding request rate limit exceeded"
+
+        # Try with another IP
+        scoped_to_ip = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/status", payload={"session_id": session_id}),
+            remote_addr=other_ip,
+        )
+
+        # Assert the other IP passes
+        assert scoped_to_ip.status_code == 200
+
+        # Move the clock
+        clock.value += timedelta(seconds=29)
+        still_blocked = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/status", payload={"session_id": session_id}),
+            remote_addr=blocked_ip,
+        )
+
+        # Still blocked because it's a 30 sec window
+        assert still_blocked.status_code == 429
+
+        # Move passed the window
+        clock.value += timedelta(seconds=2)
+        unblocked = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/status", payload={"session_id": session_id}),
+            remote_addr=blocked_ip,
+        )
+    # Assert it was unblocked
+    assert unblocked.status_code == 200
+
+def test_onboarding_request_quota_survives_store_reopen(tmp_path):
+    config = make_config(
+        tmp_path,
+        bootstrap_onboarding_requests_per_minute=2,
+        bootstrap_onboarding_block_seconds=30,
+    )
+    store_path = config.db_path
+
+    first_store = Store(store_path, session_ttl_seconds=config.session_ttl_seconds)
+    try:
+        limiter = Limiter(SimpleNamespace(config=config, store=first_store))
+        limiter.enforceOnboardingRequestQuota(
+            route="/onboarding/session/start",
+            client_ip="198.51.100.20",
+        )
+        limiter.enforceOnboardingRequestQuota(
+            route="/onboarding/session/status",
+            client_ip="198.51.100.20",
+        )
+    finally:
+        first_store.close()
+
+    reopened_store = Store(store_path, session_ttl_seconds=config.session_ttl_seconds)
+    try:
+        limiter = Limiter(SimpleNamespace(config=config, store=reopened_store))
+        with pytest.raises(falcon.HTTPTooManyRequests) as excinfo:
+            limiter.enforceOnboardingRequestQuota(
+                route="/onboarding/account/create",
+                client_ip="198.51.100.20",
+            )
+
+        assert excinfo.value.title == "Onboarding request rate limit exceeded"
+    finally:
+        reopened_store.close()
 
 def test_session_start_rejects_account_alias_over_limit(contract_factory):
     """Verify onboarding rejects a new session when the alias already has the max onboarded accounts."""

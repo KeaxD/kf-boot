@@ -14,6 +14,7 @@ from kfboot.basing import (
     AccountRecord,
     BindingRecord,
     ResourceRecord,
+    QuotaRecord,
     SessionRecord,
     open_baser,
 )
@@ -71,6 +72,15 @@ class Store:
 
     def close(self) -> None:
         self.baser.close()
+
+    def getQuota(self, scope: str, subject: str) -> QuotaRecord | None:
+        return self.baser.quotas.get(keys=(scope, subject))
+
+    def saveQuota(self, record: QuotaRecord) -> None:
+        self.baser.quotas.pin(keys=(record.scope, record.subject), val=record)
+
+    def deleteQuota(self, scope: str, subject: str) -> None:
+        self.baser.quotas.rem(keys=(scope, subject))
 
     def expireSessions(self, *, now: str | None = None) -> list[SessionRecord]:
         current = _parseDt(now or nowIso())

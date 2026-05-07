@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-
+import falcon
 import pytest
 import kfboot.boot_exchanger as boot_exchanger
 from keri.app import habbing
@@ -14,6 +14,8 @@ from kfboot.basing import (
 )
 from kfboot.boot_client import BootError
 from kfboot.config import AccountProfile
+from kfboot.store import Store
+from kfboot.limiting import Limiter
 
 from .support import (
     assert_reply_frame,
@@ -24,6 +26,7 @@ from .support import (
     register_aid,
     start_session,
     total_witness_delete_calls,
+    make_config,
 )
 
 
@@ -694,3 +697,57 @@ def test_expire_accounts_triggers_resource_teardown(contract_factory, monkeypatc
     assert expired.witness_eids == []
     assert expired.session_id == ""
 
+def test_account_request_quota_survives_store_reopen(tmp_path):
+    """Test account quotas throttle are persistent even after closing"""
+    # Create a config with 2 max requests per minute
+    config = make_config(
+        tmp_path,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=100,
+                max_requests_per_minute=2,
+                kel_budget=100,
+            ),
+        ),
+    )
+    store_path = config.db_path
+
+    # Create an element that runs session/start 
+    serder = SimpleNamespace(
+        pre="AID_DURABLE_ACCOUNT",
+        ked={
+            "r": "/onboarding/session/start",
+            "a": {
+                "account_aid": "AID_DURABLE_ACCOUNT",
+                "chosen_profile_code": "1-of-1",
+            },
+        },
+    )
+
+    first_store = Store(store_path, session_ttl_seconds=config.session_ttl_seconds)
+    try:
+        # Create limiter
+        limiter = Limiter(SimpleNamespace(config=config, store=first_store))
+
+        # Run /session/start 2 times
+        limiter.enforceAccountQuotas(serder)
+        limiter.enforceAccountQuotas(serder)
+    finally:
+        # Close the store
+        first_store.close()
+    
+    # Create the same store with the same path and config
+    reopened_store = Store(store_path, session_ttl_seconds=config.session_ttl_seconds)
+    try:
+        # Create Limiter with the same config and the reopened store
+        limiter = Limiter(SimpleNamespace(config=config, store=reopened_store))
+        with pytest.raises(falcon.HTTPTooManyRequests) as excinfo:
+            # Try to run /session/start again
+            limiter.enforceAccountQuotas(serder)
+        # Assert request was rejected and correct warning produced
+        assert excinfo.value.title == "Account request rate limit exceeded"
+    finally:
+        reopened_store.close()

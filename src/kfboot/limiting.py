@@ -1,19 +1,110 @@
-# limiting.py
-from datetime import datetime
-import falcon
-from keri import help
+from __future__ import annotations
+
+from datetime import datetime, timedelta
 from typing import Any
 
+import falcon
+from keri import help
+
+from kfboot.basing import QuotaRecord
+from kfboot.config import ACCOUNT_ROUTES, ONBOARDING_ROUTES
 from kfboot.utils import extractExnPayload, optionalStr
-from kfboot.config import ONBOARDING_ROUTES, ACCOUNT_ROUTES 
 from kfboot.store import nowIso
 
 logger = help.ogler.getLogger(__name__)
 
+ACCOUNT_REQUEST_SCOPE = "account_request"
+ONBOARDING_REQUEST_SCOPE = "onboarding_request_ip"
+
+
 class Limiter:
     def __init__(self, ctx):
         self.ctx = ctx
-        self._account_request_windows: dict[str, dict[str, Any]] = {}
+
+    def enforceOnboardingRequestQuota(self, *, route: str, client_ip: str) -> None:
+        """Throttle onboarding business requests by client IP."""
+
+        # Make sure that it is effectives only on the Onboarding routes
+        if route not in ONBOARDING_ROUTES:
+            return
+
+        # Get client IP
+        client_ip = (client_ip or "").strip()
+        if not client_ip:
+            return
+
+        # Get the requests limit from the config
+        limit = self.ctx.config.bootstrap_onboarding_requests_per_minute
+        if limit <= 0:
+            return
+
+        # Get the time a user gets blocked from the config
+        block_seconds = max(self.ctx.config.bootstrap_onboarding_block_seconds, 0)
+
+        # Get current time
+        now = datetime.fromisoformat(nowIso())
+
+        window = self._quotaRecord(ONBOARDING_REQUEST_SCOPE, client_ip, now=now)
+
+        # Check if block time exists
+        blocked_until = _parseOptionalDt(window.blocked_until)
+        if blocked_until is not None:
+
+            # Rejects requests if user is still blocked
+            if now < blocked_until:
+                retry_after = max(int((blocked_until - now).total_seconds()), 1)
+                logger.warning(
+                    f"Onboarding request rejected because client IP {client_ip} is blocked until {blocked_until.isoformat()}"
+                )
+                raise falcon.HTTPTooManyRequests(
+                    title="Onboarding request rate limit exceeded",
+                    description=(
+                        f"Client IP {client_ip} exceeded {limit} onboarding request(s) per minute. "
+                        f"Retry after {retry_after} second(s)."
+                    ),
+                    retry_after=retry_after,
+                )
+            # Reset window if he is passed his block time
+            window.window_start = now.isoformat()
+            window.count = 0
+            window.blocked_until = ""
+
+        # Calculate the elapsed time 
+        window_start = _parseDt(window.window_start, default=now)
+        elapsed = (now - window_start).total_seconds()
+
+        # If elapsed is superior to the 1 min time window
+        if elapsed >= 60:
+            window.window_start = now.isoformat()
+            window.count = 0
+
+        # If user exceeds the limit
+        if window.count >= limit:
+            # Calculate block time with block_seconds + current time
+            blocked_until = now + timedelta(seconds=block_seconds)
+            window.blocked_until = blocked_until.isoformat()
+
+            # Save the value in quota record
+            self.ctx.store.saveQuota(window)
+
+            # Calculate the time before retry
+            retry_after = max(block_seconds, 1)
+
+            logger.warning(
+                f"Onboarding request per-IP rate limit exceeded for client IP {client_ip}."
+                f" Limit is {limit} request(s) per minute; block period is {block_seconds} second(s)."
+            )
+            raise falcon.HTTPTooManyRequests(
+                title="Onboarding request rate limit exceeded",
+                description=(
+                    f"Client IP {client_ip} exceeded {limit} onboarding request(s) per minute. "
+                    f"Retry after {retry_after} second(s)."
+                ),
+                retry_after=retry_after,
+            )
+
+        window.count += 1
+        self.ctx.store.saveQuota(window)
 
     def enforceAccountQuotas(self, serder) -> None:
         """Apply account quota enforcement for onboarding and account-side requests."""
@@ -42,18 +133,18 @@ class Limiter:
         
         # Get the current time and the request window for this account
         now = datetime.fromisoformat(nowIso())
-        window = self._account_request_windows.setdefault(
-            account_aid,
-            {"start": now, "count": 0},
-        )
+        window = self._quotaRecord(ACCOUNT_REQUEST_SCOPE, account_aid, now=now)
+        
         # Reset the window if more than 60 seconds have elapsed since the start
-        elapsed = (now - window["start"]).total_seconds()
+        window_start = _parseDt(window.window_start, default=now)
+        elapsed = (now - window_start).total_seconds()
         if elapsed >= 60:
-            window["start"] = now
-            window["count"] = 0
+            window.window_start = now.isoformat()
+            window.count = 0
 
         # Check if the request count exceeds the profile limit for the window
-        if window["count"] >= profile.max_requests_per_minute > 0:
+        if window.count >= profile.max_requests_per_minute > 0:
+            self.ctx.store.saveQuota(window)
             logger.warning(
                 f"Account request per minute rate limit exceeded."
                 f" User is limited to {profile.max_requests_per_minute} requests per minute under tier '{profile.tier}'"
@@ -67,8 +158,9 @@ class Limiter:
             )
 
         # If not exceeded, increment the count and log if approaching soft limits
-        window["count"] += 1
-        ratio = window["count"] / max(profile.max_requests_per_minute, 1)
+        window.count += 1
+        self.ctx.store.saveQuota(window)
+        ratio = window.count / max(profile.max_requests_per_minute, 1)
         if ratio >= 0.95:
             logger.warning(f"Approaching request rate limit for account {account_aid}, current rate: 95%")
         elif ratio >= 0.85:
@@ -139,3 +231,30 @@ class Limiter:
             return account_aid, profile
 
         return "", None
+
+    def _quotaRecord(self, scope: str, subject: str, *, now: datetime) -> QuotaRecord:
+        """Get quota record from the store or create one if none"""
+        record = self.ctx.store.getQuota(scope, subject)
+        if record is not None:
+            return record
+        return QuotaRecord(
+            scope=scope,
+            subject=subject,
+            window_start=now.isoformat(),
+            count=0,
+            blocked_until="",
+        )
+
+
+def _parseOptionalDt(value: str) -> datetime | None:
+    """Parse the datetime value or return None"""
+    if not value:
+        return None
+    return datetime.fromisoformat(value)
+
+
+def _parseDt(value: str, *, default: datetime) -> datetime:
+    """Parse the datetime value but returns a default if None"""
+    if not value:
+        return default
+    return datetime.fromisoformat(value)

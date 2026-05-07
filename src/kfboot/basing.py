@@ -107,6 +107,15 @@ class AccountRecord:
     kel_used: int = 0
 
 
+@dataclass
+class QuotaRecord:
+    scope: str = ""
+    subject: str = ""
+    window_start: str = ""
+    count: int = 0
+    blocked_until: str = ""
+
+
 class PlatformBaser(dbing.LMDBer):
     """LMDB database for the KF boot service."""
 
@@ -119,6 +128,7 @@ class PlatformBaser(dbing.LMDBer):
         self.bindings = None
         self.sessions = None
         self.accounts = None
+        self.quotas = None
 
         super().__init__(
             name=name,
@@ -149,6 +159,11 @@ class PlatformBaser(dbing.LMDBer):
             db=self,
             subkey="acct.",
             klas=AccountRecord,
+        )
+        self.quotas = koming.Komer(
+            db=self,
+            subkey="quot.",
+            klas=QuotaRecord,
         )
 
         return self.env

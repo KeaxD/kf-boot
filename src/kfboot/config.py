@@ -230,8 +230,15 @@ class Config:
     session_ttl_seconds: int
     account_profiles: tuple[AccountProfile, ...] = ()
     witness_backends: tuple[WitnessBackend, ...] = ()
+    bootstrap_onboarding_requests_per_minute: int = 10
+    bootstrap_onboarding_block_seconds: int = 60
 
     def __post_init__(self) -> None:
+        if self.bootstrap_onboarding_requests_per_minute < 0:
+            raise ValueError("bootstrap_onboarding_requests_per_minute must be greater than or equal to 0.")
+        if self.bootstrap_onboarding_block_seconds < 0:
+            raise ValueError("bootstrap_onboarding_block_seconds must be greater than or equal to 0.")
+
         backends = tuple(self.witness_backends)
         if not backends:
             if not self.wit_boot_url or not self.wit_public_url:
@@ -314,6 +321,7 @@ class Config:
             f"Bootstrap account options: {', '.join(supported_options)}\n"
             f"Account Profiles: {', '.join(f'{profile.code} (tier={profile.tier})' for profile in account_profiles)}\n"
             f"Bootstrap Account per IP: {self.bootstrap_accounts_per_ip}\n"
+            f"Bootstrap onboarding requests per minute: {self.bootstrap_onboarding_requests_per_minute}\n"
         )
 
     def account_option(self, code: str) -> dict[str, int | str] | None:
@@ -395,4 +403,10 @@ class Config:
             session_ttl_seconds=int(_env("SESSION_TTL_SECONDS", "300")),
             account_profiles=account_profiles,
             witness_backends=witness_backends,
+            bootstrap_onboarding_requests_per_minute=int(
+                _env("BOOTSTRAP_ONBOARDING_REQUESTS_PER_MINUTE", "10")
+            ),
+            bootstrap_onboarding_block_seconds=int(
+                _env("BOOTSTRAP_ONBOARDING_BLOCK_SECONDS", "60")
+            ),
         )

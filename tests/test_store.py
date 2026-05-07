@@ -7,6 +7,7 @@ import pytest
 from kfboot.basing import (
     ACCOUNT_STATE_FAILED,
     ACCOUNT_STATE_ONBOARDED,
+    QuotaRecord,
     SESSION_STATE_COMPLETED,
     SESSION_STATE_EXPIRED,
     SessionRecord,
@@ -148,6 +149,31 @@ def test_expire_sessions_marks_only_non_terminal_records(store):
     assert store.getSession(open_session.session_id).state == SESSION_STATE_EXPIRED
     assert store.getSession(terminal.session_id).state == SESSION_STATE_COMPLETED
     assert [record.session_id for record in expired] == [open_session.session_id]
+
+
+def test_quota_records_are_saved_in_lmdb(tmp_path):
+    """Test that the quotas records are saved and persistent"""
+    path = str(tmp_path / "quota-store" / "kf-boot")
+    first = Store(path, session_ttl_seconds=60)
+    first.saveQuota(
+        QuotaRecord(
+            scope="account_request",
+            subject="AID1",
+            window_start="2026-01-01T00:00:00+00:00",
+            count=2,
+            blocked_until="",
+        )
+    )
+    first.close()
+
+    second = Store(path, session_ttl_seconds=60)
+    try:
+        record = second.getQuota("account_request", "AID1")
+        assert record is not None
+        assert record.window_start == "2026-01-01T00:00:00+00:00"
+        assert record.count == 2
+    finally:
+        second.close()
 
 
 def test_refreshSessionLease_extends_expiry_and_tracks_active_ip_sessions(store):
