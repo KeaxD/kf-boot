@@ -549,8 +549,8 @@ def test_session_start_enforces_per_ip_onboarding_principal_limit(contract_facto
     assert response.json["title"] == "Per-IP onboarding principal limit exceeded"
 
 
-def test_session_start_enforces_account_request_rate_limit(contract_factory):
-    """Verify that onboarding session-start requests are throttled per account tier."""
+def test_session_start_does_not_consume_onboarded_account_quota(contract_factory):
+    """Test using someone else's AID does not burn their quotas."""
     contract = contract_factory(
         bootstrap_accounts_per_ip=10,
         bootstrap_aids_per_ip=10,
@@ -559,36 +559,54 @@ def test_session_start_enforces_account_request_rate_limit(contract_factory):
             AccountProfile(
                 tier="trial",
                 code="1-of-1",
-                max_accounts=1,
-                max_requests_per_minute=2,
-                kel_budget=100
+                max_accounts=100,
+                max_requests_per_minute=1,
+                kel_budget=100,
             ),
         ),
     )
 
-    with habbing.openHab(name="rate-limit-ephemeral", temp=True, transferable=False) as (_, ephemeral):
-        register_aid(contract, "/onboarding", ephemeral)
+    with (
+        habbing.openHab(name="quota-victim-ephemeral", temp=True, transferable=False) as (_, victim_ephemeral),
+        habbing.openHab(name="quota-victim-account", temp=True) as (_, victim_account),
+        habbing.openHab(name="quota-attacker-ephemeral", temp=True, transferable=False) as (_, attacker),
+    ):
+        register_aid(contract, "/onboarding", victim_ephemeral)
+        register_aid(contract, "/onboarding", attacker)
+        register_aid(contract, "/account", victim_account)
 
-        # Make the maximum allowed number of requests by starting 2 sessions
-        start_session(contract, ephemeral)
-        start_session(contract, ephemeral)
-
-        contract.ctx.exchanger.limiter = Limiter(contract.ctx)
-
-        # The 3rd request exceeds the max_requests_per_minute limitand should be rejected
-        response = post_cesr(
+        _, _, start_reply = start_session(contract, victim_ephemeral, account_aid=victim_account.pre)
+        create_account(contract, victim_ephemeral, start_reply, account_aid=victim_account.pre)
+        complete_session(
             contract,
-            "/onboarding",
-            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+            victim_ephemeral,
+            session_id=start_reply.ked["a"]["session_id"],
+            account_aid=victim_account.pre,
         )
 
-    assert response.status_code == 429
-    assert response.json["title"] == "Account request rate limit exceeded"
+        rejected = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(
+                attacker,
+                route="/onboarding/session/start",
+                payload=start_payload(account_aid=victim_account.pre),
+            ),
+        )
+        assert rejected.status_code == 409
+        assert rejected.json["title"] == "Account already onboarded"
+
+        allowed = post_cesr(
+            contract,
+            "/account",
+            build_exn(victim_account, route="/account/witnesses", payload={"account_aid": victim_account.pre}),
+        )
+
+    assert allowed.status_code == 200
 
 
-def test_session_start_request_rate_limit_resets_after_minute(contract_factory, monkeypatch):
-    """Tests per-account request throttles clear when the minute window rolls over."""
-    # Instantiate boot time
+def test_account_route_request_rate_limit_resets_after_minute(contract_factory, monkeypatch):
+    """Test validated account-route throttles clear when the minute window rolls over."""
     clock = freeze_boot_time(monkeypatch, datetime(2026, 1, 1, tzinfo=UTC))
     contract = contract_factory(
         bootstrap_accounts_per_ip=10,
@@ -600,39 +618,60 @@ def test_session_start_request_rate_limit_resets_after_minute(contract_factory, 
                 code="1-of-1",
                 max_accounts=100,
                 max_requests_per_minute=2,
-                kel_budget=100
+                kel_budget=100,
             ),
         ),
     )
 
-    with habbing.openHab(name="rate-rollover-ephemeral", temp=True, transferable=False) as (_, ephemeral):
+    with (
+        habbing.openHab(name="account-rate-rollover-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name="account-rate-rollover-account", temp=True) as (_, account),
+    ):
         register_aid(contract, "/onboarding", ephemeral)
+        register_aid(contract, "/account", account)
+        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
+        create_account(contract, ephemeral, start_reply, account_aid=account.pre)
+        complete_session(
+            contract,
+            ephemeral,
+            session_id=start_reply.ked["a"]["session_id"],
+            account_aid=account.pre,
+        )
 
-        # Send 2 requests to reach the max_requests_per_minute limit
-        start_session(contract, ephemeral)
-        start_session(contract, ephemeral)
+        first = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+        assert first.status_code == 200
+
+        second = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+        assert second.status_code == 200
 
         rejected = post_cesr(
             contract,
-            "/onboarding",
-            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
         )
         assert rejected.status_code == 429
         assert rejected.json["title"] == "Account request rate limit exceeded"
 
-        # Advance clock by 61 seconds to reset the limit window 
         clock.value += timedelta(seconds=61)
         accepted = post_cesr(
             contract,
-            "/onboarding",
-            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
         )
-    # Assert the request is accepted 
+
     assert accepted.status_code == 200
 
 
-def test_session_start_request_rate_limit_is_scoped_per_account(contract_factory):
-    """Verify one account exhausting request rate does not throttle another account."""
+def test_account_route_request_rate_limit_is_scoped_per_account(contract_factory):
+    """One account exhausting its validated route quota must not throttle another account."""
     contract = contract_factory(
         bootstrap_accounts_per_ip=10,
         bootstrap_aids_per_ip=10,
@@ -643,40 +682,76 @@ def test_session_start_request_rate_limit_is_scoped_per_account(contract_factory
                 code="1-of-1",
                 max_accounts=100,
                 max_requests_per_minute=2,
-                kel_budget=100
+                kel_budget=100,
             ),
         ),
     )
 
     with (
-        habbing.openHab(name="rate-isolated-account-a", temp=True, transferable=False) as (_, first),
-        habbing.openHab(name="rate-isolated-account-b", temp=True, transferable=False) as (_, second),
+        habbing.openHab(name="account-rate-a-ephemeral", temp=True, transferable=False) as (_, first_ephemeral),
+        habbing.openHab(name="account-rate-a-account", temp=True) as (_, first_account),
+        habbing.openHab(name="account-rate-b-ephemeral", temp=True, transferable=False) as (_, second_ephemeral),
+        habbing.openHab(name="account-rate-b-account", temp=True) as (_, second_account),
     ):
-        register_aid(contract, "/onboarding", first)
-        register_aid(contract, "/onboarding", second)
+        register_aid(contract, "/onboarding", first_ephemeral)
+        register_aid(contract, "/account", first_account)
+        register_aid(contract, "/onboarding", second_ephemeral)
+        register_aid(contract, "/account", second_account)
 
-        start_session(contract, first, account_aid="AID_RATE_A", account_alias="alpha-a")
-        start_session(contract, first, account_aid="AID_RATE_A", account_alias="alpha-a")
+        _, _, first_start = start_session(
+            contract,
+            first_ephemeral,
+            account_aid=first_account.pre,
+            account_alias="alpha-a",
+        )
+        create_account(contract, first_ephemeral, first_start, account_aid=first_account.pre)
+        complete_session(
+            contract,
+            first_ephemeral,
+            session_id=first_start.ked["a"]["session_id"],
+            account_aid=first_account.pre,
+        )
+
+        _, _, second_start = start_session(
+            contract,
+            second_ephemeral,
+            account_aid=second_account.pre,
+            account_alias="alpha-b",
+        )
+        create_account(contract, second_ephemeral, second_start, account_aid=second_account.pre)
+        complete_session(
+            contract,
+            second_ephemeral,
+            session_id=second_start.ked["a"]["session_id"],
+            account_aid=second_account.pre,
+        )
+
+        first = post_cesr(
+            contract,
+            "/account",
+            build_exn(first_account, route="/account/witnesses", payload={"account_aid": first_account.pre}),
+        )
+        assert first.status_code == 200
+
+        second = post_cesr(
+            contract,
+            "/account",
+            build_exn(first_account, route="/account/witnesses", payload={"account_aid": first_account.pre}),
+        )
+        assert second.status_code == 200
+
         rejected = post_cesr(
             contract,
-            "/onboarding",
-            build_exn(
-                first,
-                route="/onboarding/session/start",
-                payload=start_payload(account_aid="AID_RATE_A", account_alias="alpha-a"),
-            ),
+            "/account",
+            build_exn(first_account, route="/account/witnesses", payload={"account_aid": first_account.pre}),
         )
         assert rejected.status_code == 429
         assert rejected.json["title"] == "Account request rate limit exceeded"
 
         accepted = post_cesr(
             contract,
-            "/onboarding",
-            build_exn(
-                second,
-                route="/onboarding/session/start",
-                payload=start_payload(account_aid="AID_RATE_B", account_alias="alpha-b"),
-            ),
+            "/account",
+            build_exn(second_account, route="/account/witnesses", payload={"account_aid": second_account.pre}),
         )
 
     assert accepted.status_code == 200

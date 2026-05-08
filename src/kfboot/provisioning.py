@@ -364,13 +364,6 @@ class Provisioner:
                     f"Teardown of witness resource failed for witness {witness_id}: {exc}"
                 )
 
-        # Clear account bindings
-        if account is not None:
-            account.watcher_eid = ""
-            account.witness_eids = []
-            account.session_id = ""
-            self.ctx.store.saveAccount(account)
-
         if errors:
             first = errors[0]
             detail = "; ".join(str(error) for error in errors)
@@ -378,6 +371,13 @@ class Provisioner:
                 f"Account resources teardown completed with errors ({len(errors)}) for account AID {account_aid}: {detail}"
             )
             raise BootError(detail, status_code=first.status_code)
+
+        # Clear account bindings
+        if account is not None:
+            account.watcher_eid = ""
+            account.witness_eids = []
+            account.session_id = ""
+            self.ctx.store.saveAccount(account)
 
         logger.info(f"Resources teardown completed for account AID {account_aid}")
 

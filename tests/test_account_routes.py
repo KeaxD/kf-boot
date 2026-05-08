@@ -580,7 +580,7 @@ def test_account_routes_enforce_persisted_witness_profile_code(contract_factory)
                 tier="org",
                 code="3-of-4",
                 max_accounts=100,
-                max_requests_per_minute=4,
+                max_requests_per_minute=1,
                 kel_budget=100
             ),
         ),
@@ -665,6 +665,32 @@ def test_account_route_expires_past_due_account_on_ingress(onboarded_bundle):
     updated = contract.ctx.store.getAccount(account.pre)
     assert updated is not None
     assert updated.status == ACCOUNT_STATE_EXPIRED
+    assert response.status_code == 409
+    assert response.json["title"] == "Account expired"
+
+
+def test_account_route_rejects_past_due_account_when_expiry_teardown_fails(onboarded_bundle, monkeypatch):
+    """Test past-due accounts stay blocked even when resources teardown has failed"""
+    contract = onboarded_bundle["contract"]
+    account = onboarded_bundle["account"]
+    record = contract.ctx.store.getAccount(account.pre)
+    record.expires_at = "2000-01-01T00:00:00+00:00"
+    contract.ctx.store.saveAccount(record)
+
+    def fake_teardown(*, account_aid: str, account=None) -> None:
+        raise BootError("simulated teardown failure", status_code=502)
+
+    monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownAccountResources", fake_teardown)
+
+    response = post_cesr(
+        contract,
+        "/account",
+        build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+    )
+
+    updated = contract.ctx.store.getAccount(account.pre)
+    assert updated is not None
+    assert updated.status == ACCOUNT_STATE_ONBOARDED
     assert response.status_code == 409
     assert response.json["title"] == "Account expired"
 
@@ -767,39 +793,49 @@ def test_account_request_quota_survives_store_reopen(tmp_path):
     )
     store_path = config.db_path
 
-    # Create an element that runs session/start 
+    # Create an authenticated account-route request.
     serder = SimpleNamespace(
         pre="AID_DURABLE_ACCOUNT",
         ked={
-            "r": "/onboarding/session/start",
+            "r": "/account/witnesses",
             "a": {
                 "account_aid": "AID_DURABLE_ACCOUNT",
-                "chosen_profile_code": "1-of-1",
             },
         },
     )
 
     first_store = Store(store_path, session_ttl_seconds=config.session_ttl_seconds)
     try:
-        # Create limiter
+        account = first_store.buildAccount(
+            account_aid="AID_DURABLE_ACCOUNT",
+            account_alias="durable",
+            witness_profile_code="1-of-1",
+            witness_count=1,
+            toad=1,
+            watcher_required=True,
+            region_id="test-region",
+            region_name="Test Region",
+            session_id="SESSION123",
+            witness_eids=[],
+            watcher_eid="",
+            tier="trial",
+            onboarded=True,
+        )
+        first_store.saveAccount(account)
+
         limiter = Limiter(SimpleNamespace(config=config, store=first_store))
 
-        # Run /session/start 2 times
+        # Run the account route 2 times.
         limiter.enforceAccountQuotas(serder)
         limiter.enforceAccountQuotas(serder)
     finally:
-        # Close the store
         first_store.close()
     
-    # Create the same store with the same path and config
     reopened_store = Store(store_path, session_ttl_seconds=config.session_ttl_seconds)
     try:
-        # Create Limiter with the same config and the reopened store
         limiter = Limiter(SimpleNamespace(config=config, store=reopened_store))
         with pytest.raises(falcon.HTTPTooManyRequests) as excinfo:
-            # Try to run /session/start again
             limiter.enforceAccountQuotas(serder)
-        # Assert request was rejected and correct warning produced
         assert excinfo.value.title == "Account request rate limit exceeded"
     finally:
         reopened_store.close()

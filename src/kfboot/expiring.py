@@ -68,18 +68,18 @@ class Expirer:
                 )
                 continue
             if expires_at <= now:
-                account.status = ACCOUNT_STATE_EXPIRED
-                self.ctx.store.saveAccount(account)
-                logger.info(
-                    f"Account expired at {account.expires_at} for account AID {account.account_aid}",
-                )
-                # Begin account resources teardown for exprired account
                 try:
                     self.provisioner.teardownAccountResources(account_aid=account.account_aid, account=account)
                 except BootError as exc:
                     logger.warning(
                         f"Resource teardown failed for expired account {account.account_aid}: {exc}"
                     )
+                    continue
+                account.status = ACCOUNT_STATE_EXPIRED
+                self.ctx.store.saveAccount(account)
+                logger.info(
+                    f"Account expired at {account.expires_at} for account AID {account.account_aid}",
+                )
 
     def failSession(
         self,

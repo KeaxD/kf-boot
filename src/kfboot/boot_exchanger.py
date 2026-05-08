@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any
 
@@ -451,6 +452,13 @@ class CancelHandler(RouteHandler):
 class AccountWitnessesHandler(RouteHandler):
     resource = "/account/witnesses"
 
+    def verifyEvent(self, serder, **kwa) -> bool:
+        sender = serder.pre
+        payload = extractExnPayload(serder)
+        self.exchanger.requireOnboardedAccount(sender, payload)
+        self.exchanger.limiter.enforceAccountQuotas(serder)
+        return True
+
     def handleEvent(self, serder, **kwa):
         sender = serder.pre
         self.exchanger.requireOnboardedAccount(sender, extractExnPayload(serder))
@@ -466,6 +474,13 @@ class AccountWitnessesHandler(RouteHandler):
 class AccountWatchersHandler(RouteHandler):
     resource = "/account/watchers"
 
+    def verifyEvent(self, serder, **kwa) -> bool:
+        sender = serder.pre
+        payload = extractExnPayload(serder)
+        self.exchanger.requireOnboardedAccount(sender, payload)
+        self.exchanger.limiter.enforceAccountQuotas(serder)
+        return True
+
     def handleEvent(self, serder, **kwa):
         sender = serder.pre
         self.exchanger.requireOnboardedAccount(sender, extractExnPayload(serder))
@@ -480,6 +495,13 @@ class AccountWatchersHandler(RouteHandler):
 
 class AccountWatcherStatusHandler(RouteHandler):
     resource = "/account/watchers/status"
+
+    def verifyEvent(self, serder, **kwa) -> bool:
+        sender = serder.pre
+        payload = extractExnPayload(serder)
+        self.exchanger.requireOnboardedAccount(sender, payload)
+        self.exchanger.limiter.enforceAccountQuotas(serder)
+        return True
 
     def handleEvent(self, serder, **kwa):
         sender = serder.pre
@@ -526,6 +548,12 @@ class AccountWatcherStatusHandler(RouteHandler):
 class AccountWitnessDeleteHandler(RouteHandler):
     resource = "/account/witnesses/delete"
 
+    def verifyEvent(self, serder, **kwa) -> bool:
+        sender = serder.pre
+        payload = extractExnPayload(serder)
+        self.exchanger.requireOnboardedAccount(sender, payload)
+        return True
+
     def handleEvent(self, serder, **kwa):
         sender = serder.pre
         payload = extractExnPayload(serder)
@@ -562,6 +590,12 @@ class AccountWitnessDeleteHandler(RouteHandler):
 
 class AccountWatcherDeleteHandler(RouteHandler):
     resource = "/account/watchers/delete"
+
+    def verifyEvent(self, serder, **kwa) -> bool:
+        sender = serder.pre
+        payload = extractExnPayload(serder)
+        self.exchanger.requireOnboardedAccount(sender, payload)
+        return True
 
     def handleEvent(self, serder, **kwa):
         sender = serder.pre
@@ -600,36 +634,19 @@ class AccountWatcherDeleteHandler(RouteHandler):
 class AccountDeleteHandler(RouteHandler):
     resource = "/account/delete"
 
+    def verifyEvent(self, serder, **kwa) -> bool:
+        sender = serder.pre
+        payload = extractExnPayload(serder)
+        self.exchanger.requireDeletableAccount(sender, payload)
+        return True
+
     def handleEvent(self, serder, **kwa):
         sender = serder.pre
         payload = extractExnPayload(serder)
-        account_aid = optionalStr(payload, "account_aid") or sender
+        account_aid, account = self.exchanger.requireDeletableAccount(sender, payload)
         logger.info(
             f"Account delete requested for account AID {account_aid}"
         )
-        if account_aid != sender:
-            logger.warning(
-                f"Account delete request rejected, authenticated sender {sender} does not match requested account AID {account_aid}"
-            )
-            raise falcon.HTTPUnauthorized(
-                title="Account principal mismatch",
-                description="The authenticated sender must match account_aid.",
-            )
-
-        account = self.exchanger.ctx.store.getAccount(sender)
-        
-        # Check account state
-        if account is not None and account.status not in {
-            ACCOUNT_STATE_ONBOARDED,
-            ACCOUNT_STATE_EXPIRED,
-        }:
-            logger.warning(
-                f"Account delete request rejected due to account {account_aid} being in invalid state: {account.status}"
-            )
-            raise falcon.HTTPConflict(
-                title="Account not onboarded",
-                description="Approved-account routes require an onboarded account principal.",
-            )
 
         try:
             self.exchanger.provisioner.deleteAccount(account_aid=sender, account=account)
@@ -799,6 +816,14 @@ class BootExchanger(Exchanger):
                 title="Account expired",
                 description="This account has expired and must be renewed or deleted before accessing account routes.",
             )
+        if self.accountPastDue(account):
+            logger.warning(
+                f"Account {account.account_aid} is past due and cannot access account routes"
+            )
+            raise falcon.HTTPConflict(
+                title="Account expired",
+                description="This account has expired and must be renewed or deleted before accessing account routes.",
+            )
         if account.status != ACCOUNT_STATE_ONBOARDED:
             logger.warning(f"Account {account.account_aid} is not onboarded and cannot access approved account routes")
             raise falcon.HTTPConflict(
@@ -806,6 +831,49 @@ class BootExchanger(Exchanger):
                 description="Approved-account routes require an onboarded account principal.",
             )
         return account
+
+    def requireDeletableAccount(self, sender: str, payload: dict[str, Any]) -> tuple[str, AccountRecord | None]:
+        """Checks the identity of the sender and if the account is in a valid state for deletion"""
+        account_aid = optionalStr(payload, "account_aid") 
+        if account_aid and account_aid != sender:
+            logger.warning(
+                f"Account delete request rejected, authenticated sender {sender} does not match requested account AID {account_aid}"
+            )
+            raise falcon.HTTPUnauthorized(
+                title="Account principal mismatch",
+                description="The authenticated sender must match account_aid.",
+            )
+
+        account = self.ctx.store.getAccount(sender)
+        if account is not None and account.status not in {
+            ACCOUNT_STATE_ONBOARDED,
+            ACCOUNT_STATE_EXPIRED,
+        }:
+            logger.warning(
+                f"Account delete request rejected due to account {account_aid} being in invalid state: {account.status}"
+            )
+            raise falcon.HTTPConflict(
+                title="Account not onboarded",
+                description="Approved-account routes require an onboarded account principal.",
+            )
+
+        return account_aid, account
+
+    def accountPastDue(self, account: AccountRecord) -> bool:
+        """Checks expiration of an account"""
+        # Return if expire date is not set
+        if not account.expires_at:
+            return False
+
+        try:
+            expires_at = datetime.fromisoformat(account.expires_at)
+        except ValueError:
+            logger.warning(
+                f"Account {account.account_aid} has invalid expires_at format: {account.expires_at}",
+            )
+            return False
+
+        return expires_at <= datetime.fromisoformat(nowIso())
 
 
     def replySession(self, route: str, *, recipient: str, session: SessionRecord) -> None:
@@ -856,9 +924,8 @@ class BootExchanger(Exchanger):
     def processEvent(self, serder, tsgs=None, cigars=None, ptds=None, essrs=None, **kwa):
         try:
             route = str(serder.ked.get("r", "") or "")
-            # First enforce quotas before processing the event.
+            # Enforce per-IP onboarding throttles before route-specific verification.
             self.limiter.enforceOnboardingRequestQuota(route=route, client_ip=self.client_ip)
-            self.limiter.enforceAccountQuotas(serder)
             return super().processEvent(serder, tsgs=tsgs, cigars=cigars, ptds=ptds, essrs=essrs, **kwa)
         except falcon.HTTPError as exc:
             self.last_error = exc
