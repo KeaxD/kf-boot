@@ -967,6 +967,51 @@ def test_expire_accounts_triggers_resource_teardown(contract_factory, monkeypatc
     assert expired.witness_eids == []
     assert expired.session_id == ""
 
+
+def test_delete_expired_accounts_removes_account(onboarded_bundle):
+    """Test deleteExpiredAccount function is correctly deleting the record of the account"""
+    contract = onboarded_bundle["contract"]
+    account = onboarded_bundle["account"]
+    session_id = onboarded_bundle["session_id"]
+    witness_ids = onboarded_bundle["witness_ids"]
+    watcher_id = onboarded_bundle["watcher_id"]
+
+    # Get the record and set it as expired
+    record = contract.ctx.store.getAccount(account.pre)
+    record.status = ACCOUNT_STATE_EXPIRED
+
+    # Save the changes
+    contract.ctx.store.saveAccount(record)
+
+    # Put it a fake cid to assert correct deletion behavior
+    contract.ctx.store.addBinding(account.pre, "cid-to-delete")
+
+    # Run the function
+    deleted = contract.ctx.exchanger.expirer.deleteExpiredAccounts()
+
+    # Assert correct deletion behavior
+    assert deleted == [account.pre]
+    assert contract.ctx.store.baser.bindings.get(keys=(account.pre, "cid-to-delete")) is None
+    assert contract.ctx.store.getAccount(account.pre) is None
+    assert contract.ctx.store.getSession(session_id) is None
+    assert contract.ctx.store.getResource("watcher", watcher_id) is None
+    for witness_id in witness_ids:
+        assert contract.ctx.store.getResource("witness", witness_id) is None
+    assert total_witness_delete_calls(contract.ctx) == witness_ids
+    assert contract.ctx.watcher_boot.delete_calls == [watcher_id]
+
+
+def test_delete_expired_accounts_ignores_non_expired_accounts(onboarded_bundle):
+    """Test that the delete expired account function does not affect non-expired accounts"""
+    contract = onboarded_bundle["contract"]
+    account = onboarded_bundle["account"]
+
+    deleted = contract.ctx.exchanger.expirer.deleteExpiredAccounts()
+
+    assert deleted == []
+    assert contract.ctx.store.getAccount(account.pre) is not None
+
+
 def test_account_request_quota_survives_store_reopen(tmp_path):
     """Test account quotas throttle are persistent even after closing"""
     # Create a config with 2 max requests per minute

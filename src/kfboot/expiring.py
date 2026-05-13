@@ -81,6 +81,32 @@ class Expirer:
                     f"Account expired at {account.expires_at} for account AID {account.account_aid}",
                 )
 
+    def deleteExpiredAccounts(self) -> list[str]:
+        """Delete local state for accounts already marked expired."""
+        deleted: list[str] = []
+
+        for account in self.ctx.store.listAccounts():
+            if account.status != ACCOUNT_STATE_EXPIRED or not account.expires_at:
+                continue
+
+            try:
+                self.provisioner.deleteAccount(
+                    account_aid=account.account_aid,
+                    account=account,
+                )
+            except BootError as exc:
+                logger.warning(
+                    f"Expired account deletion failed for account {account.account_aid}: {exc}"
+                )
+                continue
+
+            deleted.append(account.account_aid)
+            logger.info(
+                f"Expired account deleted for account AID {account.account_aid}"
+            )
+
+        return deleted
+
     def failSession(
         self,
         *,

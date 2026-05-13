@@ -63,6 +63,7 @@ class CesrSurfaceEnd:
         self.ctx.exchanger.expirer.expireSessions()
         self.ctx.exchanger.expirer.expireAccounts()
         self.ctx.exchanger.clearReplies()
+        self.ctx.exchanger.expirer.deleteExpiredAccounts()
 
         try:
             self.ctx.parser.parseOne(ims=msg, exc=self.ctx.exchanger, local=False)
