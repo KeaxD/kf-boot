@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -15,6 +16,8 @@ logger = help.ogler.getLogger(__name__)
 
 ACCOUNT_REQUEST_SCOPE = "account_request"
 ONBOARDING_REQUEST_SCOPE = "onboarding_request_ip"
+ACCOUNT_DELETE_REQUEST_SCOPE = "account_delete_request"
+ACCOUNT_DELETE_IP_REQUEST_SCOPE = "account_delete_request_ip"
 
 
 class Limiter:
@@ -34,65 +37,26 @@ class Limiter:
             return
 
         # Get the requests limit from the config
-        limit = self.ctx.config.bootstrap_onboarding_requests_per_minute
+        limit = self.ctx.config.bootstrap_api_requests_per_minute
         if limit <= 0:
             return
-
-        # Get the time a user gets blocked from the config
-        block_seconds = max(self.ctx.config.bootstrap_onboarding_block_seconds, 0)
 
         # Get current time
         now = datetime.fromisoformat(nowIso())
 
         window = self._quotaRecord(ONBOARDING_REQUEST_SCOPE, client_ip, now=now)
 
-        # Check if block time exists
-        blocked_until = _parseOptionalDt(window.blocked_until)
-        if blocked_until is not None:
-
-            # Rejects requests if user is still blocked
-            if now < blocked_until:
-                retry_after = max(int((blocked_until - now).total_seconds()), 1)
-                logger.warning(
-                    f"Onboarding request rejected because client IP {client_ip} is blocked until {blocked_until.isoformat()}"
-                )
-                raise falcon.HTTPTooManyRequests(
-                    title="Onboarding request rate limit exceeded",
-                    description=(
-                        f"Client IP {client_ip} exceeded {limit} onboarding request(s) per minute. "
-                        f"Retry after {retry_after} second(s)."
-                    ),
-                    retry_after=retry_after,
-                )
-            # Reset window if he is passed his block time
-            window.window_start = now.isoformat()
-            window.count = 0
-            window.blocked_until = ""
-
-        # Calculate the elapsed time 
-        window_start = _parseDt(window.window_start, default=now)
-        elapsed = (now - window_start).total_seconds()
-
-        # If elapsed is superior to the 1 min time window
-        if elapsed >= 60:
-            window.window_start = now.isoformat()
-            window.count = 0
+        # Check for window reset 
+        self._resetWindowIfElapsed(window, now=now)
 
         # If user exceeds the limit
         if window.count >= limit:
-            # Calculate block time with block_seconds + current time
-            blocked_until = now + timedelta(seconds=block_seconds)
-            window.blocked_until = blocked_until.isoformat()
-
-            # Save the value in quota record
             self.ctx.store.saveQuota(window)
-
-            # Calculate the time before retry
-            retry_after = max(block_seconds, 1)
+            retry_after = self._windowRetryAfterSeconds(window, now=now)
 
             logger.warning(
                 f"Onboarding request per-IP rate limit exceeded for client IP {client_ip}."
-                f" Limit is {limit} request(s) per minute; block period is {block_seconds} second(s)."
+                f" Limit is {limit} request(s) per minute."
             )
             raise falcon.HTTPTooManyRequests(
                 title="Onboarding request rate limit exceeded",
@@ -126,7 +90,68 @@ class Limiter:
 
         # Enforce request rate and KEL budget for the account
         self._enforceAccountRequestRate(account_aid, profile)
-        self._enforceAccountKelBudget(account_aid, profile)
+        self._enforceAccountApiBudget(account_aid, profile)
+
+    def enforceAccountDeleteQuota(self, *, sender: str, client_ip: str) -> None:
+        """Throttle account deletion with the shared bootstrap API limit, but on delete-specific buckets."""
+
+        # Get the limit from the config
+        limit = self.ctx.config.bootstrap_api_requests_per_minute
+        if limit <= 0:
+            return
+
+        # Get windows IP based and account based window
+        now = datetime.fromisoformat(nowIso())
+        windows: list[tuple[QuotaRecord, str, str]] = []
+
+        normalized_sender = (sender or "").strip()
+        if normalized_sender:
+            windows.append(
+                (
+                    self._quotaRecord(ACCOUNT_DELETE_REQUEST_SCOPE, normalized_sender, now=now),
+                    "sender AID",
+                    normalized_sender,
+                )
+            )
+
+        normalized_ip = (client_ip or "").strip()
+        if normalized_ip:
+            windows.append(
+                (
+                    self._quotaRecord(ACCOUNT_DELETE_IP_REQUEST_SCOPE, normalized_ip, now=now),
+                    "client IP",
+                    normalized_ip,
+                )
+            )
+
+        # Return if no windows 
+        if not windows:
+            return
+
+        # Use helper function to reset window if time window elapses
+        for window, _, _ in windows:
+            self._resetWindowIfElapsed(window, now=now)
+
+        for window, subject_kind, subject in windows:
+            # Check for limit
+            if window.count >= limit:   
+                self.ctx.store.saveQuota(window)
+                logger.warning(
+                    f"Account delete rate limit exceeded for {subject_kind} {subject}."
+                    f" Limit is {limit} delete request(s) per minute."
+                )
+                raise falcon.HTTPTooManyRequests(
+                    title="Account delete rate limit exceeded",
+                    description=(
+                        f"{subject_kind.capitalize()} {subject} exceeded {limit} account delete request(s) "
+                        "in the rolling minute window. Retry later."
+                    ),
+                )
+
+        for window, _, _ in windows:
+            # Increase count and save it
+            window.count += 1
+            self.ctx.store.saveQuota(window)
 
     def _enforceAccountRequestRate(self, account_aid: str, profile: Any) -> None:
         """Enforce per-account request limits on onboarding and account routes."""
@@ -136,11 +161,7 @@ class Limiter:
         window = self._quotaRecord(ACCOUNT_REQUEST_SCOPE, account_aid, now=now)
         
         # Reset the window if more than 60 seconds have elapsed since the start
-        window_start = _parseDt(window.window_start, default=now)
-        elapsed = (now - window_start).total_seconds()
-        if elapsed >= 60:
-            window.window_start = now.isoformat()
-            window.count = 0
+        self._resetWindowIfElapsed(window, now=now)
 
         # Check if the request count exceeds the profile limit for the window
         if window.count >= profile.max_requests_per_minute > 0:
@@ -166,10 +187,10 @@ class Limiter:
         elif ratio >= 0.85:
             logger.info(f"Approaching request rate limit for account {account_aid}, current rate: 85%")
 
-    def _enforceAccountKelBudget(self, account_aid: str, profile: Any) -> None:
-        """Enforce a fixed per-account KEL event quota on onboarding and account routes."""
+    def _enforceAccountApiBudget(self, account_aid: str, profile: Any) -> None:
+        """Enforce a fixed per-account API quota on onboarding and account routes."""
         
-        if profile.kel_budget <= 0:
+        if profile.api_budget <= 0:
             return
 
         account = self.ctx.store.getAccount(account_aid)
@@ -179,28 +200,34 @@ class Limiter:
             )
             return
 
-        count = account.kel_used
+        count = account.api_used
          
-        if count >= profile.kel_budget:
+        if count >= profile.api_budget:
             logger.warning(
-                f"Account KEL budget exceeded for account {account_aid} under tier '{profile.tier}'",
+                f"Account API budget exceeded for account {account_aid} under tier '{profile.tier}'",
             )
             raise falcon.HTTPTooManyRequests(
                 title="Account key event budget exceeded",
                 description=(
-                    f"Account {account_aid} exceeded {profile.kel_budget} key events. "
+                    f"Account {account_aid} exceeded {profile.api_budget} API requests. "
                     "Request quota has been exhausted for this account tier."
                 ),
             )
 
         count += 1
-        account.kel_used = count
+        account.api_used = count
+        if count >= profile.api_budget and not account.expires_at:
+            account.expires_at = nowIso()
+            logger.info(
+                f"API budget limit reached for account {account_aid}. "
+                "The account is now marked for expiry."
+            )
         self.ctx.store.saveAccount(account)
-        ratio = count / max(profile.kel_budget, 1)
+        ratio = count / max(profile.api_budget, 1)
         if ratio >= 0.95:
-            logger.warning(f"Approaching KEL budget limit for account {account_aid}, current rate: 95%")
+            logger.warning(f"Approaching API budget limit for account {account_aid}, current rate: 95%")
         elif ratio >= 0.85:
-            logger.info(f"Approaching KEL budget limit for account {account_aid}, current rate: 85%")
+            logger.info(f"Approaching API budget limit for account {account_aid}, current rate: 85%")
 
     def _accountContextForRoute(self, serder, payload: dict[str, Any]) -> tuple[str, Any]:
         """Resolve the account AID and tier profile for the current request."""
@@ -245,12 +272,18 @@ class Limiter:
             blocked_until="",
         )
 
+    def _resetWindowIfElapsed(self, window: QuotaRecord, *, now: datetime) -> None:
+        window_start = _parseDt(window.window_start, default=now)
+        elapsed = (now - window_start).total_seconds()
+        if elapsed >= 60:
+            window.window_start = now.isoformat()
+            window.count = 0
 
-def _parseOptionalDt(value: str) -> datetime | None:
-    """Parse the datetime value or return None"""
-    if not value:
-        return None
-    return datetime.fromisoformat(value)
+    def _windowRetryAfterSeconds(self, window: QuotaRecord, *, now: datetime) -> int:
+        window_start = _parseDt(window.window_start, default=now)
+        # Use math ceiling to return the rounded up second
+        retry_after = math.ceil(max(60 - (now - window_start).total_seconds(), 0))
+        return max(retry_after, 1)
 
 
 def _parseDt(value: str, *, default: datetime) -> datetime:

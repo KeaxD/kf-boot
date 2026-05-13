@@ -552,6 +552,7 @@ class AccountWitnessDeleteHandler(RouteHandler):
         sender = serder.pre
         payload = extractExnPayload(serder)
         self.exchanger.requireOnboardedAccount(sender, payload)
+        self.exchanger.limiter.enforceAccountQuotas(serder)
         return True
 
     def handleEvent(self, serder, **kwa):
@@ -595,6 +596,7 @@ class AccountWatcherDeleteHandler(RouteHandler):
         sender = serder.pre
         payload = extractExnPayload(serder)
         self.exchanger.requireOnboardedAccount(sender, payload)
+        self.exchanger.limiter.enforceAccountQuotas(serder)
         return True
 
     def handleEvent(self, serder, **kwa):
@@ -638,6 +640,10 @@ class AccountDeleteHandler(RouteHandler):
         sender = serder.pre
         payload = extractExnPayload(serder)
         self.exchanger.requireDeletableAccount(sender, payload)
+        self.exchanger.limiter.enforceAccountDeleteQuota(
+            sender=sender,
+            client_ip=self.exchanger.client_ip,
+        )
         return True
 
     def handleEvent(self, serder, **kwa):

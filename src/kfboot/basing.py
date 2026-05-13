@@ -102,7 +102,7 @@ class AccountRecord:
     watcher_eid: str = ""
     tier: str = ""
     expires_at: str = ""
-    kel_used: int = 0
+    api_used: int = 0
 
 
 @dataclass

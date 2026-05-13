@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 import falcon
 import pytest
@@ -18,13 +20,14 @@ from kfboot.limiting import Limiter
 from .support import (
     assert_reply_frame,
     build_exn,
+    freeze_boot_time,
     complete_session,
     create_account,
+    make_config,
     post_cesr,
     register_aid,
     start_session,
     total_witness_delete_calls,
-    make_config,
 )
 
 
@@ -208,6 +211,195 @@ def test_account_delete_failure_keeps_remaining_state_retryable(onboarded_bundle
     assert contract.ctx.store.getResource("witness", witness_id) is None
     assert contract.ctx.watcher_boot.delete_calls == [watcher_id]
     assert witness_boot.delete_calls == [witness_id, witness_id]
+
+
+@pytest.mark.parametrize(
+    ("route", "payload_builder"),
+    [
+        (
+            "/account/witnesses/delete",
+            lambda bundle: {"account_aid": bundle["account"].pre, "witness_id": bundle["witness_ids"][0]},
+        ),
+        (
+            "/account/watchers/delete",
+            lambda bundle: {"account_aid": bundle["account"].pre, "watcher_id": bundle["watcher_id"]},
+        ),
+    ],
+)
+def test_resources_delete_routes_enforce_normal_account_request_quota(
+    contract_factory,
+    route,
+    payload_builder,
+):
+    """Test that witnesses and watchers delete routes count towards the requests per minute limit"""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=100,
+                max_requests_per_minute=1,  # Note that the max requests per minute is 1
+                api_budget=100,
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name=f"quota-delete-ephemeral-{route.split('/')[-1]}", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name=f"quota-delete-account-{route.split('/')[-1]}", temp=True) as (_, account),
+    ):
+        register_aid(contract, "/onboarding", ephemeral)
+        register_aid(contract, "/account", account)
+        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
+        create_account(contract, ephemeral, start_reply, account_aid=account.pre)
+        complete_session(
+            contract,
+            ephemeral,
+            session_id=start_reply.ked["a"]["session_id"],
+            account_aid=account.pre,
+        )
+        
+        # Send the 1st request which should be accepted
+        accepted = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+        assert accepted.status_code == 200
+        account_record = contract.ctx.store.getAccount(account.pre)
+
+        # 2nd request gets rejected 
+        rejected = post_cesr(
+            contract,
+            "/account",
+            build_exn(
+                account,
+                route=route,
+                payload=payload_builder(
+                    {
+                        "account": account,
+                        "witness_ids": list(account_record.witness_eids),
+                        "watcher_id": account_record.watcher_eid,
+                    }
+                ),
+            ),
+        )
+
+    assert rejected.status_code == 429
+    assert rejected.json["title"] == "Account request rate limit exceeded"
+
+
+def test_account_delete_route_bypasses_normal_account_request_quota(contract_factory):
+    """Test that account delete route is not limited by limit"""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=100,
+                max_requests_per_minute=1,      # Note the max requests per minute is 1
+                api_budget=100,
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="delete-bypass-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name="delete-bypass-account", temp=True) as (_, account),
+    ):
+        register_aid(contract, "/onboarding", ephemeral)
+        register_aid(contract, "/account", account)
+        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
+        create_account(contract, ephemeral, start_reply, account_aid=account.pre)
+        complete_session(
+            contract,
+            ephemeral,
+            session_id=start_reply.ked["a"]["session_id"],
+            account_aid=account.pre,
+        )
+
+        # 1st requests should get accepted
+        accepted = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+        assert accepted.status_code == 200
+
+        # 2nd request is rejected
+        exhausted = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/watchers", payload={"account_aid": account.pre}),
+        )
+        assert exhausted.status_code == 429
+        assert exhausted.json["title"] == "Account request rate limit exceeded"
+
+        # Account deletion request is accepted because it is not limited
+        deleted = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/delete", payload={"account_aid": account.pre}),
+        )
+
+    _, reply = assert_reply_frame(contract, deleted, route="/account/delete")
+    assert reply.ked["a"]["deleted"] is True
+    assert contract.ctx.store.getAccount(account.pre) is None
+
+
+def test_account_delete_route_throttle_for_non_account_senders(contract_factory, monkeypatch):
+    """Test that account delete request are throttled through IP"""
+    clock = freeze_boot_time(monkeypatch, datetime(2026, 1, 1, tzinfo=UTC))
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+        bootstrap_account_options=("1-of-1",),
+        bootstrap_api_requests_per_minute=1,
+    )
+
+    with habbing.openHab(name="delete-only-sender", temp=True) as (_, account):
+        register_aid(contract, "/account", account)
+
+        # 1st request gets accepted
+        first = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/delete", payload={"account_aid": account.pre}),
+            remote_addr="198.51.100.50",
+        )
+        _, first_reply = assert_reply_frame(contract, first, route="/account/delete")
+        assert first_reply.ked["a"]["deleted"] is True
+
+        # 2nd request hits the throttle
+        second = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/delete", payload={"account_aid": account.pre}),
+            remote_addr="198.51.100.50",
+        )
+
+        assert second.status_code == 429
+        assert second.json["title"] == "Account delete rate limit exceeded"
+
+        # Move the time past 1 min
+        clock.value += timedelta(seconds=61)
+
+        # Request is accepted
+        later = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/delete", payload={"account_aid": account.pre}),
+            remote_addr="198.51.100.50",
+        )
+
+    _, later_reply = assert_reply_frame(contract, later, route="/account/delete")
+    assert later_reply.ked["a"]["deleted"] is True
 
 
 @pytest.mark.parametrize(
@@ -574,14 +766,14 @@ def test_account_routes_enforce_persisted_witness_profile_code(contract_factory)
                 code="1-of-1",
                 max_accounts=100,
                 max_requests_per_minute=100,
-                kel_budget=100
+                api_budget=100
             ),
             AccountProfile(
                 tier="org",
                 code="3-of-4",
                 max_accounts=100,
                 max_requests_per_minute=1,
-                kel_budget=100
+                api_budget=100
             ),
         ),
     )
@@ -787,7 +979,7 @@ def test_account_request_quota_survives_store_reopen(tmp_path):
                 code="1-of-1",
                 max_accounts=100,
                 max_requests_per_minute=2,
-                kel_budget=100,
+                api_budget=100,
             ),
         ),
     )
@@ -839,3 +1031,64 @@ def test_account_request_quota_survives_store_reopen(tmp_path):
         assert excinfo.value.title == "Account request rate limit exceeded"
     finally:
         reopened_store.close()
+
+
+def test_account_is_set_to_expire_when_budget_fully_used(tmp_path, monkeypatch):
+    # Set clock to 2026-01-01T00:00:00+00:00 
+    clock = freeze_boot_time(monkeypatch, datetime(2026, 1, 1, tzinfo=UTC))
+    config = make_config(
+        tmp_path,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=100,
+                max_requests_per_minute=100,
+                api_budget=1,
+            ),
+        ),
+    )
+    # Create a request to reach the limit
+    serder = SimpleNamespace(
+        pre="AID_EXPIRING_USAGE",
+        ked={
+            "r": "/account/witnesses",
+            "a": {
+                "account_aid": "AID_EXPIRING_USAGE",
+            },
+        },
+    )
+
+    store = Store(config.db_path, session_ttl_seconds=config.session_ttl_seconds)
+    try:
+        # Create an account and save it
+        account = store.buildAccount(
+            account_aid="AID_EXPIRING_USAGE",
+            account_alias="expiring",
+            witness_profile_code="1-of-1",
+            witness_count=1,
+            toad=1,
+            watcher_required=True,
+            region_id="test-region",
+            region_name="Test Region",
+            session_id="SESSION123",
+            witness_eids=[],
+            watcher_eid="",
+            tier="trial",
+            onboarded=True,
+        )
+        store.saveAccount(account)
+
+        limiter = Limiter(SimpleNamespace(config=config, store=store))
+        # Enforce the quotas on that request
+        limiter.enforceAccountQuotas(serder)
+        # Check the store for the account 
+        updated = store.getAccount("AID_EXPIRING_USAGE")
+        assert updated is not None
+        # Assert API usage changed to 1
+        assert updated.api_used == 1
+        # Assert the expiration date is immediate
+        assert updated.expires_at == "2026-01-01T00:00:00+00:00"
+    finally:
+        store.close()

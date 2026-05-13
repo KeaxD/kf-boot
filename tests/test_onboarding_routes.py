@@ -561,7 +561,7 @@ def test_session_start_does_not_consume_onboarded_account_quota(contract_factory
                 code="1-of-1",
                 max_accounts=100,
                 max_requests_per_minute=1,
-                kel_budget=100,
+                api_budget=100,
             ),
         ),
     )
@@ -618,7 +618,7 @@ def test_account_route_request_rate_limit_resets_after_minute(contract_factory, 
                 code="1-of-1",
                 max_accounts=100,
                 max_requests_per_minute=2,
-                kel_budget=100,
+                api_budget=100,
             ),
         ),
     )
@@ -682,7 +682,7 @@ def test_account_route_request_rate_limit_is_scoped_per_account(contract_factory
                 code="1-of-1",
                 max_accounts=100,
                 max_requests_per_minute=2,
-                kel_budget=100,
+                api_budget=100,
             ),
         ),
     )
@@ -765,8 +765,7 @@ def test_onboarding_request_quota_blocks_client_ip_for_configured_period(contrac
     contract = contract_factory(
         bootstrap_accounts_per_ip=10,
         bootstrap_aids_per_ip=10,
-        bootstrap_onboarding_requests_per_minute=2,
-        bootstrap_onboarding_block_seconds=30,
+        bootstrap_api_requests_per_minute=2,
         bootstrap_account_options=("1-of-1",),
         account_profiles=(
             AccountProfile(
@@ -774,7 +773,7 @@ def test_onboarding_request_quota_blocks_client_ip_for_configured_period(contrac
                 code="1-of-1",
                 max_accounts=100,
                 max_requests_per_minute=100,
-                kel_budget=100,
+                api_budget=100,
             ),
         ),
     )
@@ -824,7 +823,7 @@ def test_onboarding_request_quota_blocks_client_ip_for_configured_period(contrac
         assert scoped_to_ip.status_code == 200
 
         # Move the clock
-        clock.value += timedelta(seconds=29)
+        clock.value += timedelta(seconds=59)
         still_blocked = post_cesr(
             contract,
             "/onboarding",
@@ -832,10 +831,10 @@ def test_onboarding_request_quota_blocks_client_ip_for_configured_period(contrac
             remote_addr=blocked_ip,
         )
 
-        # Still blocked because it's a 30 sec window
+        # Still blocked because the minute window has not rolled over yet
         assert still_blocked.status_code == 429
 
-        # Move passed the window
+        # Move past the minute window
         clock.value += timedelta(seconds=2)
         unblocked = post_cesr(
             contract,
@@ -849,8 +848,7 @@ def test_onboarding_request_quota_blocks_client_ip_for_configured_period(contrac
 def test_onboarding_request_quota_survives_store_reopen(tmp_path):
     config = make_config(
         tmp_path,
-        bootstrap_onboarding_requests_per_minute=2,
-        bootstrap_onboarding_block_seconds=30,
+        bootstrap_api_requests_per_minute=2,
     )
     store_path = config.db_path
 
@@ -893,7 +891,7 @@ def test_session_start_rejects_account_alias_over_limit(contract_factory):
                 code="1-of-1",
                 max_accounts=1,
                 max_requests_per_minute=100,
-                kel_budget=100
+                api_budget=100
             ),
         ),
     )
@@ -943,7 +941,7 @@ def test_session_start_rejects_alias_when_existing_account_is_pending(contract_f
                 code="1-of-1",
                 max_accounts=1,
                 max_requests_per_minute=100,
-                kel_budget=100
+                api_budget=100
             ),
         ),
     )

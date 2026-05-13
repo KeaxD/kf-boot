@@ -63,13 +63,13 @@ class AccountProfile:
     - code: The bootstrap code (e.g. '1-of-1', '3-of-4')
     - max_accounts: Maximum number of accounts allowed for this profile
     - max_requests_per_minute: Maximum number of requests per minute allowed for this profile
-    - kel_budget: Maximum number of KEL events allowed for this profile
+    - api_budget: Maximum number of API requests allowed for this profile
     """
     tier: str
     code: str
     max_accounts: int
     max_requests_per_minute: int
-    kel_budget: int
+    api_budget: int
 
 
 def _parse_account_profiles(value: str) -> tuple[AccountProfile, ...]:
@@ -83,16 +83,16 @@ def _parse_account_profiles(value: str) -> tuple[AccountProfile, ...]:
         if len(parts) != 5:
             raise ValueError(
                 "KF_BOOT_ACCOUNT_PROFILES entries must be formatted as "
-                "'<tier>|<profile>|<max_accounts>|<max_requests_per_minute>|<kel_budget>'"
+                "'<tier>|<profile>|<max_accounts>|<max_requests_per_minute>|<api_budget>'"
             )
-        tier, code, max_accounts, max_requests, kel_budget = parts[:5]
+        tier, code, max_accounts, max_requests, api_budget = parts[:5]
         profiles.append(
             AccountProfile(
                 tier=tier,
                 code=code,
                 max_accounts=int(max_accounts),
                 max_requests_per_minute=int(max_requests),
-                kel_budget=int(kel_budget),
+                api_budget=int(api_budget),
             )
         )
     return tuple(profiles)
@@ -108,12 +108,12 @@ def _default_account_profiles(codes: tuple[str, ...]) -> tuple[AccountProfile, .
     Trial tier has:
     - max_accounts=1 
     - max_requests_per_minute=30
-    - kel_budget=100
+    - api_budget=100
     
     Org tier has: 
     - max_accounts=3
     - max_requests_per_minute=60
-    - kel_budget=200
+    - api_budget=200
     """
 
     defaults: list[AccountProfile] = []
@@ -122,14 +122,14 @@ def _default_account_profiles(codes: tuple[str, ...]) -> tuple[AccountProfile, .
         tier = "trial" if option["witness_count"] == 1 else "org"
         max_accounts = 1 if option["witness_count"] == 1 else 3
         max_requests = 30 if option["witness_count"] == 1 else 60
-        kel_budget = 100 if option["witness_count"] == 1 else 200
+        api_budget = 100 if option["witness_count"] == 1 else 200
         defaults.append(
             AccountProfile(
                 tier=tier,
                 code=option["code"],
                 max_accounts=max_accounts,
                 max_requests_per_minute=max_requests,
-                kel_budget=kel_budget,
+                api_budget=api_budget,
             )
         )
     return tuple(defaults)
@@ -230,14 +230,11 @@ class Config:
     session_ttl_seconds: int
     account_profiles: tuple[AccountProfile, ...] = ()
     witness_backends: tuple[WitnessBackend, ...] = ()
-    bootstrap_onboarding_requests_per_minute: int = 10
-    bootstrap_onboarding_block_seconds: int = 60
+    bootstrap_api_requests_per_minute: int = 10
 
     def __post_init__(self) -> None:
-        if self.bootstrap_onboarding_requests_per_minute < 0:
-            raise ValueError("bootstrap_onboarding_requests_per_minute must be greater than or equal to 0.")
-        if self.bootstrap_onboarding_block_seconds < 0:
-            raise ValueError("bootstrap_onboarding_block_seconds must be greater than or equal to 0.")
+        if self.bootstrap_api_requests_per_minute < 0:
+            raise ValueError("bootstrap_api_requests_per_minute must be greater than or equal to 0.")
 
         backends = tuple(self.witness_backends)
         if not backends:
@@ -321,7 +318,7 @@ class Config:
             f"Bootstrap account options: {', '.join(supported_options)}\n"
             f"Account Profiles: {', '.join(f'{profile.code} (tier={profile.tier})' for profile in account_profiles)}\n"
             f"Bootstrap Account per IP: {self.bootstrap_accounts_per_ip}\n"
-            f"Bootstrap onboarding requests per minute: {self.bootstrap_onboarding_requests_per_minute}\n"
+            f"Bootstrap API requests per minute: {self.bootstrap_api_requests_per_minute}\n"
         )
 
     def account_option(self, code: str) -> dict[str, int | str] | None:
@@ -403,10 +400,7 @@ class Config:
             session_ttl_seconds=int(_env("SESSION_TTL_SECONDS", "300")),
             account_profiles=account_profiles,
             witness_backends=witness_backends,
-            bootstrap_onboarding_requests_per_minute=int(
-                _env("BOOTSTRAP_ONBOARDING_REQUESTS_PER_MINUTE", "10")
-            ),
-            bootstrap_onboarding_block_seconds=int(
-                _env("BOOTSTRAP_ONBOARDING_BLOCK_SECONDS", "60")
+            bootstrap_api_requests_per_minute=int(
+                _env("BOOTSTRAP_API_REQUESTS_PER_MINUTE", "10")
             ),
         )

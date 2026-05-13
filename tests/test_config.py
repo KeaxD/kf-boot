@@ -105,7 +105,7 @@ def test_config_from_env_parses_account_profiles(monkeypatch):
     assert config.account_profile("1-of-1").tier == "trial"
     assert config.account_profile("1-of-1").max_accounts == 10
     assert config.account_profile("1-of-1").max_requests_per_minute == 5
-    assert config.account_profile("1-of-1").kel_budget == 4
+    assert config.account_profile("1-of-1").api_budget == 4
     assert config.account_profile("missing") is None
 
 
@@ -117,13 +117,25 @@ def test_config_from_env_parses_onboarding_request_quota(monkeypatch):
     )
     monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
     monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example")
-    monkeypatch.setenv("KF_BOOT_BOOTSTRAP_ONBOARDING_REQUESTS_PER_MINUTE", "17")
-    monkeypatch.setenv("KF_BOOT_BOOTSTRAP_ONBOARDING_BLOCK_SECONDS", "45")
+    monkeypatch.setenv("KF_BOOT_BOOTSTRAP_API_REQUESTS_PER_MINUTE", "17")
 
     config = Config.from_env()
 
-    assert config.bootstrap_onboarding_requests_per_minute == 17
-    assert config.bootstrap_onboarding_block_seconds == 45
+    assert config.bootstrap_api_requests_per_minute == 17
+
+
+def test_config_from_env_parses_account_delete_quota(monkeypatch):
+    monkeypatch.setenv(
+        "KF_BOOT_WITNESS_BACKENDS",
+        "wit-1|http://127.0.0.1:5631|https://boot.example.com:5632",
+    )
+    monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
+    monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example")
+    monkeypatch.setenv("KF_BOOT_BOOTSTRAP_API_REQUESTS_PER_MINUTE", "3")
+
+    config = Config.from_env()
+
+    assert config.bootstrap_api_requests_per_minute == 3
 
 
 def test_config_from_env_rejects_malformed_account_profiles(monkeypatch):
@@ -135,12 +147,12 @@ def test_config_from_env_rejects_malformed_account_profiles(monkeypatch):
         "wit-1|http://127.0.0.1:5631|https://boot.example.com:5632",
     )
 
-    # Set up a malformed account profile that is missing the kel_budget field
+    # Set up a malformed account profile that is missing the api_budget field
     monkeypatch.setenv("KF_BOOT_ACCOUNT_PROFILES", "trial|1-of-1|10|5")
     monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
     monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example")
 
-    # The entry is missing the kel_budget field
+    # The entry is missing the api_budget field
     with pytest.raises(ValueError, match="KF_BOOT_ACCOUNT_PROFILES entries must be formatted"):
         Config.from_env()
 
@@ -184,10 +196,10 @@ def test_config_from_env_generates_default_account_profiles_when_not_configured(
     assert config.account_profile("1-of-1").tier == "trial"
     assert config.account_profile("1-of-1").max_accounts == 1
     assert config.account_profile("1-of-1").max_requests_per_minute == 30
-    assert config.account_profile("1-of-1").kel_budget == 100
+    assert config.account_profile("1-of-1").api_budget == 100
     assert config.account_profile("3-of-4").tier == "org"
     assert config.account_profile("3-of-4").max_accounts == 3
-    assert config.account_profile("3-of-4").kel_budget == 200
+    assert config.account_profile("3-of-4").api_budget == 200
 
 
 def test_config_from_env_rejects_account_profile_code_not_supported_by_witness_backends(monkeypatch):
@@ -220,7 +232,7 @@ def test_config_rejects_explicit_account_profiles_missing_supported_options(tmp_
                     code="1-of-1",
                     max_accounts=1,
                     max_requests_per_minute=30,
-                    kel_budget=100,
+                    api_budget=100,
                 ),
             ),
         )
