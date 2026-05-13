@@ -981,13 +981,7 @@ def test_session_start_rejects_alias_when_existing_account_is_pending(contract_f
     assert "configured limit for tier 'trial' is 1" in response.json["description"]
 
 
-@pytest.mark.parametrize(
-    ("status", "expected_reason"),
-    [
-        (ACCOUNT_STATE_EXPIRED, "expired"),
-    ],
-)
-def test_account_create_rejects_expired_permanent_account(contract_factory, status, expected_reason):
+def test_account_create_rejects_expired_permanent_account(contract_factory):
     """Verify that onboarding rejects account creation when the account is expired."""
     contract = contract_factory(
         bootstrap_accounts_per_ip=100,
@@ -995,8 +989,8 @@ def test_account_create_rejects_expired_permanent_account(contract_factory, stat
     )
 
     with (
-        habbing.openHab(name=f"{status}-account-ephemeral", temp=True, transferable=False) as (_, ephemeral),
-        habbing.openHab(name=f"{status}-account", temp=True) as (_, account),
+        habbing.openHab(name=f"expired-account-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name=f"expired-account", temp=True) as (_, account),
     ):
         # Onboard the account and then manually set it to the desired status
         register_aid(contract, "/onboarding", ephemeral)
@@ -1009,7 +1003,7 @@ def test_account_create_rejects_expired_permanent_account(contract_factory, stat
         assert record is not None
 
         # Set the account status to expired
-        record.status = status
+        record.status = 'expired'
         contract.ctx.store.saveAccount(record)
 
         response = post_cesr(
@@ -1022,9 +1016,8 @@ def test_account_create_rejects_expired_permanent_account(contract_factory, stat
             ),
         )
     # Assert the account creation is rejected
-    assert response.status_code == 409
-    assert response.json["title"] == "Account not available"
-    assert expected_reason in response.json["description"]
+    assert response.status_code == 404
+    assert response.json["title"] == "Session not found"
 
 
 def test_expire_sessions_cleans_up_stale_staging_allocations(contract_factory, monkeypatch):

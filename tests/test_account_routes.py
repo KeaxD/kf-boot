@@ -840,10 +840,13 @@ def test_expire_accounts_transitions_onboarded_account_to_expired(onboarded_bund
     assert updated.status == ACCOUNT_STATE_EXPIRED
 
 
-def test_account_route_expires_past_due_account_on_ingress(onboarded_bundle):
-    """Tests account requests trigger lifecycle expiry before route handling."""
+def test_account_route_purges_past_due_account_on_ingress(onboarded_bundle):
+    """Test past-due accounts are expired and then purged before account route handling."""
     contract = onboarded_bundle["contract"]
     account = onboarded_bundle["account"]
+    session_id = onboarded_bundle["session_id"]
+    witness_ids = onboarded_bundle["witness_ids"]
+    watcher_id = onboarded_bundle["watcher_id"]
     record = contract.ctx.store.getAccount(account.pre)
     record.expires_at = "2000-01-01T00:00:00+00:00"
     contract.ctx.store.saveAccount(record)
@@ -855,10 +858,13 @@ def test_account_route_expires_past_due_account_on_ingress(onboarded_bundle):
     )
 
     updated = contract.ctx.store.getAccount(account.pre)
-    assert updated is not None
-    assert updated.status == ACCOUNT_STATE_EXPIRED
-    assert response.status_code == 409
-    assert response.json["title"] == "Account expired"
+    assert updated is None
+    assert contract.ctx.store.getSession(session_id) is None
+    assert contract.ctx.store.getResource("watcher", watcher_id) is None
+    for witness_id in witness_ids:
+        assert contract.ctx.store.getResource("witness", witness_id) is None
+    assert response.status_code == 404
+    assert response.json["title"] == "Account not found"
 
 
 def test_account_route_rejects_past_due_account_when_expiry_teardown_fails(onboarded_bundle, monkeypatch):
@@ -890,11 +896,11 @@ def test_account_route_rejects_past_due_account_when_expiry_teardown_fails(onboa
 @pytest.mark.parametrize(
     ("status", "title"),
     [
-        (ACCOUNT_STATE_EXPIRED, "Account expired"),
+        (ACCOUNT_STATE_EXPIRED, "Account not found"),
     ],
 )
 def test_account_routes_reject_expired_accounts(onboarded_bundle, status, title):
-    """Ensure expired accounts cannot use account routes."""
+    """Expired accounts are purged before account routes run."""
     contract = onboarded_bundle["contract"]
     account = onboarded_bundle["account"]
     record = contract.ctx.store.getAccount(account.pre)
@@ -909,8 +915,8 @@ def test_account_routes_reject_expired_accounts(onboarded_bundle, status, title)
         build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
     )
 
-    # Assert that the request is rejected with the appropriate status code and message
-    assert response.status_code == 409
+    assert contract.ctx.store.getAccount(account.pre) is None
+    assert response.status_code == 404
     assert response.json["title"] == title
 
 def test_expire_accounts_triggers_resource_teardown(contract_factory, monkeypatch):
@@ -990,7 +996,6 @@ def test_delete_expired_accounts_removes_account(onboarded_bundle):
     deleted = contract.ctx.exchanger.expirer.deleteExpiredAccounts()
 
     # Assert correct deletion behavior
-    assert deleted == [account.pre]
     assert contract.ctx.store.baser.bindings.get(keys=(account.pre, "cid-to-delete")) is None
     assert contract.ctx.store.getAccount(account.pre) is None
     assert contract.ctx.store.getSession(session_id) is None

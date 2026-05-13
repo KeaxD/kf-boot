@@ -86,7 +86,7 @@ class Expirer:
         deleted: list[str] = []
 
         for account in self.ctx.store.listAccounts():
-            if account.status != ACCOUNT_STATE_EXPIRED or not account.expires_at:
+            if account.status != ACCOUNT_STATE_EXPIRED:
                 continue
 
             try:
