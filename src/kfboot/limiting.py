@@ -27,7 +27,7 @@ class Limiter:
     def enforceOnboardingRequestQuota(self, *, route: str, client_ip: str) -> None:
         """Throttle onboarding business requests by client IP."""
 
-        # Make sure that it is effectives only on the Onboarding routes
+        # Make sure that it is effective only on the Onboarding routes
         if route not in ONBOARDING_ROUTES:
             return
 

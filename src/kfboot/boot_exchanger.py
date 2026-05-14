@@ -75,7 +75,7 @@ class RouteHandler:
             raise
         except Exception as exc:
             # Prevents internal error to be swallowed and turned into a misleading 401 Request rejected response
-            # Unexpected handler failuers now surfaces as a 500 Route handler failed
+            # Unexpected handler failures now surfaces as a 500 Route handler failed
             logger.exception("Unhandled handler error for route %s", self.resource)
             raise RouteHandlerError(f"Unhandled handler error for {self.resource}") from exc
 

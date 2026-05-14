@@ -132,11 +132,15 @@ class Expirer:
             logger.info(
                 f"Session resource teardown initiated due to session failure for session {session.session_id}"
             )
-            self.provisioner._teardownFailedSessionResources(
-                session=session,
-                failure_reason=reason,
-                account=failed,
-            )
+            try:
+                self.provisioner.teardownSessionResources(session=session, account=account)
+            except BootError as exc:
+                session.reason = f"{reason} Cleanup failed: {exc}"
+                session.updated_at = nowIso()
+                self.ctx.store.saveSession(session)
+                logger.warning(
+                    f"Session resource teardown failed for {session.session_id}: {exc}",
+                )
 
     def refreshSessionLease(self, session: SessionRecord) -> None:
         self.ctx.store.refreshSessionLease(session)

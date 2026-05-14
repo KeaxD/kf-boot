@@ -595,21 +595,3 @@ class Provisioner:
             self.ctx.store.saveSession(session)
         if account is not None:
             self.ctx.store.saveAccount(account)
-
-    def _teardownFailedSessionResources(
-        self,
-        *,
-        session: SessionRecord,
-        failure_reason: str,
-        account=None,
-    ) -> None:
-        try:
-            self.teardownSessionResources(session=session, account=account)
-        except BootError as exc:
-            session.failure_reason = f"{failure_reason} Cleanup failed: {exc}"
-            session.updated_at = nowIso()
-            self.ctx.store.saveSession(session)
-            logger.warning(
-                f"Session resource teardown failed for {session.session_id}: {exc}",
-            )
-    
