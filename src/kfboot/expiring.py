@@ -135,7 +135,7 @@ class Expirer:
             try:
                 self.provisioner.teardownSessionResources(session=session, account=account)
             except BootError as exc:
-                session.reason = f"{reason} Cleanup failed: {exc}"
+                session.failure_reason = f"{reason} Cleanup failed: {exc}"
                 session.updated_at = nowIso()
                 self.ctx.store.saveSession(session)
                 logger.warning(
