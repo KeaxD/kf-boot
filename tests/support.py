@@ -255,7 +255,7 @@ def account_create_payload(start_reply: SerderKERI, account_aid: str, **override
 
 
 def build_signed_serder(hab, serder: SerderKERI, *, end: bytes | bytearray = b"") -> bytes:
-    ims = hab.endorse(serder=serder, last=False, pipelined=False)
+    ims = hab.endorse(serder=serder, last=False, framed=True)
     attachment = bytearray(ims)
     del attachment[:serder.size]
     if end:
