@@ -6,9 +6,18 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from kfboot.basing import (
+    CLEANUP_TASK_ACCOUNT_CLEANUP,
+    CLEANUP_TASK_ACCOUNT_DELETE,
+    CLEANUP_TASK_ACCOUNT_EXPIRE,
+    CLEANUP_TASK_SESSION_CLEANUP,
+    CLEANUP_TASK_SESSION_EXPIRE,
     ACCOUNT_STATE_FAILED,
+    ACCOUNT_STATE_EXPIRED,
     ACCOUNT_STATE_ONBOARDED,
     ACCOUNT_STATE_PENDING_ONBOARDING,
+    CleanupDueRecord,
+    CleanupTaskRecord,
+    LeaseRecord,
     SESSION_STATE_EXPIRED,
     TERMINAL_SESSION_STATES,
     AccountRecord,
@@ -66,9 +75,39 @@ def _resourceToApi(record: ResourceRecord, *, include_boot_url: bool = False) ->
 
 
 class Store:
-    def __init__(self, path: str, *, session_ttl_seconds: int = 300):
+    """
+    Persistent state manager for sessions, accounts, resources, cleanup tasks,
+    and distributed leases.
+
+    Responsibilities:
+    - Maintain lifecycle‑driven cleanup task graphs.
+    - Keep cleanup_tasks and cleanup_due tables synchronized.
+    - Provide atomic, idempotent state transitions for sessions and accounts.
+    - Support distributed workers via timestamp‑based task claiming and leases.
+
+    Attributes:
+    - baser:
+        Underlying LMDB‑backed key/value store. All persistent state
+        (sessions, accounts, tasks, leases, resources) is stored here.
+
+    - session_ttl_seconds:
+        Default TTL applied to newly created sessions. Used by
+        refreshSessionLease() and createSession() to compute expires_at.
+
+    - expired_account_retention_seconds:
+        Retention window applied after an account reaches EXPIRED and its
+        resources are cleaned. Determines when account_delete tasks become due.
+    """
+    def __init__(
+        self,
+        path: str,
+        *,
+        session_ttl_seconds: int = 300,
+        expired_account_retention_seconds: float = 0.0,
+    ):
         self.baser = open_baser(path)
         self.session_ttl_seconds = session_ttl_seconds
+        self.expired_account_retention_seconds = expired_account_retention_seconds
 
     def close(self) -> None:
         self.baser.close()
@@ -82,17 +121,536 @@ class Store:
     def deleteQuota(self, scope: str, subject: str) -> None:
         self.baser.quotas.rem(keys=(scope, subject))
 
-    def expireSessions(self, *, now: str | None = None) -> list[SessionRecord]:
-        current = _parseDt(now or nowIso())
-        expired: list[SessionRecord] = []
-        for _, record in self.baser.sessions.getTopItemIter(keys=()):
-            if record.state in TERMINAL_SESSION_STATES:
+    def getCleanupTask(self, kind: str, subject: str) -> CleanupTaskRecord | None:
+        """Return the cleanup task for a specific kind/subject pair"""
+        return self.baser.cleanup_tasks.get(keys=(kind, subject))
+
+    def ensureCleanupTask(
+        self,
+        kind: str,
+        subject: str,
+        *,
+        due_at: str,
+        now: str | None = None,
+    ) -> CleanupTaskRecord:
+        """Create a cleanup task if one does not already exist for that kind and subject"""
+
+        # Check if a cleanup task exist for this kind/subject pair
+        existing = self.getCleanupTask(kind, subject)
+        if existing is not None:
+
+            # Return if yes
+            return existing
+
+        # Get current time for the cleanup task record
+        current = now or nowIso()
+
+        # Create cleanup task record
+        record = CleanupTaskRecord(
+            kind=kind,
+            subject=subject,
+            due_at=due_at,
+            created_at=current,
+            updated_at=current,
+        )
+
+        # Save the task in the db and return it
+        self._saveCleanupTask(record)
+        return record
+
+    def scheduleCleanupTask(
+        self,
+        kind: str,
+        subject: str,
+        *,
+        due_at: str,
+        now: str | None = None,
+        last_error: str | None = None,
+        reset_attempts: bool = False,
+    ) -> CleanupTaskRecord:
+        """Create a clean up task or if one exist already exists for that kind/subject pair, 
+        Update the cleanup task and move it to a new due time
+        
+        Responsibilities:
+        - Rewrite the task's `due_at` timestamp.
+        - Clear claim metadata (`claimed_by`, `claimed_at`, `claim_expires_at`).
+        - Optionally reset `attempt_count` and update `last_error`.
+        - Maintain consistency between `cleanup_tasks` and `cleanup_due`.
+        """
+
+        # Get current time
+        current = now or nowIso()
+
+        # Get the record for the kind/subject pair
+        record = self.getCleanupTask(kind, subject)
+        previous_due_at = ""
+        
+        if record is None:
+            # Create record if none is found
+            record = CleanupTaskRecord(
+                kind=kind,
+                subject=subject,
+                due_at=due_at,
+                created_at=current,
+                updated_at=current,
+            )
+        else:
+            # If it exists, update the record and move its due time forward with the provided due_at
+            previous_due_at = record.due_at
+            record.due_at = due_at
+            record.updated_at = current
+            record.claimed_by = ""
+            record.claimed_at = ""
+            record.claim_expires_at = ""
+            if reset_attempts:
+                # Reset number of attempts if flag is provided
+                record.attempt_count = 0
+            if last_error is not None:
+                record.last_error = last_error
+        # Save record with its previous due variable and return it
+        self._saveCleanupTask(record, previous_due_at=previous_due_at)
+        return record
+
+    def completeCleanupTask(self, kind: str, subject: str) -> None:
+        """Remove a cleanup task from both the task table and due-time index"""
+
+        # Get the record for that kind/subject pair
+        record = self.getCleanupTask(kind, subject)
+        if record is None:
+            # Return if record does not exist
+            return
+        if record.due_at:
+            # If record due date exist, remove it from the cleanup due table
+            self.baser.cleanup_due.rem(keys=(_dueIndexKey(record.due_at), kind, subject))
+        # Remove it from the cleanup task table
+        self.baser.cleanup_tasks.rem(keys=(kind, subject))
+
+    def listDueCleanupTasks(
+        self,
+        *,
+        now: str | None = None,
+        kind: str | None = None,
+        limit: int | None = None,
+    ) -> list[CleanupTaskRecord]:
+        """Return due cleanup tasks ordered by due-time"""
+        
+        # Get current time and create a key with it to compare it with the key of due tasks
+        current = now or nowIso()
+        current_key = _dueIndexKey(current)
+
+        # Create two lists for due tasks and stale tasks
+        rows: list[CleanupTaskRecord] = []
+        stale: list[tuple[str, ...]] = []
+
+        # Iterate through the due cleanup tasks
+        for keys, _record in self.baser.cleanup_due.getTopItemIter(keys=()):
+            due_key, task_kind, subject = keys[-3:]
+            # Check if a task is due by checking if its key is 'superior' to the key we created with the current time
+            if due_key > current_key:
+                # Task is not due yet, break
+                break
+            if kind is not None and task_kind != kind:
+                # Task is in a different scope, skip
                 continue
-            if _parseDt(record.expires_at) <= current:
-                record.state = SESSION_STATE_EXPIRED
-                record.updated_at = current.isoformat()
-                self.saveSession(record)
-                expired.append(record)
+
+            # Task is due, retrieve it
+            task = self.getCleanupTask(task_kind, subject)
+            if task is None or _dueIndexKey(task.due_at) != due_key:
+                # Task cannot be found, append to stale
+                stale.append(keys)
+                continue
+
+            # Append task to rows list
+            rows.append(task)
+            if limit is not None and len(rows) >= limit:
+                # If the number of items inside the task list reaches the batch size limit, break
+                break
+        
+        # Clean up stale tasks
+        for keys in stale:
+            self.baser.cleanup_due.rem(keys=keys)
+
+        # Return the list of due tasks
+        return rows
+
+    def claimDueCleanupTask(
+        self,
+        *,
+        now: str | None = None,
+        owner_id: str,
+        claim_ttl_seconds: float,
+        kind: str | None = None,
+    ) -> CleanupTaskRecord | None:
+        """Claim one due cleanup task and push its due time to a claim deadline
+        
+        Workflow:
+        - Select earliest due task.
+        - Validate due‑time index entry.
+        - Advance `due_at` to a claim deadline.
+        - Increment attempt counters.
+        """
+
+        # Get current time and create a key for it
+        current = now or nowIso()
+        current_key = _dueIndexKey(current)
+        current_dt = _parseDt(current)
+
+        # Create a claim deadline
+        claim_deadline = (current_dt + timedelta(seconds=claim_ttl_seconds)).isoformat()
+        stale: list[tuple[str, ...]] = []
+
+        # Iterate through due cleanup tasks
+        for keys, _record in self.baser.cleanup_due.getTopItemIter(keys=()):
+            
+            # Check if a task is due by checking if its key is 'superior' to the key we created with the current time
+            due_key, task_kind, subject = keys[-3:]
+            if due_key > current_key:
+                break
+            if kind is not None and task_kind != kind:
+                continue
+
+            # Retrieve task
+            task = self.getCleanupTask(task_kind, subject)
+            if task is None or _dueIndexKey(task.due_at) != due_key:
+                # Task is stale, append it to the stale list
+                stale.append(keys)
+                continue
+
+            # Update the task fields
+            previous_due_at = task.due_at
+            
+            # Move the task due_at to the claim deadline
+            task.due_at = claim_deadline
+            task.updated_at = current
+            task.claimed_by = owner_id
+            task.claimed_at = current
+            task.claim_expires_at = claim_deadline
+            task.last_attempt_at = current
+            
+            # Increase attempt count
+            task.attempt_count += 1
+
+            # Save record to DB
+            self._saveCleanupTask(task, previous_due_at=previous_due_at)
+            
+            # Cleanup stale tasks
+            for stale_keys in stale:
+                self.baser.cleanup_due.rem(keys=stale_keys)
+
+            # Return claimed due task
+            return task
+        
+        # If no valid task was found, still clean up the stale tasks and return None
+        for keys in stale:
+            self.baser.cleanup_due.rem(keys=keys)
+
+        return None
+
+    def getLease(self, name: str) -> LeaseRecord | None:
+        """Return the persisted lease record for a background activity"""
+        return self.baser.leases.get(keys=(name,))
+
+    def acquireLease(
+        self,
+        name: str,
+        *,
+        owner_id: str,
+        ttl_seconds: float,
+        now: str | None = None,
+    ) -> bool:
+        """Acquire or renew a lease unless another worker still holds it
+        
+        Behavior:
+        - Reject acquisition if another owner holds a non‑expired lease.
+        - Renew lease if caller already owns it.
+        - Write updated lease atomically.
+        """
+        
+        # Get current time
+        current = now or nowIso()
+        current_dt = _parseDt(current)
+
+        # Retrieve the lease
+        existing = self.getLease(name)
+
+        # check if the lease exists and is owned by someone else
+        if existing is not None and existing.owner_id and existing.owner_id != owner_id:
+            try:
+                # If the lease is still valid and someone else's, return False
+                if existing.expires_at and _parseDt(existing.expires_at) > current_dt:
+                    return False
+            except ValueError:
+                pass
+
+        # Retrieve acquisition date of the existing lease. If the same worker renews the lease, 
+        # preserve the original acquisition time. If a new worker acquires it, reset acquired_at.
+        acquired_at = (
+            existing.acquired_at
+            if existing is not None and existing.owner_id == owner_id and existing.acquired_at
+            else current
+        )
+
+        # Calculate expires at using ttl_seconds variable provided
+        expires_at = (current_dt + timedelta(seconds=ttl_seconds)).isoformat()
+
+        # Create the new Lease Record with the new owner
+        record = LeaseRecord(
+            name=name,
+            owner_id=owner_id,
+            acquired_at=acquired_at,
+            heartbeat_at=current,
+            expires_at=expires_at,
+        )
+        
+        # Update the record in the DB
+        self.baser.leases.pin(keys=(name,), val=record)
+
+        # Retrieve it from the DB and return it after checks. 
+        # This ensure that the record matches the intended owner, it also acts as a race condition safety check
+        persisted = self.getLease(name)
+        return persisted is not None and persisted.owner_id == owner_id and persisted.expires_at == expires_at
+
+    def releaseLease(self, name: str, *, owner_id: str) -> None:
+        """Release a lease when it is still owned by the caller"""
+
+        # Get the lease
+        record = self.getLease(name)
+
+        # If lease is not found or owner is not valid, return
+        if record is None or record.owner_id != owner_id:
+            return
+
+        # Remove the lease from DB
+        self.baser.leases.rem(keys=(name,))
+
+    def _saveCleanupTask(
+        self,
+        record: CleanupTaskRecord,
+        *,
+        previous_due_at: str | None = None,
+    ) -> None:
+        """Persist a cleanup task and keep the due-time table synchronized
+        Responsibilities:
+        - Write to cleanup_tasks.
+        - Insert/update cleanup_due entry.
+        - Remove stale due‑time entries when rescheduling
+        """
+
+        # Get previous due date if provided
+        previous = previous_due_at if previous_due_at is not None else ""
+
+        # If the task was rescheduled (due_at changed), remove the old index entry.
+        # This prevents stale entries from polluting the due-time index.
+        if previous and previous != record.due_at:
+            self.baser.cleanup_due.rem(
+                keys=(_dueIndexKey(previous), record.kind, record.subject)
+            )
+        # Update record
+        self.baser.cleanup_tasks.pin(keys=(record.kind, record.subject), val=record)
+        
+        # Insert/update in the cleanup due table if the task has a due_at timestamp.
+        if record.due_at:
+            self.baser.cleanup_due.pin(
+                keys=(_dueIndexKey(record.due_at), record.kind, record.subject),
+                val=CleanupDueRecord(
+                    kind=record.kind,
+                    subject=record.subject,
+                    due_at=record.due_at,
+                ),
+            )
+
+    def _deleteCleanupTaskIfPresent(self, kind: str, subject: str) -> None:
+        """Delete a cleanup task if it exists"""
+
+        # Retrieve cleanup task, return if None
+        record = self.getCleanupTask(kind, subject)
+        if record is None:
+            return
+
+        # Mark as Complete
+        self.completeCleanupTask(kind, subject)
+
+    def _syncSessionTasks(self, record: SessionRecord) -> None:
+        """Create a task queue based on the session state change.
+        If a session is:
+        - Expired and not cleaned => creates a cleanup task
+        - Expired and cleaned => remove cleanup task
+        - Still Active and has an expiry date => schedule session expiry with session_expire
+        - In terminal or no expiry => remove expire task
+        """
+
+        # Check if session is expired
+        if record.state == SESSION_STATE_EXPIRED:
+
+            # Clean up task if it exist
+            self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_EXPIRE, record.session_id)
+            if record.resources_cleaned_at:
+                # If session resources were cleaned, delete task
+                self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_CLEANUP, record.session_id)
+            else:
+                # If session is not cleaned yet, schedule a cleanup task
+                self.ensureCleanupTask(
+                    CLEANUP_TASK_SESSION_CLEANUP,
+                    record.session_id,
+                    due_at=record.expired_at or record.updated_at or nowIso(),
+                    now=record.updated_at or None,
+                )
+            return
+
+        # Delete cleanup task if it exist
+        self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_CLEANUP, record.session_id)
+
+        # If session is in terminal state or expiry date is not defined, delete task
+        if record.state in TERMINAL_SESSION_STATES or not record.expires_at:
+            self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_EXPIRE, record.session_id)
+            return
+        
+        # Session is active and has an expiry date, schedule a session expire task
+        self.scheduleCleanupTask(
+            CLEANUP_TASK_SESSION_EXPIRE,
+            record.session_id,
+            due_at=record.expires_at,
+            now=record.updated_at or None,
+            reset_attempts=True,
+        )
+
+    def _syncAccountTasks(self, record: AccountRecord) -> None:
+        """Create a task queue based on the account state change.
+        If a account is:
+        - Expired and not cleaned => schedlue account cleanup with account_cleanup
+        - Expired and cleaned => schedule account delete with account_delete
+        - Onboarded and has an expiry date => schedule account expiry with account_expire
+        - Anything else => clear stale tasks
+        """
+        # Check if account is expired
+        if record.status == ACCOUNT_STATE_EXPIRED:
+            # Clear task if present
+            self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_EXPIRE, record.account_aid)
+            
+            # Check if resources were cleaned
+            if record.resources_cleaned_at:
+                self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_CLEANUP, record.account_aid)
+                
+                # If account resources were torndown, schedule account deletion
+                self.ensureCleanupTask(
+                    CLEANUP_TASK_ACCOUNT_DELETE,
+                    record.account_aid,
+                    due_at=self._accountDeleteDueAt(record),
+                    now=record.resources_cleaned_at or None,
+                )
+            else:
+                self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_DELETE, record.account_aid)
+                # If account resources were not cleaned, schedule an account cleanup
+                self.ensureCleanupTask(
+                    CLEANUP_TASK_ACCOUNT_CLEANUP,
+                    record.account_aid,
+                    due_at=record.expired_at or record.created_at or nowIso(),
+                    now=record.expired_at or None,
+                )
+            return
+
+        # Delete stale tasks
+        self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_CLEANUP, record.account_aid)
+        self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_DELETE, record.account_aid)
+        
+        if record.status != ACCOUNT_STATE_ONBOARDED or not record.expires_at:
+            # If account is not onboarded or does not have an expiry date, return
+            self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_EXPIRE, record.account_aid)
+            return
+
+        # If the account is onboarded and has an expiry date, schedule its expiry
+        self.scheduleCleanupTask(
+            CLEANUP_TASK_ACCOUNT_EXPIRE,
+            record.account_aid,
+            due_at=record.expires_at,
+            now=record.onboarded_at or record.created_at or None,
+            reset_attempts=True,
+        )
+
+    def _accountDeleteDueAt(self, record: AccountRecord) -> str:
+        """Compute when an expired account becomes eligible for final deletion.
+        If expired_account_retention_seconds is not defined, account deletion is immediate"""
+
+        # Get a base time to compute account deletion, either expiration date, resources cleaned date or current time
+        anchor = record.expired_at or record.resources_cleaned_at or nowIso()
+        
+        # Get valid account retention time, provided in the config
+        retention = max(self.expired_account_retention_seconds, 0.0)
+        
+        # If variable is None or invalid, return anchor which would make account deletion immediate
+        if retention <= 0:
+            return anchor
+        return (_parseDt(anchor) + timedelta(seconds=retention)).isoformat()
+
+    def expireSessions(
+        self,
+        *,
+        now: str | None = None,
+        limit: int | None = None,
+    ) -> list[SessionRecord]:
+        """Transition sessions to EXPIRED when their `session_expire` task becomes due
+        Workflow:
+            - Iterate due `session_expire` tasks in due-time order.
+            - Validate that the session still exists and is not terminal.
+            - Compare `expires_at` with the current time.
+            - Mark the session EXPIRED and persist the updated record.
+            - Remove or reschedule tasks based on updated state.
+        """
+
+        # Get current time to compare with the time of the session expiry date
+        current = now or nowIso()
+        current_dt = _parseDt(current)
+
+        # Create expired session list
+        expired: list[SessionRecord] = []
+
+        # Iterate through due cleanup tasks
+        for task in self.listDueCleanupTasks(
+            now=current,
+            kind=CLEANUP_TASK_SESSION_EXPIRE,
+            limit=limit,
+        ):
+            # Get Session record for that task
+            record = self.getSession(task.subject)
+
+            # If session is not found, task is orhpaned so mark as completed for removal
+            if record is None:
+                self.completeCleanupTask(task.kind, task.subject)
+                continue
+            # If session is in terminal state, mark task as completed and continue
+            if record.state in TERMINAL_SESSION_STATES:
+                self.completeCleanupTask(task.kind, task.subject)
+                continue
+            # If session does not have an expiration date, task is invalid so mark as completed for removal
+            if not record.expires_at:
+                self.completeCleanupTask(task.kind, task.subject)
+                continue
+            # If session is not yet expired, reschedule a cleanup task to the updated expiration date
+            if _parseDt(record.expires_at) > current_dt:
+                self.scheduleCleanupTask(
+                    task.kind,
+                    task.subject,
+                    due_at=record.expires_at,
+                    now=current,
+                    reset_attempts=True,
+                )
+                continue
+
+            # Set the session as expired
+            record.state = SESSION_STATE_EXPIRED
+            record.updated_at = current
+
+            # Set the expiration date if None
+            if not record.expired_at:
+                record.expired_at = current
+
+            # Save the session record in the DB
+            self.saveSession(record)
+
+            # Add the session record to expired session list
+            expired.append(record)
+
+        # Return the expired session list
         return expired
 
     def createSession(
@@ -134,7 +692,11 @@ class Store:
         return record
 
     def saveSession(self, record: SessionRecord) -> None:
+        # Update session 
         self.baser.sessions.pin(keys=(record.session_id,), val=record)
+
+        # Check for session cleanup tasks based on the newly updated session state
+        self._syncSessionTasks(record)
 
     def refreshSessionLease(self, record: SessionRecord, *, now: str | None = None) -> None:
         current = _parseDt(now or nowIso())
@@ -176,12 +738,21 @@ class Store:
         return rows
 
     def saveAccount(self, record: AccountRecord) -> None:
+        # Save the account in DB
         self.baser.accounts.pin(keys=(record.account_aid,), val=record)
+        # Check for account task based on the newly saved session state
+        self._syncAccountTasks(record)
 
     def getAccount(self, account_aid: str) -> AccountRecord | None:
         return self.baser.accounts.get(keys=(account_aid,))
 
     def deleteAccount(self, account_aid: str) -> None:
+        # Remove cleanup task related to this account
+        self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_EXPIRE, account_aid)
+        self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_CLEANUP, account_aid)
+        self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_DELETE, account_aid)
+
+        # Remove Account from the DB
         self.baser.accounts.rem(keys=(account_aid,))
 
     def listAccounts(self) -> list[AccountRecord]:
@@ -255,6 +826,11 @@ class Store:
         self.baser.resources.rem(keys=(kind, eid))
 
     def deleteSession(self, session_id: str) -> None:
+        # Delete any cleanup task related to that session
+        self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_EXPIRE, session_id)
+        self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_CLEANUP, session_id)
+
+        # Remove session from the DB
         self.baser.sessions.rem(keys=(session_id,))
 
     def countResources(self, kind: str) -> int:
@@ -311,6 +887,8 @@ class Store:
             "witness_count": session.witness_count,
             "toad": session.toad,
             "failure_reason": session.failure_reason,
+            "expired_at": session.expired_at,
+            "resources_cleaned_at": session.resources_cleaned_at,
         }
 
     def accountPayload(self, account: AccountRecord) -> dict[str, Any]:
@@ -331,6 +909,8 @@ class Store:
             "session_id": account.session_id,
             "witness_eids": list(account.witness_eids),
             "watcher_eid": account.watcher_eid,
+            "expired_at": account.expired_at,
+            "resources_cleaned_at": account.resources_cleaned_at,
         }
 
     def buildAccount(
@@ -435,6 +1015,11 @@ def accountFailed(account: AccountRecord | None) -> AccountRecord | None:
 
 def _parseDt(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def _dueIndexKey(value: str) -> str:
+    """Convert an ISO timestamp into a lexicographically sortable UTC key."""
+    return _parseDt(value).astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def _newSessionId() -> str:

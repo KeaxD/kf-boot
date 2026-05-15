@@ -193,7 +193,17 @@ def make_config(tmp_path, *, index: int = 0, **overrides: Any) -> Config:
         "bootstrap_accounts_per_ip": 1,
         "bootstrap_aids_per_ip": 10,
         "bootstrap_api_requests_per_minute": 10,
+        "cleanup_runner_enabled": True,
         "session_ttl_seconds": 300,
+        "cleanup_interval_seconds": 0,
+        "cleanup_batch_size": 100,
+        "cleanup_time_budget_seconds": 5,
+        "cleanup_task_claim_ttl_seconds": 300,
+        "cleanup_leader_ttl_seconds": 120,
+        "cleanup_failure_backoff_seconds": 60,
+        "cleanup_failure_backoff_max_seconds": 900,
+        "cleanup_failure_jitter_seconds": 0,
+        "expired_account_retention_seconds": 0,
         "witness_backends": witness_backends,
     }
     data.update(overrides)

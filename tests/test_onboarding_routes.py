@@ -108,6 +108,43 @@ def test_onboarding_flow_persists_state_transitions_and_bound_resources(contract
         assert account_record.onboarded_at
 
 
+def test_session_status_rejects_expired_session_without_refreshing_lease(contract):
+    """Test that requests are rejected if session is expired"""
+    with (
+        habbing.openHab(name="expired-status-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name="expired-status-account", temp=True) as (_, account),
+    ):
+        register_aid(contract, "/onboarding", ephemeral)
+        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
+
+        # Retrieve session and expire it 
+        session_id = start_reply.ked["a"]["session_id"]
+        session = contract.ctx.store.getSession(session_id)
+        session.expires_at = "2000-01-01T00:00:00+00:00"
+
+        # Save session to trigger clean up tasks
+        contract.ctx.store.saveSession(session)
+
+        # Send an onboarding status request
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(
+                ephemeral,
+                route="/onboarding/session/status",
+                payload={"session_id": session_id},
+            ),
+        )
+
+        # Assert session is expired and request is rejected
+        updated = contract.ctx.store.getSession(session_id)
+        assert response.status_code == 410
+        assert response.json["title"] == "Session expired"
+        assert updated is not None
+        assert updated.state == SESSION_STATE_EXPIRED
+        assert updated.expires_at == "2000-01-01T00:00:00+00:00"
+
+
 def test_session_start_is_idempotent_and_does_not_duplicate_allocations(contract):
     with habbing.openHab(name="start-idempotent", temp=True, transferable=False) as (_, ephemeral):
         register_aid(contract, "/onboarding", ephemeral)
@@ -426,6 +463,8 @@ def test_expired_sessions_reclaim_hosted_resources_and_fail_pending_account(cont
         expired.expires_at = "2024-01-01T00:00:00+00:00"
         contract.ctx.store.saveSession(expired)
 
+        sweep = contract.ctx.exchanger.expirer.sweep(batch_size=10)
+
         register_aid(contract, "/onboarding", next_ephemeral)
         response = post_cesr(
             contract,
@@ -437,6 +476,8 @@ def test_expired_sessions_reclaim_hosted_resources_and_fail_pending_account(cont
 
         expired = contract.ctx.store.getSession(session_id)
         account_record = contract.ctx.store.getAccount(account.pre)
+        assert sweep["sessions_expired"] == 1
+        assert sweep["sessions_cleaned"] == 1
         assert expired.state == SESSION_STATE_EXPIRED
         assert account_record.status == ACCOUNT_STATE_FAILED
         assert contract.ctx.store.getResource("witness", witness_id) is None
@@ -989,8 +1030,8 @@ def test_account_create_rejects_expired_permanent_account(contract_factory):
     )
 
     with (
-        habbing.openHab(name=f"expired-account-ephemeral", temp=True, transferable=False) as (_, ephemeral),
-        habbing.openHab(name=f"expired-account", temp=True) as (_, account),
+        habbing.openHab(name="expired-account-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name="expired-account", temp=True) as (_, account),
     ):
         # Onboard the account and then manually set it to the desired status
         register_aid(contract, "/onboarding", ephemeral)
@@ -1003,7 +1044,7 @@ def test_account_create_rejects_expired_permanent_account(contract_factory):
         assert record is not None
 
         # Set the account status to expired
-        record.status = 'expired'
+        record.status = ACCOUNT_STATE_EXPIRED
         contract.ctx.store.saveAccount(record)
 
         response = post_cesr(
@@ -1015,13 +1056,13 @@ def test_account_create_rejects_expired_permanent_account(contract_factory):
                 payload=account_create_payload(start_reply, account.pre),
             ),
         )
-    # Assert the account creation is rejected
-    assert response.status_code == 404
-    assert response.json["title"] == "Session not found"
+    assert response.status_code == 409
+    assert response.json["title"] == "Account not available"
+    assert "expired" in response.json["description"]
 
 
-def test_expire_sessions_cleans_up_stale_staging_allocations(contract_factory, monkeypatch):
-    """Ensure expired staging sessions trigger cleanup of stale allocations."""
+def test_cleanup_expired_sessions_cleans_up_stale_staging_allocations(contract_factory, monkeypatch):
+    """Ensure expired staging sessions are cleaned by the sweeper cleanup phase."""
     contract = contract_factory(
         bootstrap_accounts_per_ip=100,
         bootstrap_aids_per_ip=100,
@@ -1050,11 +1091,17 @@ def test_expire_sessions_cleans_up_stale_staging_allocations(contract_factory, m
 
     monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownSessionResources", fake_teardown)
 
-    contract.ctx.exchanger.expirer.expireSessions()
+    expired = contract.ctx.exchanger.expirer.expireSessions(now="2026-01-01T00:00:00+00:00")
+    cleaned_sessions = contract.ctx.exchanger.expirer.cleanupExpiredSessions(
+        now="2026-01-01T00:00:00+00:00"
+    )
 
     expired_session = contract.ctx.store.getSession(session.session_id)
     assert expired_session is not None
     assert expired_session.state == SESSION_STATE_EXPIRED
+    assert [record.session_id for record in expired] == [session.session_id]
+    assert cleaned_sessions == [session.session_id]
+    assert expired_session.resources_cleaned_at == "2026-01-01T00:00:00+00:00"
     assert cleaned == [(session.session_id, None)]
 
 

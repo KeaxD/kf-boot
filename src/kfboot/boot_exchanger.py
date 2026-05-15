@@ -208,6 +208,7 @@ class SessionStatusHandler(RouteHandler):
         sender = serder.pre
         session = self.exchanger.requireSession(requiredStr(extractExnPayload(serder), "session_id"))
         self.exchanger.requireOnboardingPrincipal(sender=sender, session=session)
+        self.exchanger.requireOpenSession(session)
         self.exchanger.expirer.refreshSessionLease(session)
         logger.info(
             f"Session status requested for session {session.session_id}"
@@ -780,6 +781,31 @@ class BootExchanger(Exchanger):
         )
 
     def requireOpenSession(self, session: SessionRecord, *, allow_completed: bool = False) -> None:
+        """
+        Ensure the session is in an open, non-terminal lifecycle state.
+
+        Responsibilities:
+        - Reject sessions that have reached a terminal state
+        (FAILED, CANCELLED, EXPIRED, COMPLETED unless explicitly allowed).
+        - Reject sessions that are missing required lifecycle fields.
+        - Provide a consistent guardrail for all onboarding routes that require
+        an active session.
+
+        Lifecycle rules enforced:
+        - If session.state is in TERMINAL_SESSION_STATES = reject.
+        - If session.state == COMPLETED and allow_completed is False = reject.
+        - Otherwise, the session is considered open and usable.
+
+        Raises:
+        - falcon.HTTPConflict if the session is closed or completed when not allowed.
+        - falcon.HTTPUnauthorized if the session is missing or invalid.
+        """
+
+        # Check if a session is not in a terminal state but its expiration date is due, expire it now then rejects
+        if session.state not in TERMINAL_SESSION_STATES and self.sessionPastDue(session):
+            self.expirer.markSessionExpired(session)
+            logger.warning(f"Session {session.session_id} expired")
+            raise falcon.HTTPGone(title="Session expired")
         if session.state == SESSION_STATE_EXPIRED:
             logger.warning(f"Session {session.session_id} expired")
             raise falcon.HTTPGone(title="Session expired")
@@ -797,6 +823,35 @@ class BootExchanger(Exchanger):
             raise falcon.HTTPConflict(title="Session completed")
 
     def requireOnboardedAccount(self, sender: str, payload: dict[str, Any]) -> AccountRecord:
+        """
+        Ensure the authenticated sender corresponds to a valid, non‑expired,
+        fully onboarded account.
+
+        Responsibilities:
+        - Enforce that the authenticated sender is the principal for the
+        requested account (account_aid must match sender when provided).
+        - Retrieve the account record for the sender and validate that it exists.
+        - Reject accounts that are expired or past due, performing a dynamic
+        expiration transition when necessary.
+        - Reject accounts that have not completed onboarding.
+        - Provide a consistent guardrail for all routes that require an
+        onboarded account principal.
+
+        Lifecycle rules enforced:
+        - If account_aid is provided and does not match sender => reject (401).
+        - If no account exists for sender => reject (404).
+        - If account.status == EXPIRED => reject (409).
+        - If account is past due (TTL exceeded), mark it expired and reject (409).
+        - If account.status != ONBOARDED => reject (409).
+
+        Returns:
+        - The validated AccountRecord for the authenticated sender.
+
+        Raises:
+        - falcon.HTTPUnauthorized for principal mismatch.
+        - falcon.HTTPNotFound if the account does not exist.
+        - falcon.HTTPConflict for expired, past‑due, or non‑onboarded accounts.
+        """
         account_aid = optionalStr(payload, "account_aid")
         if account_aid and account_aid != sender:
             logger.warning(
@@ -823,6 +878,7 @@ class BootExchanger(Exchanger):
                 description="This account has expired and must be renewed or deleted before accessing account routes.",
             )
         if self.accountPastDue(account):
+            self.expirer.markAccountExpired(account)
             logger.warning(
                 f"Account {account.account_aid} is past due and cannot access account routes"
             )
@@ -837,6 +893,23 @@ class BootExchanger(Exchanger):
                 description="Approved-account routes require an onboarded account principal.",
             )
         return account
+
+    def sessionPastDue(self, session: SessionRecord) -> bool:
+        """Check if a session's expiration is due"""
+
+        # Get expiration date, return if None
+        if not session.expires_at:
+            return False
+
+        try:
+            expires_at = datetime.fromisoformat(session.expires_at)
+        except ValueError:
+            logger.warning(
+                f"Session {session.session_id} has invalid expires_at format: {session.expires_at}",
+            )
+            return False
+
+        return expires_at <= datetime.fromisoformat(nowIso())
 
     def requireDeletableAccount(self, sender: str, payload: dict[str, Any]) -> tuple[str, AccountRecord | None]:
         """Checks the identity of the sender and if the account is in a valid state for deletion"""

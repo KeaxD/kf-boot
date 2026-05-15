@@ -6,7 +6,10 @@ import pytest
 
 from kfboot.basing import (
     ACCOUNT_STATE_FAILED,
+    ACCOUNT_STATE_EXPIRED,
     ACCOUNT_STATE_ONBOARDED,
+    CLEANUP_TASK_ACCOUNT_CLEANUP,
+    CLEANUP_TASK_SESSION_EXPIRE,
     QuotaRecord,
     SESSION_STATE_COMPLETED,
     SESSION_STATE_EXPIRED,
@@ -149,6 +152,107 @@ def test_expire_sessions_marks_only_non_terminal_records(store):
     assert store.getSession(open_session.session_id).state == SESSION_STATE_EXPIRED
     assert store.getSession(terminal.session_id).state == SESSION_STATE_COMPLETED
     assert [record.session_id for record in expired] == [open_session.session_id]
+
+
+def test_cleanup_tasks_survive_store_reopen(tmp_path):
+    """Test that clean up task are persistent"""
+    path = str(tmp_path / "cleanup-store" / "kf-boot")
+    first = Store(
+        path,
+        session_ttl_seconds=60,
+        expired_account_retention_seconds=120,
+    )
+    try:
+        session = first.createSession(
+            ephemeral_aid="E-clean",
+            account_aid="A-clean",
+            account_alias="alpha",
+            chosen_profile_code="1-of-1",
+            client_ip="127.0.0.1",
+            region_id="test-region",
+            region_name="Test Region",
+            watcher_required=True,
+            witness_count=1,
+            toad=1,
+            account_tier="trial",
+        )
+        # Set expiration date as now
+        session.expires_at = "2024-01-01T00:00:00+00:00"
+
+        # Save the session which should trigger clean up
+        first.saveSession(session)
+
+        # Build account from that session
+        account = first.buildAccount(
+            account_aid="A-clean",
+            account_alias="alpha",
+            witness_profile_code="1-of-1",
+            witness_count=1,
+            toad=1,
+            watcher_required=True,
+            region_id="test-region",
+            region_name="Test Region",
+            session_id=session.session_id,
+            witness_eids=["W1"],
+            watcher_eid="WA1",
+            onboarded=True,
+        )
+        
+        # Set the account as expired
+        account.status = ACCOUNT_STATE_EXPIRED
+        account.expired_at = "2024-01-01T00:00:00+00:00"
+
+        # Save the account 
+        first.saveAccount(account)
+    finally:
+
+        # Close the store to test persistence
+        first.close()
+
+    # Open the store with the same path
+    second = Store(
+        path,
+        session_ttl_seconds=60,
+        expired_account_retention_seconds=120,
+    )
+    try:
+        # Assert for clean up tasks
+        session_task = second.getCleanupTask(CLEANUP_TASK_SESSION_EXPIRE, session.session_id)
+        account_task = second.getCleanupTask(CLEANUP_TASK_ACCOUNT_CLEANUP, account.account_aid)
+        assert session_task is not None
+        assert session_task.due_at == "2024-01-01T00:00:00+00:00"
+        assert account_task is not None
+        assert account_task.due_at == "2024-01-01T00:00:00+00:00"
+    finally:
+        second.close()
+
+
+def test_cleanup_leases_are_persisted_and_exclusive(store):
+    """Test that leases are exclusive to their owner and cannot be acquired unless realeased or ttl reached"""
+
+    # owner A gets the lease with a TTL of 30 sec
+    assert store.acquireLease(
+        "cleanup",
+        owner_id="owner-a",
+        ttl_seconds=30,
+        now="2024-01-01T00:00:00+00:00",
+    )
+
+    # owner B tries to acquire the lease after 10 sec, gets denied 
+    assert not store.acquireLease(
+        "cleanup",
+        owner_id="owner-b",
+        ttl_seconds=30,
+        now="2024-01-01T00:00:10+00:00",
+    )
+
+    # Owner B tries again after 21 sec which is 1s after owner A's lease of 30 sec
+    assert store.acquireLease(
+        "cleanup",
+        owner_id="owner-b",
+        ttl_seconds=30,
+        now="2024-01-01T00:00:31+00:00",
+    )
 
 
 def test_quota_records_are_saved_in_lmdb(tmp_path):

@@ -17,6 +17,7 @@ from kfboot.boot_exchanger import BootContext, BootExchanger
 from kfboot.config import Config
 from kfboot.onboarding import CesrSurfaceEnd
 from kfboot.store import Store
+from kfboot.sweeping import CleanupRunner
 
 
 logger = help.ogler.getLogger(__name__)
@@ -53,11 +54,14 @@ class Context:
     kvy: Kevery | None
     parser: Parser | None
     exchanger: BootExchanger | None
+    cleanup_runner: CleanupRunner | None
 
     def close(self, *, clear: bool = False) -> None:
         logger.info(
             "App Context is closing",
         )
+        if self.cleanup_runner is not None:
+            self.cleanup_runner.stop()
         self.store.close()
         self.habery.close(clear=clear)
         logger.info(
@@ -99,7 +103,12 @@ def create_app(config: Config | None = None, *, temp: bool = False) -> tuple[fal
     logger.info(
         "App config loaded and app is starting"
     )
-    store = Store(config.db_path, session_ttl_seconds=config.session_ttl_seconds)
+    # Instantiate store
+    store = Store(
+        config.db_path,
+        session_ttl_seconds=config.session_ttl_seconds,
+        expired_account_retention_seconds=config.expired_account_retention_seconds,
+    )
     cf = Configer(
         name=config.keri_name,
         base="",
@@ -135,6 +144,7 @@ def create_app(config: Config | None = None, *, temp: bool = False) -> tuple[fal
         kvy=None,
         parser=None,
         exchanger=None,
+        cleanup_runner=None,
     )
 
     exchanger = BootExchanger(
@@ -164,6 +174,14 @@ def create_app(config: Config | None = None, *, temp: bool = False) -> tuple[fal
     ctx.kvy = kvy
     ctx.parser = parser
     ctx.exchanger = exchanger
+    ctx.cleanup_runner = CleanupRunner(
+        expirer=exchanger.expirer,
+        interval=config.cleanup_interval_seconds,
+        batch_size=config.cleanup_batch_size,
+        time_budget_seconds=config.cleanup_time_budget_seconds,
+        enabled=config.cleanup_runner_enabled,
+    )
+    ctx.cleanup_runner.start()
 
     app = falcon.App()
     app.add_route("/health", HealthEnd())

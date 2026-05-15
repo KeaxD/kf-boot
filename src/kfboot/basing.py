@@ -25,6 +25,12 @@ ACCOUNT_STATE_ONBOARDED = "onboarded"
 ACCOUNT_STATE_EXPIRED = "expired"
 ACCOUNT_STATE_FAILED = "failed"
 
+CLEANUP_TASK_SESSION_EXPIRE = "session_expire"
+CLEANUP_TASK_SESSION_CLEANUP = "session_cleanup"
+CLEANUP_TASK_ACCOUNT_EXPIRE = "account_expire"
+CLEANUP_TASK_ACCOUNT_CLEANUP = "account_cleanup"
+CLEANUP_TASK_ACCOUNT_DELETE = "account_delete"
+
 TERMINAL_SESSION_STATES = {
     SESSION_STATE_COMPLETED,
     SESSION_STATE_EXPIRED,
@@ -82,6 +88,8 @@ class SessionRecord:
     toad: int = 0
     account_tier: str = ""
     failure_reason: str = ""
+    expired_at: str = ""
+    resources_cleaned_at: str = ""
 
 
 @dataclass
@@ -103,6 +111,8 @@ class AccountRecord:
     tier: str = ""
     expires_at: str = ""
     api_used: int = 0
+    expired_at: str = ""
+    resources_cleaned_at: str = ""
 
 
 @dataclass
@@ -112,6 +122,37 @@ class QuotaRecord:
     window_start: str = ""
     count: int = 0
     blocked_until: str = ""
+
+
+@dataclass
+class CleanupTaskRecord:
+    kind: str = ""
+    subject: str = ""
+    due_at: str = ""
+    attempt_count: int = 0
+    created_at: str = ""
+    updated_at: str = ""
+    claimed_by: str = ""
+    claimed_at: str = ""
+    claim_expires_at: str = ""
+    last_attempt_at: str = ""
+    last_error: str = ""
+
+
+@dataclass(frozen=True)
+class CleanupDueRecord:
+    kind: str = ""
+    subject: str = ""
+    due_at: str = ""
+
+
+@dataclass
+class LeaseRecord:
+    name: str = ""
+    owner_id: str = ""
+    acquired_at: str = ""
+    heartbeat_at: str = ""
+    expires_at: str = ""
 
 
 class PlatformBaser(dbing.LMDBer):
@@ -127,6 +168,9 @@ class PlatformBaser(dbing.LMDBer):
         self.sessions = None
         self.accounts = None
         self.quotas = None
+        self.cleanup_tasks = None
+        self.cleanup_due = None
+        self.leases = None
 
         super().__init__(
             name=name,
@@ -162,6 +206,22 @@ class PlatformBaser(dbing.LMDBer):
             db=self,
             subkey="quot.",
             klas=QuotaRecord,
+        )
+        # Periodic Flush DBs
+        self.cleanup_tasks = koming.Komer(
+            db=self,
+            subkey="ctsk.",
+            klas=CleanupTaskRecord,
+        )
+        self.cleanup_due = koming.Komer(
+            db=self,
+            subkey="cdue.",
+            klas=CleanupDueRecord,
+        )
+        self.leases = koming.Komer(
+            db=self,
+            subkey="leas.",
+            klas=LeaseRecord,
         )
 
         return self.env

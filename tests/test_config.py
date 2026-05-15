@@ -138,6 +138,36 @@ def test_config_from_env_parses_account_delete_quota(monkeypatch):
     assert config.bootstrap_api_requests_per_minute == 3
 
 
+def test_config_from_env_parses_cleanup_settings(monkeypatch):
+    monkeypatch.setenv(
+        "KF_BOOT_WITNESS_BACKENDS",
+        "wit-1|http://127.0.0.1:5631|https://boot.example.com:5632",
+    )
+    monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
+    monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example")
+    monkeypatch.setenv("KF_BOOT_CLEANUP_INTERVAL_SECONDS", "15")
+    monkeypatch.setenv("KF_BOOT_CLEANUP_BATCH_SIZE", "7")
+    monkeypatch.setenv("KF_BOOT_CLEANUP_TIME_BUDGET_SECONDS", "3")
+    monkeypatch.setenv("KF_BOOT_CLEANUP_TASK_CLAIM_TTL_SECONDS", "33")
+    monkeypatch.setenv("KF_BOOT_CLEANUP_LEADER_TTL_SECONDS", "77")
+    monkeypatch.setenv("KF_BOOT_CLEANUP_FAILURE_BACKOFF_SECONDS", "45")
+    monkeypatch.setenv("KF_BOOT_CLEANUP_FAILURE_BACKOFF_MAX_SECONDS", "300")
+    monkeypatch.setenv("KF_BOOT_CLEANUP_FAILURE_JITTER_SECONDS", "2")
+    monkeypatch.setenv("KF_BOOT_EXPIRED_ACCOUNT_RETENTION_SECONDS", "120")
+
+    config = Config.from_env()
+
+    assert config.cleanup_interval_seconds == 15
+    assert config.cleanup_batch_size == 7
+    assert config.cleanup_time_budget_seconds == 3
+    assert config.cleanup_task_claim_ttl_seconds == 33
+    assert config.cleanup_leader_ttl_seconds == 77
+    assert config.cleanup_failure_backoff_seconds == 45
+    assert config.cleanup_failure_backoff_max_seconds == 300
+    assert config.cleanup_failure_jitter_seconds == 2
+    assert config.expired_account_retention_seconds == 120
+
+
 def test_config_from_env_rejects_malformed_account_profiles(monkeypatch):
     """Tests that malformed account profile entries are rejected with a clear error message."""
 

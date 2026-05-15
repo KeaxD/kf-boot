@@ -231,10 +231,40 @@ class Config:
     account_profiles: tuple[AccountProfile, ...] = ()
     witness_backends: tuple[WitnessBackend, ...] = ()
     bootstrap_api_requests_per_minute: int = 10
+    cleanup_runner_enabled: bool = True
+    cleanup_interval_seconds: float = 60.0
+    cleanup_batch_size: int = 100
+    cleanup_time_budget_seconds: float = 5.0
+    cleanup_task_claim_ttl_seconds: float = 300.0
+    cleanup_leader_ttl_seconds: float = 120.0
+    cleanup_failure_backoff_seconds: float = 60.0
+    cleanup_failure_backoff_max_seconds: float = 900.0
+    cleanup_failure_jitter_seconds: float = 5.0
+    expired_account_retention_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if self.bootstrap_api_requests_per_minute < 0:
             raise ValueError("bootstrap_api_requests_per_minute must be greater than or equal to 0.")
+        if self.cleanup_batch_size <= 0:
+            raise ValueError("cleanup_batch_size must be greater than 0.")
+        if self.cleanup_time_budget_seconds <= 0:
+            raise ValueError("cleanup_time_budget_seconds must be greater than 0.")
+        if self.cleanup_task_claim_ttl_seconds <= 0:
+            raise ValueError("cleanup_task_claim_ttl_seconds must be greater than 0.")
+        if self.cleanup_leader_ttl_seconds <= 0:
+            raise ValueError("cleanup_leader_ttl_seconds must be greater than 0.")
+        if self.cleanup_failure_backoff_seconds < 0:
+            raise ValueError("cleanup_failure_backoff_seconds must be greater than or equal to 0.")
+        if self.cleanup_failure_backoff_max_seconds < self.cleanup_failure_backoff_seconds:
+            raise ValueError(
+                "cleanup_failure_backoff_max_seconds must be greater than or equal to cleanup_failure_backoff_seconds."
+            )
+        if self.cleanup_failure_jitter_seconds < 0:
+            raise ValueError("cleanup_failure_jitter_seconds must be greater than or equal to 0.")
+        if self.expired_account_retention_seconds < 0:
+            raise ValueError("expired_account_retention_seconds must be greater than or equal to 0.")
+        if self.cleanup_interval_seconds < 0:
+            raise ValueError("cleanup_interval_seconds must be greater than or equal to 0.")
 
         backends = tuple(self.witness_backends)
         if not backends:
@@ -319,6 +349,16 @@ class Config:
             f"Account Profiles: {', '.join(f'{profile.code} (tier={profile.tier})' for profile in account_profiles)}\n"
             f"Bootstrap Account per IP: {self.bootstrap_accounts_per_ip}\n"
             f"Bootstrap API requests per minute: {self.bootstrap_api_requests_per_minute}\n"
+            f"Cleanup runner enabled: {self.cleanup_runner_enabled}\n"
+            f"Cleanup interval seconds: {self.cleanup_interval_seconds}\n"
+            f"Cleanup batch size: {self.cleanup_batch_size}\n"
+            f"Cleanup time budget seconds: {self.cleanup_time_budget_seconds}\n"
+            f"Cleanup task claim ttl seconds: {self.cleanup_task_claim_ttl_seconds}\n"
+            f"Cleanup leader ttl seconds: {self.cleanup_leader_ttl_seconds}\n"
+            f"Cleanup failure backoff seconds: {self.cleanup_failure_backoff_seconds}\n"
+            f"Cleanup failure backoff max seconds: {self.cleanup_failure_backoff_max_seconds}\n"
+            f"Cleanup failure jitter seconds: {self.cleanup_failure_jitter_seconds}\n"
+            f"Expired account retention seconds: {self.expired_account_retention_seconds}\n"
         )
 
     def account_option(self, code: str) -> dict[str, int | str] | None:
@@ -402,5 +442,36 @@ class Config:
             witness_backends=witness_backends,
             bootstrap_api_requests_per_minute=int(
                 _env("BOOTSTRAP_API_REQUESTS_PER_MINUTE", "10")
+            ),
+            cleanup_runner_enabled=_parse_bool(
+                _env("CLEANUP_RUNNER_ENABLED", "true"),
+                True,
+            ),
+            cleanup_interval_seconds=float(
+                _env("CLEANUP_INTERVAL_SECONDS", "60")
+            ),
+            cleanup_batch_size=int(
+                _env("CLEANUP_BATCH_SIZE", "100")
+            ),
+            cleanup_time_budget_seconds=float(
+                _env("CLEANUP_TIME_BUDGET_SECONDS", "5")
+            ),
+            cleanup_task_claim_ttl_seconds=float(
+                _env("CLEANUP_TASK_CLAIM_TTL_SECONDS", "300")
+            ),
+            cleanup_leader_ttl_seconds=float(
+                _env("CLEANUP_LEADER_TTL_SECONDS", "120")
+            ),
+            cleanup_failure_backoff_seconds=float(
+                _env("CLEANUP_FAILURE_BACKOFF_SECONDS", "60")
+            ),
+            cleanup_failure_backoff_max_seconds=float(
+                _env("CLEANUP_FAILURE_BACKOFF_MAX_SECONDS", "900")
+            ),
+            cleanup_failure_jitter_seconds=float(
+                _env("CLEANUP_FAILURE_JITTER_SECONDS", "5")
+            ),
+            expired_account_retention_seconds=float(
+                _env("EXPIRED_ACCOUNT_RETENTION_SECONDS", "0")
             ),
         )
