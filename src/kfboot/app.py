@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import falcon
+from keri import help
 from keri.app.configing import Configer
 from keri.app.habbing import Habery
 from keri.core import Parser
@@ -17,6 +18,8 @@ from kfboot.config import Config
 from kfboot.onboarding import CesrSurfaceEnd
 from kfboot.store import Store
 
+
+logger = help.ogler.getLogger(__name__)
 
 DEFAULT_KRAM_CONFIG = {
     "kram": {
@@ -46,14 +49,20 @@ class Context:
     watcher_boot: BootClient
     habery: Habery
     host_hab: Any
-    kramer: Kramer
-    kvy: Kevery
-    parser: Parser
-    exchanger: BootExchanger
+    kramer: Kramer | None
+    kvy: Kevery | None
+    parser: Parser | None
+    exchanger: BootExchanger | None
 
     def close(self, *, clear: bool = False) -> None:
+        logger.info(
+            "App Context is closing",
+        )
         self.store.close()
         self.habery.close(clear=clear)
+        logger.info(
+            "App context closed",
+        )
 
 
 class HealthEnd:
@@ -87,6 +96,9 @@ class BootstrapConfigEnd:
 
 def create_app(config: Config | None = None, *, temp: bool = False) -> tuple[falcon.App, Context]:
     config = config or Config.from_env()
+    logger.info(
+        "App config loaded and app is starting"
+    )
     store = Store(config.db_path, session_ttl_seconds=config.session_ttl_seconds)
     cf = Configer(
         name=config.keri_name,
@@ -119,10 +131,10 @@ def create_app(config: Config | None = None, *, temp: bool = False) -> tuple[fal
         watcher_boot=BootClient(config.wat_boot_url),
         habery=hby,
         host_hab=host_hab,
-        kramer=None,  # type: ignore[arg-type]
-        kvy=None,  # type: ignore[arg-type]
-        parser=None,  # type: ignore[arg-type]
-        exchanger=None,  # type: ignore[arg-type]
+        kramer=None,
+        kvy=None,
+        parser=None,
+        exchanger=None,
     )
 
     exchanger = BootExchanger(
@@ -158,5 +170,8 @@ def create_app(config: Config | None = None, *, temp: bool = False) -> tuple[fal
     app.add_route("/bootstrap/config", BootstrapConfigEnd(ctx))
     app.add_route(config.onboarding_path, CesrSurfaceEnd(ctx, surface="onboarding"))
     app.add_route(config.account_path, CesrSurfaceEnd(ctx, surface="account"))
+    logger.info(
+        "App routes registered and ready to serve requests",
+    )
 
     return app, ctx

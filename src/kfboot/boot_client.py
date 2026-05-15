@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from keri import help
+
 try:
     import requests
 except ImportError:  # pragma: no cover - exercised only in thin local test envs
     requests = None
 
+logger = help.ogler.getLogger(__name__)
 
 class BootError(RuntimeError):
     """Raised when a boot API call fails."""
@@ -21,18 +24,18 @@ class BootClient:
     base_url: str
     timeout: int = 10
 
-    def allocate_witness(self, account_aid: str) -> dict:
+    def allocateWitness(self, account_aid: str) -> dict:
         """Allocate a hosted witness for the permanent account AID."""
 
         return self._json("POST", "/witnesses", json={"aid": account_aid})
 
-    def create_witness(self, cid: str) -> dict:
-        return self.allocate_witness(cid)
+    def createWitness(self, cid: str) -> dict:
+        return self.allocateWitness(cid)
 
-    def delete_witness(self, eid: str) -> None:
+    def deleteWitness(self, eid: str) -> None:
         self._empty("DELETE", f"/witnesses/{eid}")
 
-    def allocate_watcher(self, account_aid: str, oobi: str | None = None) -> dict:
+    def allocateWatcher(self, account_aid: str, oobi: str | None = None) -> dict:
         """Allocate a hosted watcher for the permanent account AID."""
 
         payload = {"aid": account_aid}
@@ -40,13 +43,13 @@ class BootClient:
             payload["oobi"] = oobi
         return self._json("POST", "/watchers", json=payload)
 
-    def create_watcher(self, cid: str, oobi: str | None = None) -> dict:
-        return self.allocate_watcher(cid, oobi=oobi)
+    def createWatcher(self, cid: str, oobi: str | None = None) -> dict:
+        return self.allocateWatcher(cid, oobi=oobi)
 
-    def delete_watcher(self, eid: str) -> None:
+    def deleteWatcher(self, eid: str) -> None:
         self._empty("DELETE", f"/watchers/{eid}")
 
-    def watcher_status(self, eid: str) -> dict:
+    def watcherStatus(self, eid: str) -> dict:
         return self._json("GET", f"/watchers/{eid}/status")
 
     def _json(self, method: str, path: str, json: dict | None = None) -> dict:
@@ -66,8 +69,14 @@ class BootClient:
         self, method: str, path: str, json: dict | None = None
     ):
         if requests is None:
+            logger.error(
+                "Boot API client cannot make request because requests library is not available",
+            )
             raise BootError("requests is required to call the downstream boot API")
         url = f"{self.base_url}{path}"
+        logger.debug(
+            "Boot API request starting",
+        )
         try:
             response = requests.request(
                 method,
@@ -76,10 +85,19 @@ class BootClient:
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
+            logger.warning(
+                f"BOOT API request failed due to request exception error: `{exc}`",
+            )
             raise BootError(f"Boot API request failed: {exc}") from exc
 
         if response.status_code >= 400:
             description = response.text.strip() or f"HTTP {response.status_code}"
+            logger.warning(
+                f"BOOT API request failed: `{description}`",
+            )
             raise BootError(description, status_code=response.status_code)
 
+        logger.info(
+            f"BOOT API request succeeded: `{response}`",
+        )
         return response

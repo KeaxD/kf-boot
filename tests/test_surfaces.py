@@ -6,7 +6,6 @@ from keri.app.httping import CESR_ATTACHMENT_HEADER, CESR_CONTENT_TYPE
 from keri.core import eventing
 
 from .support import (
-    assert_reply_frame,
     build_exn,
     build_signed_serder,
     make_witness_backends,
@@ -102,6 +101,29 @@ def test_cesr_ingress_rejects_missing_state_attachment_signature_and_malformed_b
     )
     assert malformed.status_code == 400
     assert malformed.json["title"] == "Malformed JSON"
+
+
+def test_internal_route_handler_attribute_errors_do_not_fall_through_as_request_rejected(contract, monkeypatch):
+    with habbing.openHab(name="handler-attribute-error", temp=True, transferable=False) as (_, ephemeral):
+        register_aid(contract, "/onboarding", ephemeral)
+        _, _, start_reply = start_session(contract, ephemeral)
+
+        def brokenRequireSession(_session_id):
+            raise AttributeError("simulated internal rename miss")
+
+        monkeypatch.setattr(contract.ctx.exchanger, "requireSession", brokenRequireSession)
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(
+                ephemeral,
+                route="/onboarding/session/status",
+                payload={"session_id": start_reply.ked["a"]["session_id"]},
+            ),
+        )
+
+    assert response.status_code == 500
+    assert response.json["title"] == "Route handler failed"
 
 
 def test_cesr_ingress_rejects_unsupported_content_type(contract):

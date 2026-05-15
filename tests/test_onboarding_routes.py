@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from types import SimpleNamespace
+import falcon
 import pytest
 from keri.app import habbing
 
 from kfboot.basing import (
     ACCOUNT_STATE_FAILED,
     ACCOUNT_STATE_ONBOARDED,
+    ACCOUNT_STATE_EXPIRED,
     ACCOUNT_STATE_PENDING_ONBOARDING,
     SESSION_STATE_ACCOUNT_CREATED,
     SESSION_STATE_CANCELLED,
@@ -14,6 +19,8 @@ from kfboot.basing import (
     SESSION_STATE_FAILED,
     SESSION_STATE_WITNESS_POOL_ALLOCATED,
 )
+from kfboot.config import AccountProfile
+from kfboot.limiting import Limiter
 from .support import (
     FakeWatcherBoot,
     account_create_payload,
@@ -22,6 +29,7 @@ from .support import (
     build_exn,
     complete_session,
     create_account,
+    freeze_boot_time,
     make_witness_backends,
     post_cesr,
     register_aid,
@@ -30,7 +38,9 @@ from .support import (
     total_witness_create_calls,
     total_witness_created_eids,
     total_witness_delete_calls,
+    make_config,
 )
+from kfboot.store import Store
 
 
 def test_onboarding_flow_persists_state_transitions_and_bound_resources(contract):
@@ -47,14 +57,14 @@ def test_onboarding_flow_persists_state_transitions_and_bound_resources(contract
         assert "boot_url" in start_reply.ked["a"]["witnesses"][0]
         assert "boot_url" in start_reply.ked["a"]["watcher"]
 
-        session = contract.ctx.store.get_session(session_id)
+        session = contract.ctx.store.getSession(session_id)
         assert session.state == SESSION_STATE_WITNESS_POOL_ALLOCATED
         assert session.witness_eids == [witness_id]
         assert session.watcher_eid == watcher_id
-        assert contract.ctx.store.get_resource("witness", witness_id).principal == ""
-        assert contract.ctx.store.get_resource("witness", witness_id).cid == ""
-        assert contract.ctx.store.get_resource("watcher", watcher_id).principal == ""
-        assert contract.ctx.store.get_resource("watcher", watcher_id).cid == ""
+        assert contract.ctx.store.getResource("witness", witness_id).principal == ""
+        assert contract.ctx.store.getResource("witness", witness_id).cid == ""
+        assert contract.ctx.store.getResource("watcher", watcher_id).principal == ""
+        assert contract.ctx.store.getResource("watcher", watcher_id).cid == ""
 
         status_response = post_cesr(
             contract,
@@ -73,15 +83,15 @@ def test_onboarding_flow_persists_state_transitions_and_bound_resources(contract
         _, _, create_reply = create_account(contract, ephemeral, start_reply, account_aid=account.pre)
         assert create_reply.ked["a"]["account"]["account_aid"] == account.pre
 
-        session = contract.ctx.store.get_session(session_id)
-        account_record = contract.ctx.store.get_account(account.pre)
+        session = contract.ctx.store.getSession(session_id)
+        account_record = contract.ctx.store.getAccount(account.pre)
         assert session.state == SESSION_STATE_ACCOUNT_CREATED
         assert session.account_aid == account.pre
         assert account_record.status == ACCOUNT_STATE_PENDING_ONBOARDING
-        assert contract.ctx.store.get_resource("witness", witness_id).principal == account.pre
-        assert contract.ctx.store.get_resource("witness", witness_id).cid == account.pre
-        assert contract.ctx.store.get_resource("watcher", watcher_id).principal == account.pre
-        assert contract.ctx.store.get_resource("watcher", watcher_id).cid == account.pre
+        assert contract.ctx.store.getResource("witness", witness_id).principal == account.pre
+        assert contract.ctx.store.getResource("witness", witness_id).cid == account.pre
+        assert contract.ctx.store.getResource("watcher", watcher_id).principal == account.pre
+        assert contract.ctx.store.getResource("watcher", watcher_id).cid == account.pre
 
         _, _, complete_reply = complete_session(
             contract,
@@ -91,8 +101,8 @@ def test_onboarding_flow_persists_state_transitions_and_bound_resources(contract
         )
         assert complete_reply.ked["a"]["state"] == SESSION_STATE_COMPLETED
 
-        session = contract.ctx.store.get_session(session_id)
-        account_record = contract.ctx.store.get_account(account.pre)
+        session = contract.ctx.store.getSession(session_id)
+        account_record = contract.ctx.store.getAccount(account.pre)
         assert session.state == SESSION_STATE_COMPLETED
         assert account_record.status == ACCOUNT_STATE_ONBOARDED
         assert account_record.onboarded_at
@@ -104,9 +114,9 @@ def test_session_start_is_idempotent_and_does_not_duplicate_allocations(contract
 
         _, _, first = start_session(contract, ephemeral, chosen_profile_code="3-of-4")
         _, _, second = start_session(contract, ephemeral, chosen_profile_code="3-of-4")
-        session = contract.ctx.store.get_session(first.ked["a"]["session_id"])
+        session = contract.ctx.store.getSession(first.ked["a"]["session_id"])
         records = [
-            contract.ctx.store.get_resource("witness", row["eid"])
+            contract.ctx.store.getResource("witness", row["eid"])
             for row in first.ked["a"]["witnesses"]
         ]
         backend_ids = [record.backend_id for record in records]
@@ -118,8 +128,8 @@ def test_session_start_is_idempotent_and_does_not_duplicate_allocations(contract
         assert session.witness_backend_ids == backend_ids
         assert total_witness_create_calls(contract.ctx) == 4
         assert contract.ctx.watcher_boot.create_calls == 1
-        assert contract.ctx.store.count_resources("witness") == 4
-        assert contract.ctx.store.count_resources("watcher") == 1
+        assert contract.ctx.store.countResources("witness") == 4
+        assert contract.ctx.store.countResources("watcher") == 1
         for backend_id in session.witness_backend_ids:
             assert contract.ctx.witness_boots[backend_id].create_cids == ["AID_ACCOUNT"]
         for record in records:
@@ -133,7 +143,7 @@ def test_session_start_is_idempotent_and_does_not_duplicate_allocations(contract
             assert record.cid == ""
             assert record.principal == ""
 
-        watcher_record = contract.ctx.store.get_resource("watcher", first.ked["a"]["watcher"]["eid"])
+        watcher_record = contract.ctx.store.getResource("watcher", first.ked["a"]["watcher"]["eid"])
         assert watcher_record.cid == ""
         assert watcher_record.principal == ""
         assert contract.ctx.watcher_boot.create_cids == ["AID_ACCOUNT"]
@@ -158,7 +168,7 @@ def test_session_start_rejects_fresh_ephemeral_retry_for_active_account(contract
     assert response.json["title"] == "Account session already active"
     assert total_witness_create_calls(contract.ctx) == 1
     assert contract.ctx.watcher_boot.create_calls == 1
-    session = contract.ctx.store.get_session(first.ked["a"]["session_id"])
+    session = contract.ctx.store.getSession(first.ked["a"]["session_id"])
     assert session.ephemeral_aid == owner.pre
 
 
@@ -192,9 +202,9 @@ def test_session_start_rejects_closed_existing_session_without_new_allocations(c
         register_aid(contract, "/onboarding", ephemeral)
         _, _, start_reply = start_session(contract, ephemeral)
         session_id = start_reply.ked["a"]["session_id"]
-        session = contract.ctx.store.get_session(session_id)
+        session = contract.ctx.store.getSession(session_id)
         session.state = state
-        contract.ctx.store.save_session(session)
+        contract.ctx.store.saveSession(session)
 
         response = post_cesr(
             contract,
@@ -204,7 +214,7 @@ def test_session_start_rejects_closed_existing_session_without_new_allocations(c
 
     assert response.status_code == 409
     assert response.json["title"] == "Session closed"
-    assert contract.ctx.store.get_session(session_id).state == state
+    assert contract.ctx.store.getSession(session_id).state == state
     assert total_witness_create_calls(contract.ctx) == 1
     assert contract.ctx.watcher_boot.create_calls == 1
 
@@ -223,7 +233,7 @@ def test_session_start_retry_parameter_mismatch_conflicts_without_new_allocation
         register_aid(contract, "/onboarding", ephemeral)
         _, _, first = start_session(contract, ephemeral)
         session_id = first.ked["a"]["session_id"]
-        original_session = contract.ctx.store.get_session(session_id)
+        original_session = contract.ctx.store.getSession(session_id)
 
         retry_payload = start_payload()
         retry_payload[field] = value
@@ -237,7 +247,7 @@ def test_session_start_retry_parameter_mismatch_conflicts_without_new_allocation
         assert response.json["title"] == "Session parameter mismatch"
         assert total_witness_create_calls(contract.ctx) == 1
         assert contract.ctx.watcher_boot.create_calls == 1
-        assert contract.ctx.store.get_session(session_id).account_alias == original_session.account_alias
+        assert contract.ctx.store.getSession(session_id).account_alias == original_session.account_alias
 
 
 def test_session_start_retry_rejects_watcher_requirement_mismatch_when_optional(contract_factory):
@@ -281,7 +291,7 @@ def test_session_start_rejects_invalid_profile_and_missing_required_watcher(cont
 
         assert response.status_code == 400
         assert response.json["title"] == expected_title
-        assert contract.ctx.store.find_active_session_for_ephemeral(ephemeral.pre) is None
+        assert contract.ctx.store.findActiveSessionForEphemeral(ephemeral.pre) is None
 
 
 def test_session_start_rejects_profile_not_supported_by_configured_witness_pool(contract_factory):
@@ -301,7 +311,7 @@ def test_session_start_rejects_profile_not_supported_by_configured_witness_pool(
 
     assert response.status_code == 400
     assert response.json["title"] == "Unsupported witness profile"
-    assert contract.ctx.store.find_active_session_for_ephemeral(ephemeral.pre) is None
+    assert contract.ctx.store.findActiveSessionForEphemeral(ephemeral.pre) is None
 
 
 def test_session_status_requires_existing_session_and_onboarding_principal(contract):
@@ -336,9 +346,9 @@ def test_session_status_refreshes_session_lease(contract):
         register_aid(contract, "/onboarding", ephemeral)
         _, _, start_reply = start_session(contract, ephemeral)
         session_id = start_reply.ked["a"]["session_id"]
-        session = contract.ctx.store.get_session(session_id)
+        session = contract.ctx.store.getSession(session_id)
         session.expires_at = "2099-01-01T00:00:00+00:00"
-        contract.ctx.store.save_session(session)
+        contract.ctx.store.saveSession(session)
 
         response = post_cesr(
             contract,
@@ -351,11 +361,11 @@ def test_session_status_refreshes_session_lease(contract):
         )
         assert response.status_code == 200
 
-        refreshed = contract.ctx.store.get_session(session_id)
+        refreshed = contract.ctx.store.getSession(session_id)
         assert refreshed.expires_at != "2099-01-01T00:00:00+00:00"
 
 
-def test_partial_downstream_failure_marks_session_failed_and_blind_retry_does_not_duplicate_resources(contract_factory):
+def test_partial_downstream_failure_marks_sessionFailed_and_blind_retry_does_not_duplicate_resources(contract_factory):
     contract = contract_factory(
         watcher_boot=FakeWatcherBoot(create_error=boot_error(502, "simulated watcher failure"))
     )
@@ -374,14 +384,14 @@ def test_partial_downstream_failure_marks_session_failed_and_blind_retry_does_no
         )
         assert response.status_code == 502
 
-        session = contract.ctx.store.find_active_session_for_ephemeral(ephemeral.pre)
+        session = contract.ctx.store.findActiveSessionForEphemeral(ephemeral.pre)
         assert session.state == SESSION_STATE_FAILED
         assert session.witness_eids == []
         assert session.watcher_eid == ""
         assert total_witness_create_calls(contract.ctx) == 4
         assert contract.ctx.watcher_boot.create_calls == 1
-        assert contract.ctx.store.count_resources("witness") == 0
-        assert contract.ctx.store.count_resources("watcher") == 0
+        assert contract.ctx.store.countResources("witness") == 0
+        assert contract.ctx.store.countResources("watcher") == 0
         assert sorted(total_witness_delete_calls(contract.ctx)) == sorted(total_witness_created_eids(contract.ctx))
 
         retry = post_cesr(
@@ -412,9 +422,9 @@ def test_expired_sessions_reclaim_hosted_resources_and_fail_pending_account(cont
         witness_id = start_reply.ked["a"]["witnesses"][0]["eid"]
         watcher_id = start_reply.ked["a"]["watcher"]["eid"]
 
-        expired = contract.ctx.store.get_session(session_id)
+        expired = contract.ctx.store.getSession(session_id)
         expired.expires_at = "2024-01-01T00:00:00+00:00"
-        contract.ctx.store.save_session(expired)
+        contract.ctx.store.saveSession(expired)
 
         register_aid(contract, "/onboarding", next_ephemeral)
         response = post_cesr(
@@ -425,12 +435,12 @@ def test_expired_sessions_reclaim_hosted_resources_and_fail_pending_account(cont
 
         assert response.status_code == 200
 
-        expired = contract.ctx.store.get_session(session_id)
-        account_record = contract.ctx.store.get_account(account.pre)
+        expired = contract.ctx.store.getSession(session_id)
+        account_record = contract.ctx.store.getAccount(account.pre)
         assert expired.state == SESSION_STATE_EXPIRED
         assert account_record.status == ACCOUNT_STATE_FAILED
-        assert contract.ctx.store.get_resource("witness", witness_id) is None
-        assert contract.ctx.store.get_resource("watcher", watcher_id) is None
+        assert contract.ctx.store.getResource("witness", witness_id) is None
+        assert contract.ctx.store.getResource("watcher", watcher_id) is None
         assert witness_id in total_witness_delete_calls(contract.ctx)
         assert watcher_id in contract.ctx.watcher_boot.delete_calls
 
@@ -447,11 +457,11 @@ def test_session_start_enforces_witness_capacity(contract_factory):
         )
 
     assert response.status_code == 409
-    session = contract.ctx.store.find_active_session_for_ephemeral(ephemeral.pre)
+    session = contract.ctx.store.findActiveSessionForEphemeral(ephemeral.pre)
     assert session.state == SESSION_STATE_FAILED
     assert session.witness_eids == []
     assert session.watcher_eid == ""
-    assert contract.ctx.store.count_resources("witness") == 0
+    assert contract.ctx.store.countResources("witness") == 0
 
 
 def test_session_start_enforces_watcher_capacity_without_duplicate_witnesses(contract_factory):
@@ -466,12 +476,12 @@ def test_session_start_enforces_watcher_capacity_without_duplicate_witnesses(con
         )
         assert response.status_code == 409
 
-        session = contract.ctx.store.find_active_session_for_ephemeral(ephemeral.pre)
+        session = contract.ctx.store.findActiveSessionForEphemeral(ephemeral.pre)
         assert session.state == SESSION_STATE_FAILED
         assert session.witness_eids == []
         assert session.watcher_eid == ""
-        assert contract.ctx.store.count_resources("witness") == 0
-        assert contract.ctx.store.count_resources("watcher") == 0
+        assert contract.ctx.store.countResources("witness") == 0
+        assert contract.ctx.store.countResources("watcher") == 0
         assert len(total_witness_delete_calls(contract.ctx)) == 1
 
         retry = post_cesr(
@@ -539,6 +549,515 @@ def test_session_start_enforces_per_ip_onboarding_principal_limit(contract_facto
     assert response.json["title"] == "Per-IP onboarding principal limit exceeded"
 
 
+def test_session_start_does_not_consume_onboarded_account_quota(contract_factory):
+    """Test using someone else's AID does not burn their quotas."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=10,
+        bootstrap_aids_per_ip=10,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=100,
+                max_requests_per_minute=1,
+                api_budget=100,
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="quota-victim-ephemeral", temp=True, transferable=False) as (_, victim_ephemeral),
+        habbing.openHab(name="quota-victim-account", temp=True) as (_, victim_account),
+        habbing.openHab(name="quota-attacker-ephemeral", temp=True, transferable=False) as (_, attacker),
+    ):
+        register_aid(contract, "/onboarding", victim_ephemeral)
+        register_aid(contract, "/onboarding", attacker)
+        register_aid(contract, "/account", victim_account)
+
+        _, _, start_reply = start_session(contract, victim_ephemeral, account_aid=victim_account.pre)
+        create_account(contract, victim_ephemeral, start_reply, account_aid=victim_account.pre)
+        complete_session(
+            contract,
+            victim_ephemeral,
+            session_id=start_reply.ked["a"]["session_id"],
+            account_aid=victim_account.pre,
+        )
+
+        rejected = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(
+                attacker,
+                route="/onboarding/session/start",
+                payload=start_payload(account_aid=victim_account.pre),
+            ),
+        )
+        assert rejected.status_code == 409
+        assert rejected.json["title"] == "Account already onboarded"
+
+        allowed = post_cesr(
+            contract,
+            "/account",
+            build_exn(victim_account, route="/account/witnesses", payload={"account_aid": victim_account.pre}),
+        )
+
+    assert allowed.status_code == 200
+
+
+def test_account_route_request_rate_limit_resets_after_minute(contract_factory, monkeypatch):
+    """Test validated account-route throttles clear when the minute window rolls over."""
+    clock = freeze_boot_time(monkeypatch, datetime(2026, 1, 1, tzinfo=UTC))
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=10,
+        bootstrap_aids_per_ip=10,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=100,
+                max_requests_per_minute=2,
+                api_budget=100,
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="account-rate-rollover-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name="account-rate-rollover-account", temp=True) as (_, account),
+    ):
+        register_aid(contract, "/onboarding", ephemeral)
+        register_aid(contract, "/account", account)
+        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
+        create_account(contract, ephemeral, start_reply, account_aid=account.pre)
+        complete_session(
+            contract,
+            ephemeral,
+            session_id=start_reply.ked["a"]["session_id"],
+            account_aid=account.pre,
+        )
+
+        first = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+        assert first.status_code == 200
+
+        second = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+        assert second.status_code == 200
+
+        rejected = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+        assert rejected.status_code == 429
+        assert rejected.json["title"] == "Account request rate limit exceeded"
+
+        clock.value += timedelta(seconds=61)
+        accepted = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+
+    assert accepted.status_code == 200
+
+
+def test_account_route_request_rate_limit_is_scoped_per_account(contract_factory):
+    """One account exhausting its validated route quota must not throttle another account."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=10,
+        bootstrap_aids_per_ip=10,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=100,
+                max_requests_per_minute=2,
+                api_budget=100,
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="account-rate-a-ephemeral", temp=True, transferable=False) as (_, first_ephemeral),
+        habbing.openHab(name="account-rate-a-account", temp=True) as (_, first_account),
+        habbing.openHab(name="account-rate-b-ephemeral", temp=True, transferable=False) as (_, second_ephemeral),
+        habbing.openHab(name="account-rate-b-account", temp=True) as (_, second_account),
+    ):
+        register_aid(contract, "/onboarding", first_ephemeral)
+        register_aid(contract, "/account", first_account)
+        register_aid(contract, "/onboarding", second_ephemeral)
+        register_aid(contract, "/account", second_account)
+
+        _, _, first_start = start_session(
+            contract,
+            first_ephemeral,
+            account_aid=first_account.pre,
+            account_alias="alpha-a",
+        )
+        create_account(contract, first_ephemeral, first_start, account_aid=first_account.pre)
+        complete_session(
+            contract,
+            first_ephemeral,
+            session_id=first_start.ked["a"]["session_id"],
+            account_aid=first_account.pre,
+        )
+
+        _, _, second_start = start_session(
+            contract,
+            second_ephemeral,
+            account_aid=second_account.pre,
+            account_alias="alpha-b",
+        )
+        create_account(contract, second_ephemeral, second_start, account_aid=second_account.pre)
+        complete_session(
+            contract,
+            second_ephemeral,
+            session_id=second_start.ked["a"]["session_id"],
+            account_aid=second_account.pre,
+        )
+
+        first = post_cesr(
+            contract,
+            "/account",
+            build_exn(first_account, route="/account/witnesses", payload={"account_aid": first_account.pre}),
+        )
+        assert first.status_code == 200
+
+        second = post_cesr(
+            contract,
+            "/account",
+            build_exn(first_account, route="/account/witnesses", payload={"account_aid": first_account.pre}),
+        )
+        assert second.status_code == 200
+
+        rejected = post_cesr(
+            contract,
+            "/account",
+            build_exn(first_account, route="/account/witnesses", payload={"account_aid": first_account.pre}),
+        )
+        assert rejected.status_code == 429
+        assert rejected.json["title"] == "Account request rate limit exceeded"
+
+        accepted = post_cesr(
+            contract,
+            "/account",
+            build_exn(second_account, route="/account/witnesses", payload={"account_aid": second_account.pre}),
+        )
+
+    assert accepted.status_code == 200
+
+
+def test_onboarding_request_quota_blocks_client_ip_for_configured_period(contract_factory, monkeypatch):
+    """Verify onboarding request throttles are enforced per client IP before account-specific quotas."""
+    clock = freeze_boot_time(monkeypatch, datetime(2026, 1, 1, tzinfo=UTC))
+    blocked_ip = "198.51.100.10"
+    other_ip = "198.51.100.11"
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=10,
+        bootstrap_aids_per_ip=10,
+        bootstrap_api_requests_per_minute=2,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=100,
+                max_requests_per_minute=100,
+                api_budget=100,
+            ),
+        ),
+    )
+
+    with habbing.openHab(name="onboarding-ip-quota", temp=True, transferable=False) as (_, ephemeral):
+        register_aid(contract, "/onboarding", ephemeral)
+
+        # Make 2 requests for onboarding
+        started = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+            remote_addr=blocked_ip,
+        )
+        _, start_reply = assert_reply_frame(contract, started, route="/onboarding/session/start")
+        session_id = start_reply.ked["a"]["session_id"]
+
+        accepted = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/status", payload={"session_id": session_id}),
+            remote_addr=blocked_ip,
+        )
+        assert accepted.status_code == 200
+
+        contract.ctx.exchanger.limiter = Limiter(contract.ctx)
+
+        # Third request gets rejected
+        rejected = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/status", payload={"session_id": session_id}),
+            remote_addr=blocked_ip,
+        )
+        assert rejected.status_code == 429
+        assert rejected.json["title"] == "Onboarding request rate limit exceeded"
+
+        # Try with another IP
+        scoped_to_ip = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/status", payload={"session_id": session_id}),
+            remote_addr=other_ip,
+        )
+
+        # Assert the other IP passes
+        assert scoped_to_ip.status_code == 200
+
+        # Move the clock
+        clock.value += timedelta(seconds=59)
+        still_blocked = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/status", payload={"session_id": session_id}),
+            remote_addr=blocked_ip,
+        )
+
+        # Still blocked because the minute window has not rolled over yet
+        assert still_blocked.status_code == 429
+
+        # Move past the minute window
+        clock.value += timedelta(seconds=2)
+        unblocked = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/status", payload={"session_id": session_id}),
+            remote_addr=blocked_ip,
+        )
+    # Assert it was unblocked
+    assert unblocked.status_code == 200
+
+def test_onboarding_request_quota_survives_store_reopen(tmp_path):
+    config = make_config(
+        tmp_path,
+        bootstrap_api_requests_per_minute=2,
+    )
+    store_path = config.db_path
+
+    first_store = Store(store_path, session_ttl_seconds=config.session_ttl_seconds)
+    try:
+        limiter = Limiter(SimpleNamespace(config=config, store=first_store))
+        limiter.enforceOnboardingRequestQuota(
+            route="/onboarding/session/start",
+            client_ip="198.51.100.20",
+        )
+        limiter.enforceOnboardingRequestQuota(
+            route="/onboarding/session/status",
+            client_ip="198.51.100.20",
+        )
+    finally:
+        first_store.close()
+
+    reopened_store = Store(store_path, session_ttl_seconds=config.session_ttl_seconds)
+    try:
+        limiter = Limiter(SimpleNamespace(config=config, store=reopened_store))
+        with pytest.raises(falcon.HTTPTooManyRequests) as excinfo:
+            limiter.enforceOnboardingRequestQuota(
+                route="/onboarding/account/create",
+                client_ip="198.51.100.20",
+            )
+
+        assert excinfo.value.title == "Onboarding request rate limit exceeded"
+    finally:
+        reopened_store.close()
+
+def test_session_start_rejects_account_alias_over_limit(contract_factory):
+    """Verify onboarding rejects a new session when the alias already has the max onboarded accounts."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=1,
+                max_requests_per_minute=100,
+                api_budget=100
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="alias-limit-ephemeral-1", temp=True, transferable=False) as (_, ephemeral1),
+        habbing.openHab(name="alias-limit-account-1", temp=True) as (_, account1),
+        habbing.openHab(name="alias-limit-ephemeral-2", temp=True, transferable=False) as (_, ephemeral2),
+    ):
+        register_aid(contract, "/onboarding", ephemeral1)
+        register_aid(contract, "/account", account1)
+
+        # Start and complete a session 
+        _, _, start_reply = start_session(contract, ephemeral1, account_aid=account1.pre)
+        create_account(contract, ephemeral1, start_reply, account_aid=account1.pre)
+        _, _, _ = complete_session(
+            contract,
+            ephemeral1,
+            session_id=start_reply.ked["a"]["session_id"],
+            account_aid=account1.pre,
+        )
+
+        register_aid(contract, "/onboarding", ephemeral2)
+
+        # Attempt to start a session with a different ephemeral but the same alias
+        # which should be rejected because the alias already has the max onboarded accounts
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral2, route="/onboarding/session/start", payload=start_payload(account_aid="AID_SECOND", account_alias="alpha")),
+        )
+
+    assert response.status_code == 429
+    assert response.json["title"] == "Account alias limit exceeded"
+    assert "configured limit for tier 'trial' is 1" in response.json["description"]
+
+
+def test_session_start_rejects_alias_when_existing_account_is_pending(contract_factory):
+    """Verify onboarding rejects a new session when the alias already has an account pending onboarding."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=1,
+                max_requests_per_minute=100,
+                api_budget=100
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="alias-pending-ephemeral-1", temp=True, transferable=False) as (_, ephemeral1),
+        habbing.openHab(name="alias-pending-account-1", temp=True) as (_, account1),
+        habbing.openHab(name="alias-pending-ephemeral-2", temp=True, transferable=False) as (_, ephemeral2),
+    ):
+        # Don't complete the session to leave the account in pending onboarding status
+        register_aid(contract, "/onboarding", ephemeral1)
+        register_aid(contract, "/account", account1)
+
+        _, _, start_reply = start_session(
+            contract,
+            ephemeral1,
+            account_aid=account1.pre,
+            account_alias="alpha",
+        )
+        
+        create_account(contract, ephemeral1, start_reply, account_aid=account1.pre)
+
+        # Register and start a session with a different ephemeral but the same alias
+        register_aid(contract, "/onboarding", ephemeral2)
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(
+                ephemeral2,
+                route="/onboarding/session/start",
+                payload=start_payload(account_aid="AID_SECOND", account_alias="alpha"),
+            ),
+        )
+    # Assert the second session is rejected due to the alias already having an account pending onboarding
+    assert response.status_code == 429
+    assert response.json["title"] == "Account alias limit exceeded"
+    assert "configured limit for tier 'trial' is 1" in response.json["description"]
+
+
+def test_account_create_rejects_expired_permanent_account(contract_factory):
+    """Verify that onboarding rejects account creation when the account is expired."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+    )
+
+    with (
+        habbing.openHab(name=f"expired-account-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name=f"expired-account", temp=True) as (_, account),
+    ):
+        # Onboard the account and then manually set it to the desired status
+        register_aid(contract, "/onboarding", ephemeral)
+        register_aid(contract, "/account", account)
+
+        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
+        create_account(contract, ephemeral, start_reply, account_aid=account.pre)
+
+        record = contract.ctx.store.getAccount(account.pre)
+        assert record is not None
+
+        # Set the account status to expired
+        record.status = 'expired'
+        contract.ctx.store.saveAccount(record)
+
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(
+                ephemeral,
+                route="/onboarding/account/create",
+                payload=account_create_payload(start_reply, account.pre),
+            ),
+        )
+    # Assert the account creation is rejected
+    assert response.status_code == 404
+    assert response.json["title"] == "Session not found"
+
+
+def test_expire_sessions_cleans_up_stale_staging_allocations(contract_factory, monkeypatch):
+    """Ensure expired staging sessions trigger cleanup of stale allocations."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+    )
+
+    session = contract.ctx.store.createSession(
+        ephemeral_aid="E-STALE",
+        account_aid="AID_STALE",
+        account_alias="alpha",
+        chosen_profile_code="1-of-1",
+        client_ip="127.0.0.1",
+        region_id="test-region",
+        region_name="Test Region",
+        watcher_required=True,
+        witness_count=1,
+        toad=1,
+        account_tier="trial",
+    )
+    session.expires_at = "2000-01-01T00:00:00+00:00"
+    contract.ctx.store.saveSession(session)
+
+    cleaned: list[tuple] = []
+
+    def fake_teardown(*, session: Any, account=None) -> None:
+        cleaned.append((session.session_id, account))
+
+    monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownSessionResources", fake_teardown)
+
+    contract.ctx.exchanger.expirer.expireSessions()
+
+    expired_session = contract.ctx.store.getSession(session.session_id)
+    assert expired_session is not None
+    assert expired_session.state == SESSION_STATE_EXPIRED
+    assert cleaned == [(session.session_id, None)]
+
+
 def test_account_create_rejects_wrong_onboarding_principal(contract):
     with (
         habbing.openHab(name="create-mismatch-ephemeral", temp=True, transferable=False) as (_, ephemeral),
@@ -561,16 +1080,16 @@ def test_account_create_rejects_wrong_onboarding_principal(contract):
 
         assert response.status_code == 401
         assert response.json["title"] == "Wrong onboarding principal"
-        session = contract.ctx.store.get_session(start_reply.ked["a"]["session_id"])
+        session = contract.ctx.store.getSession(start_reply.ked["a"]["session_id"])
         assert session.state == SESSION_STATE_WITNESS_POOL_ALLOCATED
 
 
-def test_account_create_marks_session_failed_when_resources_are_incomplete(contract):
+def test_account_create_marks_sessionFailed_when_resources_are_incomplete(contract):
     with (
         habbing.openHab(name="resources-incomplete-ephemeral", temp=True, transferable=False) as (_, ephemeral),
         habbing.openHab(name="resources-incomplete-account", temp=True) as (_, account),
     ):
-        session = contract.ctx.store.create_session(
+        session = contract.ctx.store.createSession(
             ephemeral_aid=ephemeral.pre,
             account_aid=account.pre,
             account_alias="alpha",
@@ -581,6 +1100,7 @@ def test_account_create_marks_session_failed_when_resources_are_incomplete(contr
             watcher_required=True,
             witness_count=1,
             toad=1,
+            account_tier="trial",
         )
         register_aid(contract, "/onboarding", ephemeral)
 
@@ -596,7 +1116,7 @@ def test_account_create_marks_session_failed_when_resources_are_incomplete(contr
 
         assert response.status_code == 409
         assert response.json["title"] == "Resources missing"
-        saved = contract.ctx.store.get_session(session.session_id)
+        saved = contract.ctx.store.getSession(session.session_id)
         assert saved.state == SESSION_STATE_FAILED
         assert "Hosted resources were not fully allocated" in saved.failure_reason
 
@@ -609,7 +1129,7 @@ def test_account_create_rejects_account_bound_to_other_session(contract):
         register_aid(contract, "/onboarding", ephemeral)
         _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
 
-        existing = contract.ctx.store.build_account(
+        existing = contract.ctx.store.buildAccount(
             account_aid=account.pre,
             account_alias="existing",
             witness_profile_code="1-of-1",
@@ -622,7 +1142,7 @@ def test_account_create_rejects_account_bound_to_other_session(contract):
             witness_eids=["W1"],
             watcher_eid="WA1",
         )
-        contract.ctx.store.save_account(existing)
+        contract.ctx.store.saveAccount(existing)
 
         response = post_cesr(
             contract,
@@ -652,7 +1172,7 @@ def test_account_create_rejects_closed_sessions(contract, state, expected_status
         habbing.openHab(name=f"closed-create-{state}-ephemeral", temp=True, transferable=False) as (_, ephemeral),
         habbing.openHab(name=f"closed-create-{state}-account", temp=True) as (_, account),
     ):
-        session = contract.ctx.store.create_session(
+        session = contract.ctx.store.createSession(
             ephemeral_aid=ephemeral.pre,
             account_aid=account.pre,
             account_alias="alpha",
@@ -663,11 +1183,12 @@ def test_account_create_rejects_closed_sessions(contract, state, expected_status
             watcher_required=True,
             witness_count=1,
             toad=1,
+            account_tier="trial",
         )
         session.state = state
         if state == "failed":
             session.failure_reason = "downstream failed"
-        contract.ctx.store.save_session(session)
+        contract.ctx.store.saveSession(session)
         register_aid(contract, "/onboarding", ephemeral)
 
         response = post_cesr(
@@ -693,10 +1214,10 @@ def test_complete_rejects_before_account_exists(contract):
         _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
         session_id = start_reply.ked["a"]["session_id"]
 
-        session = contract.ctx.store.get_session(session_id)
+        session = contract.ctx.store.getSession(session_id)
         session.account_aid = account.pre
         session.state = SESSION_STATE_ACCOUNT_CREATED
-        contract.ctx.store.save_session(session)
+        contract.ctx.store.saveSession(session)
 
         response = post_cesr(
             contract,
@@ -720,12 +1241,12 @@ def test_complete_rejects_missing_watcher_and_wrong_principal(pending_account_bu
     with habbing.openHab(name="complete-wrong-other", temp=True, transferable=False) as (_, other):
         register_aid(contract, "/onboarding", other)
 
-        session = contract.ctx.store.get_session(session_id)
-        account_record = contract.ctx.store.get_account(account.pre)
+        session = contract.ctx.store.getSession(session_id)
+        account_record = contract.ctx.store.getAccount(account.pre)
         session.watcher_eid = ""
         account_record.watcher_eid = ""
-        contract.ctx.store.save_session(session)
-        contract.ctx.store.save_account(account_record)
+        contract.ctx.store.saveSession(session)
+        contract.ctx.store.saveAccount(account_record)
 
         wrong_principal = post_cesr(
             contract,
@@ -751,8 +1272,8 @@ def test_complete_rejects_missing_watcher_and_wrong_principal(pending_account_bu
         assert missing_watcher.status_code == 409
         assert missing_watcher.json["title"] == "Watcher missing"
 
-        session = contract.ctx.store.get_session(session_id)
-        account_record = contract.ctx.store.get_account(account.pre)
+        session = contract.ctx.store.getSession(session_id)
+        account_record = contract.ctx.store.getAccount(account.pre)
         assert session.state == SESSION_STATE_FAILED
         assert session.witness_eids == []
         assert session.watcher_eid == ""
@@ -760,8 +1281,8 @@ def test_complete_rejects_missing_watcher_and_wrong_principal(pending_account_bu
         assert account_record.witness_eids == []
         assert account_record.watcher_eid == ""
         assert sorted(total_witness_delete_calls(contract.ctx)) == sorted(pending_account_bundle["witness_ids"])
-        assert contract.ctx.store.count_resources("witness") == 0
-        assert contract.ctx.store.count_resources("watcher") == 0
+        assert contract.ctx.store.countResources("witness") == 0
+        assert contract.ctx.store.countResources("watcher") == 0
 
 
 def test_cancel_marks_session_cancelled_is_idempotent_and_fails_pending_account(contract):
@@ -797,16 +1318,16 @@ def test_cancel_marks_session_cancelled_is_idempotent_and_fails_pending_account(
         )
         _, second_reply = assert_reply_frame(contract, second, route="/onboarding/cancel")
         assert second_reply.ked["a"]["state"] == SESSION_STATE_CANCELLED
-        session = contract.ctx.store.get_session(session_id)
-        account_record = contract.ctx.store.get_account(account.pre)
+        session = contract.ctx.store.getSession(session_id)
+        account_record = contract.ctx.store.getAccount(account.pre)
         assert session.state == SESSION_STATE_CANCELLED
         assert session.witness_eids == []
         assert session.watcher_eid == ""
         assert account_record.status == ACCOUNT_STATE_FAILED
         assert account_record.witness_eids == []
         assert account_record.watcher_eid == ""
-        assert contract.ctx.store.count_resources("witness") == 0
-        assert contract.ctx.store.count_resources("watcher") == 0
+        assert contract.ctx.store.countResources("witness") == 0
+        assert contract.ctx.store.countResources("watcher") == 0
         assert len(total_witness_delete_calls(contract.ctx)) == 1
         assert contract.ctx.watcher_boot.delete_calls == ["WAT_1"]
 
@@ -822,7 +1343,7 @@ def test_cancel_returns_error_when_teardown_fails_and_leaves_session_retryable(c
         _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
         session_id = start_reply.ked["a"]["session_id"]
         witness_id = start_reply.ked["a"]["witnesses"][0]["eid"]
-        witness_record = contract.ctx.store.get_resource("witness", witness_id)
+        witness_record = contract.ctx.store.getResource("witness", witness_id)
         contract.ctx.witness_boots[witness_record.backend_id].delete_error = boot_error(
             503,
             "simulated witness delete failure",
@@ -840,8 +1361,8 @@ def test_cancel_returns_error_when_teardown_fails_and_leaves_session_retryable(c
         )
 
     assert response.status_code == 502
-    session = contract.ctx.store.get_session(session_id)
-    account_record = contract.ctx.store.get_account(account.pre)
+    session = contract.ctx.store.getSession(session_id)
+    account_record = contract.ctx.store.getAccount(account.pre)
     assert session.state == SESSION_STATE_FAILED
     assert "teardown failed during cancellation" in session.failure_reason.lower()
     assert len(session.witness_eids) == 1
@@ -849,8 +1370,8 @@ def test_cancel_returns_error_when_teardown_fails_and_leaves_session_retryable(c
     assert account_record.status == ACCOUNT_STATE_FAILED
     assert len(account_record.witness_eids) == 1
     assert account_record.watcher_eid == ""
-    assert contract.ctx.store.count_resources("witness") == 1
-    assert contract.ctx.store.count_resources("watcher") == 0
+    assert contract.ctx.store.countResources("witness") == 1
+    assert contract.ctx.store.countResources("watcher") == 0
     assert contract.ctx.watcher_boot.delete_calls == ["WAT_1"]
     assert len(total_witness_delete_calls(contract.ctx)) == 1
 

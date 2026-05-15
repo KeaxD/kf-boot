@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from falcon import testing
@@ -31,7 +32,7 @@ class FakeWitnessBoot:
         self.create_error = create_error
         self.delete_error = delete_error
 
-    def create_witness(self, cid: str) -> dict[str, Any]:
+    def createWitness(self, cid: str) -> dict[str, Any]:
         self.create_calls += 1
         self.create_cids.append(cid)
         if self.create_error is not None:
@@ -46,10 +47,10 @@ class FakeWitnessBoot:
             "status": "allocated",
         }
 
-    def allocate_witness(self, account_aid: str) -> dict[str, Any]:
-        return self.create_witness(account_aid)
+    def allocateWitness(self, account_aid: str) -> dict[str, Any]:
+        return self.createWitness(account_aid)
 
-    def delete_witness(self, eid: str) -> None:
+    def deleteWitness(self, eid: str) -> None:
         self.delete_calls.append(eid)
         if self.delete_error is not None:
             raise self.delete_error
@@ -82,7 +83,7 @@ class FakeWatcherBoot:
             },
         }
 
-    def create_watcher(self, cid: str, oobi: str | None = None) -> dict[str, Any]:
+    def createWatcher(self, cid: str, oobi: str | None = None) -> dict[str, Any]:
         self.create_calls += 1
         self.create_cids.append(cid)
         self.create_oobis.append(oobi)
@@ -98,15 +99,15 @@ class FakeWatcherBoot:
             "oobi": oobi or "",
         }
 
-    def allocate_watcher(self, account_aid: str, oobi: str | None = None) -> dict[str, Any]:
-        return self.create_watcher(account_aid, oobi=oobi)
+    def allocateWatcher(self, account_aid: str, oobi: str | None = None) -> dict[str, Any]:
+        return self.createWatcher(account_aid, oobi=oobi)
 
-    def delete_watcher(self, eid: str) -> None:
+    def deleteWatcher(self, eid: str) -> None:
         self.delete_calls.append(eid)
         if self.delete_error is not None:
             raise self.delete_error
 
-    def watcher_status(self, eid: str) -> dict[str, Any]:
+    def watcherStatus(self, eid: str) -> dict[str, Any]:
         self.status_calls.append(eid)
         if self.status_error is not None:
             raise self.status_error
@@ -191,11 +192,38 @@ def make_config(tmp_path, *, index: int = 0, **overrides: Any) -> Config:
         "bootstrap_watcher_required": True,
         "bootstrap_accounts_per_ip": 1,
         "bootstrap_aids_per_ip": 10,
+        "bootstrap_api_requests_per_minute": 10,
         "session_ttl_seconds": 300,
         "witness_backends": witness_backends,
     }
     data.update(overrides)
     return Config(**data)
+
+
+def freeze_boot_time(monkeypatch, current: datetime):
+    import kfboot.expiring as expiring
+    import kfboot.limiting as limiting
+    import kfboot.store as store
+    
+    class FrozenDateTime:
+        value = current
+
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return cls.value.replace(tzinfo=None)
+            if cls.value.tzinfo is None:
+                return cls.value.replace(tzinfo=tz)
+            return cls.value.astimezone(tz)
+
+        @classmethod
+        def fromisoformat(cls, value: str):
+            return datetime.fromisoformat(value)
+
+    monkeypatch.setattr(expiring, "datetime", FrozenDateTime)
+    monkeypatch.setattr(limiting, "datetime", FrozenDateTime)
+    monkeypatch.setattr(store, "datetime", FrozenDateTime)
+    return FrozenDateTime
 
 
 def start_payload(**overrides: Any) -> dict[str, Any]:
