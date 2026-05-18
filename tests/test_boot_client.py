@@ -4,6 +4,7 @@ import pytest
 
 import kfboot.boot_client as boot_client_module
 from kfboot.boot_client import BootClient, BootError
+from kfboot.utils import bootErrorToHTTP
 
 
 class FakeResponse:
@@ -191,6 +192,14 @@ def test_http_error_without_body_uses_status_fallback(monkeypatch):
 
     assert str(excinfo.value) == "HTTP 503"
     assert excinfo.value.status_code == 503
+
+
+def test_boot_error_to_http_preserves_downstream_service_unavailable():
+    error = bootErrorToHTTP(BootError("capacity exhausted", status_code=503))
+
+    assert error.status == "503 Service Unavailable"
+    assert error.title == "Downstream service unavailable"
+    assert error.description == "capacity exhausted"
 
 
 def test_invalid_json_response_raisesbootError_with_status(monkeypatch):

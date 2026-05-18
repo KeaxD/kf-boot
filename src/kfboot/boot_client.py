@@ -93,7 +93,9 @@ class BootClient:
         if response.status_code >= 400:
             description = response.text.strip() or f"HTTP {response.status_code}"
             logger.warning(
-                f"BOOT API request failed: `{description}`",
+                "BOOT API request failed: "
+                f"method={method} url={url} status={response.status_code} "
+                f"body={description!r}",
             )
             raise BootError(description, status_code=response.status_code)
 

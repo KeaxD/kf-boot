@@ -43,6 +43,11 @@ def bootErrorToHTTP(exc: BootError) -> falcon.HTTPError:
             title="Boot API conflict",
             description=str(exc),
         )
+    if exc.status_code == 503:
+        return falcon.HTTPServiceUnavailable(
+            title="Downstream service unavailable",
+            description=str(exc),
+        )
     return falcon.HTTPBadGateway(
         title="Boot API call failed",
         description=str(exc),
