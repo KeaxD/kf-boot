@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 import falcon
@@ -993,7 +992,7 @@ def test_delete_expired_accounts_removes_account(onboarded_bundle):
     contract.ctx.store.addBinding(account.pre, "cid-to-delete")
 
     # Run the function
-    deleted = contract.ctx.exchanger.expirer.deleteExpiredAccounts()
+    contract.ctx.exchanger.expirer.deleteExpiredAccounts()
 
     # Assert correct deletion behavior
     assert contract.ctx.store.baser.bindings.get(keys=(account.pre, "cid-to-delete")) is None
@@ -1085,7 +1084,7 @@ def test_account_request_quota_survives_store_reopen(tmp_path):
 
 def test_account_is_set_to_expire_when_budget_fully_used(tmp_path, monkeypatch):
     # Set clock to 2026-01-01T00:00:00+00:00 
-    clock = freeze_boot_time(monkeypatch, datetime(2026, 1, 1, tzinfo=UTC))
+    freeze_boot_time(monkeypatch, datetime(2026, 1, 1, tzinfo=UTC))
     config = make_config(
         tmp_path,
         bootstrap_account_options=("1-of-1",),
