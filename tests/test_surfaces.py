@@ -160,7 +160,7 @@ def test_cesr_ingress_rejects_unsupported_content_type(contract):
 )
 def test_cesr_ingress_accepts_supported_content_types_for_event_messages(contract, path, content_type):
     with habbing.openHab(name=f"content-type-{path.strip('/')}", temp=True, transferable=False) as (_, hab):
-        body, attachment = split_cesr_message(hab.makeOwnInception())
+        body, attachment = split_cesr_message(hab.msgOwnInception())
         response = contract.simulate_post(
             path,
             body=body,
@@ -206,16 +206,16 @@ def test_event_messages_are_accepted_on_both_cesr_surfaces(contract):
         habbing.openHab(name="onboarding-event", temp=True, transferable=False) as (_, onboarding_hab),
         habbing.openHab(name="account-event", temp=True, transferable=False) as (_, account_hab),
     ):
-        assert post_cesr(contract, "/onboarding", onboarding_hab.makeOwnInception()).status_code == 204
-        assert post_cesr(contract, "/account", account_hab.makeOwnInception()).status_code == 204
+        assert post_cesr(contract, "/onboarding", onboarding_hab.msgOwnInception()).status_code == 204
+        assert post_cesr(contract, "/account", account_hab.msgOwnInception()).status_code == 204
 
 
 def test_surface_rejects_key_events_that_do_not_advance_accepted_state(contract, monkeypatch):
     with habbing.openHab(name="account-rot", temp=True) as (_, hab):
-        assert post_cesr(contract, "/account", hab.makeOwnInception()).status_code == 204
+        assert post_cesr(contract, "/account", hab.msgOwnInception()).status_code == 204
 
         hab.rotate()
-        rot = hab.makeOwnEvent(sn=hab.kever.sn)
+        rot = hab.msgOwnEvent(sn=hab.kever.sn)
 
         monkeypatch.setattr(contract.ctx.parser, "parseOne", lambda **kwa: None)
 

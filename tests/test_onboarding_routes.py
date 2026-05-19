@@ -10,7 +10,6 @@ from keri.app import habbing
 from kfboot.basing import (
     ACCOUNT_STATE_FAILED,
     ACCOUNT_STATE_ONBOARDED,
-    ACCOUNT_STATE_EXPIRED,
     ACCOUNT_STATE_PENDING_ONBOARDING,
     SESSION_STATE_ACCOUNT_CREATED,
     SESSION_STATE_CANCELLED,
@@ -989,8 +988,8 @@ def test_account_create_rejects_expired_permanent_account(contract_factory):
     )
 
     with (
-        habbing.openHab(name=f"expired-account-ephemeral", temp=True, transferable=False) as (_, ephemeral),
-        habbing.openHab(name=f"expired-account", temp=True) as (_, account),
+        habbing.openHab(name="expired-account-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name="expired-account", temp=True) as (_, account),
     ):
         # Onboard the account and then manually set it to the desired status
         register_aid(contract, "/onboarding", ephemeral)
