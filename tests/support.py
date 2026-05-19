@@ -327,7 +327,7 @@ def assert_reply_frame(client: testing.TestClient, response, *, route: str) -> t
 
 
 def register_aid(client: testing.TestClient, path: str, hab) -> None:
-    response = post_cesr(client, path, hab.makeOwnInception())
+    response = post_cesr(client, path, hab.msgOwnInception())
     assert response.status_code == 204
 
 

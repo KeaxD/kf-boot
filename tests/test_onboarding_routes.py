@@ -10,7 +10,6 @@ from keri.app import habbing
 from kfboot.basing import (
     ACCOUNT_STATE_FAILED,
     ACCOUNT_STATE_ONBOARDED,
-    ACCOUNT_STATE_EXPIRED,
     ACCOUNT_STATE_PENDING_ONBOARDING,
     SESSION_STATE_ACCOUNT_CREATED,
     SESSION_STATE_CANCELLED,
@@ -404,7 +403,7 @@ def test_session_status_refreshes_session_lease(contract):
 
 def test_partial_downstream_failure_marks_sessionFailed_and_blind_retry_does_not_duplicate_resources(contract_factory):
     contract = contract_factory(
-        watcher_boot=FakeWatcherBoot(create_error=boot_error(502, "simulated watcher failure"))
+        watcher_boot=FakeWatcherBoot(create_error=boot_error(503, "simulated watcher failure"))
     )
 
     with habbing.openHab(name="partial-failure", temp=True, transferable=False) as (_, ephemeral):
@@ -419,7 +418,7 @@ def test_partial_downstream_failure_marks_sessionFailed_and_blind_retry_does_not
                 payload=start_payload(chosen_profile_code="3-of-4"),
             ),
         )
-        assert response.status_code == 502
+        assert response.status_code == 503
 
         session = contract.ctx.store.findActiveSessionForEphemeral(ephemeral.pre)
         assert session.state == SESSION_STATE_FAILED
@@ -1407,7 +1406,7 @@ def test_cancel_returns_error_when_teardown_fails_and_leaves_session_retryable(c
             ),
         )
 
-    assert response.status_code == 502
+    assert response.status_code == 503
     session = contract.ctx.store.getSession(session_id)
     account_record = contract.ctx.store.getAccount(account.pre)
     assert session.state == SESSION_STATE_FAILED

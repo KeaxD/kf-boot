@@ -179,8 +179,8 @@ def test_account_delete_failure_keeps_remaining_state_retryable(onboarded_bundle
         ),
     )
 
-    assert failed.status_code == 502
-    assert failed.json["title"] == "Boot API call failed"
+    assert failed.status_code == 503
+    assert failed.json["title"] == "Downstream service unavailable"
     account_record = contract.ctx.store.getAccount(account.pre)
     assert account_record is not None
     assert account_record.status == ACCOUNT_STATE_ONBOARDED
@@ -726,7 +726,7 @@ def test_account_resource_routes_return_404_for_missing_resources(onboarded_bund
         (400, 400, "Boot API rejected request"),
         (404, 404, "Upstream resource not found"),
         (409, 409, "Boot API conflict"),
-        (503, 502, "Boot API call failed"),
+        (503, 503, "Downstream service unavailable"),
     ],
 )
 def test_account_routes_map_downstreambootErrors_to_http_statuses(
@@ -1112,7 +1112,7 @@ def test_delete_expired_accounts_removes_account(onboarded_bundle):
     contract.ctx.store.addBinding(account.pre, "cid-to-delete")
 
     # Run the function
-    deleted = contract.ctx.exchanger.expirer.deleteExpiredAccounts()
+    contract.ctx.exchanger.expirer.deleteExpiredAccounts()
 
     # Assert correct deletion behavior
     assert deleted == [account.pre]
