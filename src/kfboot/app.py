@@ -107,6 +107,8 @@ def create_app(config: Config | None = None, *, temp: bool = False) -> tuple[fal
     store = Store(
         config.db_path,
         session_ttl_seconds=config.session_ttl_seconds,
+        account_ttl_seconds=config.account_ttl_seconds,
+        closed_session_retention_seconds=config.closed_session_retention_seconds or 0.0,
         expired_account_retention_seconds=config.expired_account_retention_seconds,
     )
     cf = Configer(

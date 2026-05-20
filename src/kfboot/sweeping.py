@@ -90,6 +90,7 @@ class CleanupDoer(doing.Doer):
                     "Periodic cleanup sweep completed: "
                     f"sessions_expired={results['sessions_expired']}, "
                     f"sessions_cleaned={results['sessions_cleaned']}, "
+                    f"sessions_deleted={results['sessions_deleted']}, "
                     f"accounts_expired={results['accounts_expired']}, "
                     f"accounts_cleaned={results['accounts_cleaned']}, "
                     f"accounts_deleted={results['accounts_deleted']}"

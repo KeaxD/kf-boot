@@ -10,6 +10,7 @@ from kfboot.basing import (
     CLEANUP_TASK_ACCOUNT_DELETE,
     CLEANUP_TASK_ACCOUNT_EXPIRE,
     CLEANUP_TASK_SESSION_CLEANUP,
+    CLEANUP_TASK_SESSION_DELETE,
     CLEANUP_TASK_SESSION_EXPIRE,
     ACCOUNT_STATE_FAILED,
     ACCOUNT_STATE_EXPIRED,
@@ -18,7 +19,10 @@ from kfboot.basing import (
     CleanupDueRecord,
     CleanupTaskRecord,
     LeaseRecord,
+    SESSION_STATE_CANCELLED,
+    SESSION_STATE_COMPLETED,
     SESSION_STATE_EXPIRED,
+    SESSION_STATE_FAILED,
     TERMINAL_SESSION_STATES,
     AccountRecord,
     BindingRecord,
@@ -103,14 +107,34 @@ class Store:
         path: str,
         *,
         session_ttl_seconds: int = 300,
+        account_ttl_seconds: float = 0.0,
+        closed_session_retention_seconds: float = 0.0,
         expired_account_retention_seconds: float = 0.0,
     ):
         self.baser = open_baser(path)
         self.session_ttl_seconds = session_ttl_seconds
+        self.account_ttl_seconds = account_ttl_seconds
+        self.closed_session_retention_seconds = closed_session_retention_seconds
         self.expired_account_retention_seconds = expired_account_retention_seconds
 
     def close(self) -> None:
         self.baser.close()
+
+    def _sessionPastDue(self, record: SessionRecord, *, now: str | None = None) -> bool:
+        """Return True when a non-terminal session has reached its expiry timestamp."""
+        if record.state in TERMINAL_SESSION_STATES or not record.expires_at:
+            return False
+
+        try:
+            expires_at = _parseDt(record.expires_at)
+        except ValueError:
+            return False
+
+        return expires_at <= _parseDt(now or nowIso())
+
+    def _sessionIsActive(self, record: SessionRecord, *, now: str | None = None) -> bool:
+        """Return True when the session is still usable for admission purposes"""
+        return record.state not in TERMINAL_SESSION_STATES and not self._sessionPastDue(record, now=now)
 
     def getQuota(self, scope: str, subject: str) -> QuotaRecord | None:
         return self.baser.quotas.get(keys=(scope, subject))
@@ -473,22 +497,43 @@ class Store:
     def _syncSessionTasks(self, record: SessionRecord) -> None:
         """Create a task queue based on the session state change.
         If a session is:
-        - Expired and not cleaned => creates a cleanup task
-        - Expired and cleaned => remove cleanup task
+        - Expired/failed/cancelled and not cleaned => creates a cleanup task
+        - Closed and cleaned => schedule final session deletion
+        - Completed => schedule final session deletion
         - Still Active and has an expiry date => schedule session expiry with session_expire
         - In terminal or no expiry => remove expire task
         """
+        cleanup_states = {
+            SESSION_STATE_EXPIRED,
+            SESSION_STATE_FAILED,
+            SESSION_STATE_CANCELLED,
+        }
 
-        # Check if session is expired
-        if record.state == SESSION_STATE_EXPIRED:
+        # Check if a session is in a cleanup state
+        if record.state in cleanup_states:
 
-            # Clean up task if it exist
+            # Clean up stale task if it exists
             self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_EXPIRE, record.session_id)
+            
+            # If the session's resources were cleaned up
             if record.resources_cleaned_at:
-                # If session resources were cleaned, delete task
+
+                # Clean up stale task
                 self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_CLEANUP, record.session_id)
+                
+                # Create a session delete task
+                self.ensureCleanupTask(
+                    CLEANUP_TASK_SESSION_DELETE,
+                    record.session_id,
+                    due_at=self._sessionDeleteDueAt(record),
+                    now=record.resources_cleaned_at or record.updated_at or None,
+                )
+            # If the session's resources were not cleaned up
             else:
-                # If session is not cleaned yet, schedule a cleanup task
+                # Clean up stale task
+                self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_DELETE, record.session_id)
+                
+                # Create a session clean up task
                 self.ensureCleanupTask(
                     CLEANUP_TASK_SESSION_CLEANUP,
                     record.session_id,
@@ -497,15 +542,37 @@ class Store:
                 )
             return
 
-        # Delete cleanup task if it exist
-        self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_CLEANUP, record.session_id)
+        # If the session is in a completed state
+        if record.state == SESSION_STATE_COMPLETED:
 
-        # If session is in terminal state or expiry date is not defined, delete task
-        if record.state in TERMINAL_SESSION_STATES or not record.expires_at:
+            # Delete any session stale expiry or clean up task 
             self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_EXPIRE, record.session_id)
+            self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_CLEANUP, record.session_id)
+            
+            # Create a session delete task
+            # Sessions in completed state no longer have its hosted resources, it is just metadata
+            # which justifies skipping cleaning straight to deletion
+            self.ensureCleanupTask(
+                CLEANUP_TASK_SESSION_DELETE,
+                record.session_id,
+                due_at=self._sessionDeleteDueAt(record),
+                now=record.updated_at or None,
+            )
             return
         
-        # Session is active and has an expiry date, schedule a session expire task
+        # Clean up stale session cleanup and delete task
+        self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_CLEANUP, record.session_id)
+        self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_DELETE, record.session_id)
+
+        # Defensive check or if we add another terminal state 
+        # If session is in a terminal state or it does not have an expiry date
+        if record.state in TERMINAL_SESSION_STATES or not record.expires_at:
+
+            # Clean up any stale task for expiry and return
+            self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_EXPIRE, record.session_id)
+            return
+
+        # Create a a task for session expiry
         self.scheduleCleanupTask(
             CLEANUP_TASK_SESSION_EXPIRE,
             record.session_id,
@@ -517,21 +584,20 @@ class Store:
     def _syncAccountTasks(self, record: AccountRecord) -> None:
         """Create a task queue based on the account state change.
         If a account is:
-        - Expired and not cleaned => schedlue account cleanup with account_cleanup
-        - Expired and cleaned => schedule account delete with account_delete
+        - Expired/failed and not cleaned => schedule account cleanup with account_cleanup
+        - Expired/failed and cleaned => schedule account delete with account_delete
         - Onboarded and has an expiry date => schedule account expiry with account_expire
         - Anything else => clear stale tasks
         """
-        # Check if account is expired
-        if record.status == ACCOUNT_STATE_EXPIRED:
-            # Clear task if present
+        closed_states = {
+            ACCOUNT_STATE_EXPIRED,
+            ACCOUNT_STATE_FAILED,
+        }
+
+        if record.status in closed_states:
             self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_EXPIRE, record.account_aid)
-            
-            # Check if resources were cleaned
             if record.resources_cleaned_at:
                 self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_CLEANUP, record.account_aid)
-                
-                # If account resources were torndown, schedule account deletion
                 self.ensureCleanupTask(
                     CLEANUP_TASK_ACCOUNT_DELETE,
                     record.account_aid,
@@ -540,7 +606,6 @@ class Store:
                 )
             else:
                 self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_DELETE, record.account_aid)
-                # If account resources were not cleaned, schedule an account cleanup
                 self.ensureCleanupTask(
                     CLEANUP_TASK_ACCOUNT_CLEANUP,
                     record.account_aid,
@@ -568,16 +633,24 @@ class Store:
         )
 
     def _accountDeleteDueAt(self, record: AccountRecord) -> str:
-        """Compute when an expired account becomes eligible for final deletion.
-        If expired_account_retention_seconds is not defined, account deletion is immediate"""
+        """Compute when a closed account becomes eligible for final deletion."""
 
-        # Get a base time to compute account deletion, either expiration date, resources cleaned date or current time
         anchor = record.expired_at or record.resources_cleaned_at or nowIso()
-        
-        # Get valid account retention time, provided in the config
         retention = max(self.expired_account_retention_seconds, 0.0)
-        
-        # If variable is None or invalid, return anchor which would make account deletion immediate
+        if retention <= 0:
+            return anchor
+        return (_parseDt(anchor) + timedelta(seconds=retention)).isoformat()
+
+    def _sessionDeleteDueAt(self, record: SessionRecord) -> str:
+        """Compute when a closed session becomes eligible for final deletion."""
+        anchor = (
+            record.resources_cleaned_at
+            or record.updated_at
+            or record.expired_at
+            or record.created_at
+            or nowIso()
+        )
+        retention = max(self.closed_session_retention_seconds, 0.0)
         if retention <= 0:
             return anchor
         return (_parseDt(anchor) + timedelta(seconds=retention)).isoformat()
@@ -707,10 +780,48 @@ class Store:
             ).isoformat()
         self.saveSession(record)
 
+    def refreshAccountLease(self, record: AccountRecord, *, now: str | None = None) -> None:
+        """Extend the idle TTL for a still-active onboarded account."""
+
+        # Get current time
+        current = _parseDt(now or nowIso())
+
+        # Check if account status is valid for refresh lease
+        if record.status != ACCOUNT_STATE_ONBOARDED or self.account_ttl_seconds <= 0:
+            return
+
+        # Check if the account has an expiration date
+        if record.expires_at:
+            try:
+                # Check if the account is expired, if so return to not refresh its lease
+                if _parseDt(record.expires_at) <= current:
+                    return
+            except ValueError:
+                return
+        
+        # Refresh the lease by setting its expiration date to current time + account TTL
+        record.expires_at = (
+            current + timedelta(seconds=self.account_ttl_seconds)
+        ).isoformat()
+
+        # Save it into DB
+        self.saveAccount(record)
+
     def getSession(self, session_id: str) -> SessionRecord | None:
         return self.baser.sessions.get(keys=(session_id,))
 
     def findActiveSessionForEphemeral(self, ephemeral_aid: str) -> SessionRecord | None:
+        latest: SessionRecord | None = None
+        for _, record in self.baser.sessions.getTopItemIter(keys=()):
+            if record.ephemeral_aid != ephemeral_aid:
+                continue
+            if not self._sessionIsActive(record):
+                continue
+            if latest is None or record.created_at > latest.created_at:
+                latest = record
+        return latest
+
+    def findSessionForEphemeral(self, ephemeral_aid: str) -> SessionRecord | None:
         latest: SessionRecord | None = None
         for _, record in self.baser.sessions.getTopItemIter(keys=()):
             if record.ephemeral_aid != ephemeral_aid:
@@ -770,9 +881,9 @@ class Store:
     def listActiveSessionsForIp(self, client_ip: str) -> list[SessionRecord]:
         rows = []
         for _, record in self.baser.sessions.getTopItemIter(keys=()):
-            if record.state in TERMINAL_SESSION_STATES:
-                continue
             if record.client_ip != client_ip:
+                continue
+            if not self._sessionIsActive(record):
                 continue
             rows.append(record)
         rows.sort(key=lambda record: _sortValue(record.created_at), reverse=True)
@@ -782,9 +893,9 @@ class Store:
         """Return a list of active SessionRecords matching the given account alias"""
         rows = []
         for _, record in self.baser.sessions.getTopItemIter(keys=()):
-            if record.state in TERMINAL_SESSION_STATES:
-                continue
             if record.account_alias != account_alias:
+                continue
+            if not self._sessionIsActive(record):
                 continue
             rows.append(record)
         rows.sort(key=lambda record: _sortValue(record.created_at), reverse=True)
@@ -829,6 +940,7 @@ class Store:
         # Delete any cleanup task related to that session
         self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_EXPIRE, session_id)
         self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_CLEANUP, session_id)
+        self._deleteCleanupTaskIfPresent(CLEANUP_TASK_SESSION_DELETE, session_id)
 
         # Remove session from the DB
         self.baser.sessions.rem(keys=(session_id,))
@@ -932,6 +1044,12 @@ class Store:
         onboarded: bool = False,
     ) -> AccountRecord:
         created_at = nowIso()
+        account_expires_at = expires_at
+        # If an account is onboarded, it should have an expiry date
+        if onboarded and not account_expires_at and self.account_ttl_seconds > 0:
+            account_expires_at = (
+                _parseDt(created_at) + timedelta(seconds=self.account_ttl_seconds)
+            ).isoformat()
         return AccountRecord(
             account_aid=account_aid,
             account_alias=account_alias,
@@ -948,7 +1066,7 @@ class Store:
             witness_eids=list(witness_eids),
             watcher_eid=watcher_eid,
             tier=tier,
-            expires_at=expires_at,
+            expires_at=account_expires_at,
         )
 
 

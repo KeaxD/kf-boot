@@ -9,6 +9,7 @@ from keri import help
 from keri.peer.exchanging import Exchanger
 
 from kfboot.basing import (
+    ACCOUNT_STATE_FAILED,
     ACCOUNT_STATE_ONBOARDED,
     ACCOUNT_STATE_PENDING_ONBOARDING,
     ACCOUNT_STATE_EXPIRED,
@@ -135,7 +136,22 @@ class SessionStartHandler(RouteHandler):
             )
 
         session = None
+        existing = None
+        newly_expired_session_ids: set[str] = set()
         session_for_account = self.exchanger.ctx.store.findSessionForAccount(account_aid)
+
+        # First check if the account exists, is not in a terminal state BUT is expired
+        # If so, mark it as expired to enter the cleanup process
+        # This prevents session who are due for expiry from 'reviving' 
+        if (
+            session_for_account is not None
+            and session_for_account.state not in TERMINAL_SESSION_STATES
+            and self.exchanger.sessionPastDue(session_for_account)
+        ):
+            self.exchanger.expirer.markSessionExpired(session_for_account)
+            newly_expired_session_ids.add(session_for_account.session_id)
+            session_for_account = None
+
         if session_for_account is not None and session_for_account.state not in TERMINAL_SESSION_STATES:
             if session_for_account.ephemeral_aid != sender:
                 logger.warning(
@@ -147,7 +163,29 @@ class SessionStartHandler(RouteHandler):
                     description="A different onboarding principal already owns the active session for this account AID.",
                 )
             session = session_for_account
-        elif (existing := self.exchanger.ctx.store.findActiveSessionForEphemeral(sender)) is not None:
+        # Session is bound by an ephemeral sender 
+        else:
+            # Retrieve the existing session for that ephemeral
+            existing = self.exchanger.ctx.store.findSessionForEphemeral(sender)
+            
+            # Check if it exists, is not in a terminal state, and is not expired
+            if (
+                existing is not None
+                and existing.state not in TERMINAL_SESSION_STATES
+                and self.exchanger.sessionPastDue(existing)
+            ):
+                # If so, mark it as expired for cleanup process
+                self.exchanger.expirer.markSessionExpired(existing)
+                newly_expired_session_ids.add(existing.session_id)
+                existing = None
+            
+            # Check if it was expired earlier
+            elif (
+                existing is not None
+                and existing.session_id in newly_expired_session_ids
+            ):
+                existing = None
+        if existing is not None:
             session = existing
 
         if session is not None:
@@ -306,6 +344,10 @@ class AccountCreateHandler(RouteHandler):
                 account.witness_eids = list(session.witness_eids)
                 account.watcher_eid = session.watcher_eid
                 account.session_id = session.session_id
+                account.onboarded_at = ""
+                account.expired_at = ""
+                account.resources_cleaned_at = ""
+                account.expires_at = ""
 
             session.account_aid = account_aid
             session.state = SESSION_STATE_ACCOUNT_CREATED
@@ -366,6 +408,8 @@ class CompleteHandler(RouteHandler):
             )
 
         if session.state == SESSION_STATE_COMPLETED and account.status == ACCOUNT_STATE_ONBOARDED:
+            # Refresh the account lease on the account because it is active
+            self.exchanger.expirer.refreshAccountLease(account)
             logger.info(
                 f"Onboarding request reconciled with existing completed session and onboarded account {account_aid}"
             )
@@ -393,6 +437,8 @@ class CompleteHandler(RouteHandler):
         account.onboarded_at = nowIso()
         self.exchanger.ctx.store.saveSession(session)
         self.exchanger.ctx.store.saveAccount(account)
+        # Refresh the account lease to the onboarded time 
+        self.exchanger.expirer.refreshAccountLease(account, now=account.onboarded_at)
         logger.info(
             f"Onboarding completed for account AID {account_aid}"
         )
@@ -435,6 +481,8 @@ class CancelHandler(RouteHandler):
 
             session.state = SESSION_STATE_CANCELLED
             session.updated_at = nowIso()
+            # Set cleaned flag
+            session.resources_cleaned_at = session.updated_at
             self.exchanger.ctx.store.saveSession(session)
             logger.info(
                 f"Session cancelled for session {session.session_id}"
@@ -442,6 +490,8 @@ class CancelHandler(RouteHandler):
 
             failed = accountFailed(account)
             if failed is not None:
+                failed.resources_cleaned_at = session.updated_at
+                failed.session_id = ""
                 self.exchanger.ctx.store.saveAccount(failed)
                 logger.info(
                     f"Account failed due to session cancellation for account AID {account.account_aid}"
@@ -462,10 +512,11 @@ class AccountWitnessesHandler(RouteHandler):
 
     def handleEvent(self, serder, **kwa):
         sender = serder.pre
-        self.exchanger.requireOnboardedAccount(sender, extractExnPayload(serder))
+        account = self.exchanger.requireOnboardedAccount(sender, extractExnPayload(serder))
         rows = resourcesToApi(
             self.exchanger.ctx.store.listResourcesForAccount(kind="witness", account_aid=sender)
         )
+        self.exchanger.expirer.refreshAccountLease(account)
         logger.info(
             f"Query response for witnesses for account AID {sender}: {rows}"
         )
@@ -484,10 +535,11 @@ class AccountWatchersHandler(RouteHandler):
 
     def handleEvent(self, serder, **kwa):
         sender = serder.pre
-        self.exchanger.requireOnboardedAccount(sender, extractExnPayload(serder))
+        account = self.exchanger.requireOnboardedAccount(sender, extractExnPayload(serder))
         rows = resourcesToApi(
             self.exchanger.ctx.store.listResourcesForAccount(kind="watcher", account_aid=sender)
         )
+        self.exchanger.expirer.refreshAccountLease(account)
         logger.info(
             f"Query response for watchers for account AID {sender}: {rows}"
         )
@@ -507,7 +559,7 @@ class AccountWatcherStatusHandler(RouteHandler):
     def handleEvent(self, serder, **kwa):
         sender = serder.pre
         payload = extractExnPayload(serder)
-        self.exchanger.requireOnboardedAccount(sender, payload)
+        account = self.exchanger.requireOnboardedAccount(sender, payload)
 
         watcher_id = optionalStr(payload, "watcher_eid") or requiredStr(payload, "watcher_id")
         logger.info(
@@ -539,6 +591,7 @@ class AccountWatcherStatusHandler(RouteHandler):
         watcher = resourcesToApi([record])[0]
         if isinstance(status, dict):
             watcher.update(status)
+        self.exchanger.expirer.refreshAccountLease(account)
         self.exchanger.queueReply(
             self.resource,
             sender,
@@ -583,6 +636,7 @@ class AccountWitnessDeleteHandler(RouteHandler):
             )
             raise bootErrorToHTTP(exc)
 
+        self.exchanger.expirer.refreshAccountLease(account)
         self.exchanger.queueReply(
             self.resource,
             sender,
@@ -627,6 +681,7 @@ class AccountWatcherDeleteHandler(RouteHandler):
             )
             raise bootErrorToHTTP(exc)
 
+        self.exchanger.expirer.refreshAccountLease(account)
         self.exchanger.queueReply(
             self.resource,
             sender,
@@ -924,9 +979,12 @@ class BootExchanger(Exchanger):
             )
 
         account = self.ctx.store.getAccount(sender)
+
+        # Accounts that are onboarded, expired and failed are valid for deletion
         if account is not None and account.status not in {
             ACCOUNT_STATE_ONBOARDED,
             ACCOUNT_STATE_EXPIRED,
+            ACCOUNT_STATE_FAILED,
         }:
             logger.warning(
                 f"Account delete request rejected due to account {account_aid} being in invalid state: {account.status}"

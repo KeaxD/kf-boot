@@ -878,6 +878,30 @@ def test_account_route_marks_past_due_account_expired_on_ingress(onboarded_bundl
     assert response.json["title"] == "Account expired"
 
 
+def test_account_routes_refresh_idle_account_lease(onboarded_bundle):
+    """Test that refreshing an account lease sets it to current time + account TTL even if expires_at is superior"""
+    contract = onboarded_bundle["contract"]
+    account = onboarded_bundle["account"]
+    record = contract.ctx.store.getAccount(account.pre)
+
+    # Expire the account far in the future
+    record.expires_at = "2099-01-01T00:00:00+00:00"
+    contract.ctx.store.saveAccount(record)
+
+    response = post_cesr(
+        contract,
+        "/account",
+        build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+    )
+
+    assert response.status_code == 200
+    updated = contract.ctx.store.getAccount(account.pre)
+    assert updated is not None
+
+    # Assert that the expires_at variable changed to be current time + account TTL
+    assert updated.expires_at != "2099-01-01T00:00:00+00:00"
+
+
 def test_cleanup_expired_accounts_retries_with_backoff(onboarded_bundle, monkeypatch):
     """Expired account cleanup should back off after teardown failures instead of retrying every sweep."""
     contract = onboarded_bundle["contract"]
@@ -1034,6 +1058,7 @@ def test_cleanup_sweep_processes_expired_account_in_batches(onboarded_bundle):
     assert first == {
         "sessions_expired": 0,
         "sessions_cleaned": 0,
+        "sessions_deleted": 0,
         "accounts_expired": 1,
         "accounts_cleaned": 0,
         "accounts_deleted": 0,
@@ -1060,6 +1085,7 @@ def test_cleanup_sweep_processes_expired_account_in_batches(onboarded_bundle):
     assert second == {
         "sessions_expired": 0,
         "sessions_cleaned": 0,
+        "sessions_deleted": 0,
         "accounts_expired": 0,
         "accounts_cleaned": 1,
         "accounts_deleted": 0,
@@ -1081,6 +1107,7 @@ def test_cleanup_sweep_processes_expired_account_in_batches(onboarded_bundle):
     assert third == {
         "sessions_expired": 0,
         "sessions_cleaned": 0,
+        "sessions_deleted": 0,
         "accounts_expired": 0,
         "accounts_cleaned": 0,
         "accounts_deleted": 1,
@@ -1112,7 +1139,7 @@ def test_delete_expired_accounts_removes_account(onboarded_bundle):
     contract.ctx.store.addBinding(account.pre, "cid-to-delete")
 
     # Run the function
-    contract.ctx.exchanger.expirer.deleteExpiredAccounts()
+    deleted = contract.ctx.exchanger.expirer.deleteExpiredAccounts()
 
     # Assert correct deletion behavior
     assert deleted == [account.pre]

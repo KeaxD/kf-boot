@@ -13,13 +13,18 @@ from keri import help
 
 from kfboot.basing import (
     ACCOUNT_STATE_EXPIRED,
+    ACCOUNT_STATE_FAILED,
     ACCOUNT_STATE_ONBOARDED,
     CLEANUP_TASK_ACCOUNT_CLEANUP,
     CLEANUP_TASK_ACCOUNT_DELETE,
     CLEANUP_TASK_ACCOUNT_EXPIRE,
     CLEANUP_TASK_SESSION_CLEANUP,
+    CLEANUP_TASK_SESSION_DELETE,
     CLEANUP_TASK_SESSION_EXPIRE,
+    SESSION_STATE_CANCELLED,
+    SESSION_STATE_COMPLETED,
     SESSION_STATE_EXPIRED,
+    SESSION_STATE_FAILED,
     TERMINAL_SESSION_STATES,
     CleanupTaskRecord,
     SessionRecord,
@@ -56,10 +61,11 @@ class Expirer:
     Cleanup‑task lifecycle enforced:
     - `session_expire` => mark session expired.
     - `session_cleanup` => teardown session resources => complete.
+    - `session_delete` => delete closed session after retention => complete.
 
     - `account_expire` => mark account expired.
-    - `account_cleanup` => teardown account resources => complete.
-    - `account_delete` => delete expired, cleaned account => complete.
+    - `account_cleanup` => teardown closed-account resources => complete.
+    - `account_delete` => delete closed, cleaned account => complete.
 
     High‑level workflow:
     - sweep(): claim tasks until batch/time budget is exhausted.
@@ -72,6 +78,7 @@ class Expirer:
     # Just for readability
     SESSION_EXPIRE_TASK = CLEANUP_TASK_SESSION_EXPIRE
     SESSION_CLEANUP_TASK = CLEANUP_TASK_SESSION_CLEANUP
+    SESSION_DELETE_TASK = CLEANUP_TASK_SESSION_DELETE
     ACCOUNT_EXPIRE_TASK = CLEANUP_TASK_ACCOUNT_EXPIRE
     ACCOUNT_CLEANUP_TASK = CLEANUP_TASK_ACCOUNT_CLEANUP
     ACCOUNT_DELETE_TASK = CLEANUP_TASK_ACCOUNT_DELETE
@@ -138,6 +145,7 @@ class Expirer:
         results = {
             "sessions_expired": 0,
             "sessions_cleaned": 0,
+            "sessions_deleted": 0,
             "accounts_expired": 0,
             "accounts_cleaned": 0,
             "accounts_deleted": 0,
@@ -322,7 +330,13 @@ class Expirer:
             f"Session {session.session_id} failed: {reason}",
         )
 
-        failed = accountFailed(account)
+        if account is None:
+            failed = None
+        elif account.status == ACCOUNT_STATE_ONBOARDED:
+            failed = None
+        else:
+            failed = accountFailed(account)
+
         if failed is not None:
             self.ctx.store.saveAccount(failed)
             logger.warning(
@@ -342,11 +356,27 @@ class Expirer:
                 logger.warning(
                     f"Session resource teardown failed for {session.session_id}: {exc}",
                 )
+            # Teardown succeeds
+            else:
+                cleaned_at = nowIso()
+                session.resources_cleaned_at = cleaned_at
+                session.updated_at = cleaned_at
+                self.ctx.store.saveSession(session)
+
+                if failed is not None:
+                    failed.resources_cleaned_at = cleaned_at
+                    failed.session_id = ""
+                    self.ctx.store.saveAccount(failed)
 
     def refreshSessionLease(self, session: SessionRecord) -> None:
         """Extend the TTL for a still-active session"""
         self.ctx.store.refreshSessionLease(session)
         logger.debug(f"Session lease refreshed for session {session.session_id}")
+
+    def refreshAccountLease(self, account, *, now: str | None = None) -> None:
+        """Extend the idle TTL for a still-active onboarded account."""
+        self.ctx.store.refreshAccountLease(account, now=now)
+        logger.debug(f"Account lease refreshed for account {account.account_aid}")
 
     def acquireSweepLease(self, *, owner_id: str | None = None, now: str | None = None) -> bool:
         """Attempt to become the active background cleanup leader"""
@@ -411,11 +441,23 @@ class Expirer:
         *,
         now: str,
     ) -> tuple[str | None, object | None]:
-        """Dispatch a claimed task to its task-specific handler"""
+        """Dispatch a claimed task to its task-specific handler
+        - Session tasks:
+            - Expire a session
+            - Clean up a session
+            - Delete a session
+        
+        - Account tasks:
+            - Expire a session
+            - Clean up a session
+            - Delete a session
+        """
         if task.kind == self.SESSION_EXPIRE_TASK:
             return self._processSessionExpire(task, now=now)
         if task.kind == self.SESSION_CLEANUP_TASK:
             return self._processSessionCleanup(task, now=now)
+        if task.kind == self.SESSION_DELETE_TASK:
+            return self._processSessionDelete(task, now=now)
         if task.kind == self.ACCOUNT_EXPIRE_TASK:
             return self._processAccountExpire(task, now=now)
         if task.kind == self.ACCOUNT_CLEANUP_TASK:
@@ -500,14 +542,20 @@ class Expirer:
             self._completeTask(task.kind, task.subject)
             return None, None
         
-        # If session is not expired, task is invalid
-        if session.state != SESSION_STATE_EXPIRED:
+        # If session is not expired, failed or cancelled session cleanup task is invalid
+        if session.state not in {
+            SESSION_STATE_EXPIRED,
+            SESSION_STATE_FAILED,
+            SESSION_STATE_CANCELLED,
+        }:
             self._completeTask(task.kind, task.subject)
             return None, None
 
-        # If sesion's resources has not been cleaned up yet, task is invalid
+        # If session resources have already been cleaned, re-sync to the delete phase
         if session.resources_cleaned_at:
-            self._completeTask(task.kind, task.subject)
+            with self._lock:
+                self.ctx.store.saveSession(session)
+                self._completeTask(task.kind, task.subject)
             return None, None
 
         # Retrieve the account for that session
@@ -541,8 +589,17 @@ class Expirer:
             session.updated_at = now
             with self._lock:
                 self.ctx.store.saveSession(session)
-                failed = accountFailed(account)
+
+                if account is None:
+                    failed = None
+                elif account.status == ACCOUNT_STATE_ONBOARDED:
+                    failed = None
+                else:
+                    failed = accountFailed(account)
+
                 if failed is not None:
+                    failed.resources_cleaned_at = now
+                    failed.session_id = ""
                     self.ctx.store.saveAccount(failed)
                     logger.info(
                         f"Account failed due to session expiry for account {account.account_aid}",
@@ -554,6 +611,64 @@ class Expirer:
             )
 
         return "sessions_cleaned", session.session_id
+
+    def _processSessionDelete(
+        self,
+        task: CleanupTaskRecord,
+        *,
+        now: str,
+    ) -> tuple[str | None, object | None]:
+        """Delete one closed session after its retention window elapses."""
+
+        # Retrieve session for that task/subject pair
+        session = self.ctx.store.getSession(task.subject)
+        
+        # If session is not found, task is invalid 
+        if session is None:
+            self._completeTask(task.kind, task.subject)
+            return None, None
+
+        # If session is not expired, failed, cancelled or completed, session delete task is invalid
+        if session.state not in {
+            SESSION_STATE_EXPIRED,
+            SESSION_STATE_FAILED,
+            SESSION_STATE_CANCELLED,
+            SESSION_STATE_COMPLETED,
+        }:
+            self._completeTask(task.kind, task.subject)
+            return None, None
+        
+        # If session is not expired, failed, or cancelled, and resources haven't been cleaned yet,
+        # session delete task is invalid
+        if (
+            session.state in {
+                SESSION_STATE_EXPIRED,
+                SESSION_STATE_FAILED,
+                SESSION_STATE_CANCELLED,
+            }
+            and not session.resources_cleaned_at
+        ):
+            with self._lock:
+                self.ctx.store.saveSession(session)
+                self._completeTask(task.kind, task.subject)
+            return None, None
+
+        # Retrieve delete due time, if it has not elapsed yet, reschedule to the new time
+        delete_due_at = self._sessionDeleteDueAt(session)
+        if delete_due_at > now:
+            self._rescheduleTask(
+                task.kind,
+                task.subject,
+                due_at=delete_due_at,
+                now=now,
+            )
+            return None, None
+
+        # Session is valid for deletion, proceed to deletion
+        with self._lock:
+            self.ctx.store.deleteSession(session.session_id)
+        logger.info(f"Closed session deleted for session {session.session_id}")
+        return "sessions_deleted", session.session_id
 
     def _processAccountExpire(
         self,
@@ -621,8 +736,11 @@ class Expirer:
             self._completeTask(task.kind, task.subject)
             return None, None
 
-        # If account is not expired, task is invalid
-        if account.status != ACCOUNT_STATE_EXPIRED:
+        # If account is not expired, or failed, account cleanup task is invalid
+        if account.status not in {
+            ACCOUNT_STATE_EXPIRED,
+            ACCOUNT_STATE_FAILED,
+        }:
             self._completeTask(task.kind, task.subject)
             return None, None
         
@@ -683,8 +801,11 @@ class Expirer:
             self._completeTask(task.kind, task.subject)
             return None, None
         
-        # If account is not expired, task is invalid
-        if account.status != ACCOUNT_STATE_EXPIRED:
+        # If account is not expired or failed, account delete task is invalid
+        if account.status not in {
+            ACCOUNT_STATE_EXPIRED,
+            ACCOUNT_STATE_FAILED,
+        }:
             self._completeTask(task.kind, task.subject)
             return None, None
 
@@ -753,9 +874,7 @@ class Expirer:
         return (datetime.fromisoformat(now) + timedelta(seconds=delay)).isoformat()
 
     def _deleteDueAt(self, account) -> str:
-        """Compute the earliest deletion time for an expired, cleaned account.
-        If expired_account_retention_seconds is not configured, the deletion is immediate.
-        """
+        """Compute the earliest deletion time for a closed, cleaned account."""
         # Get a base time either the account expiration time, resources cleaned or current
         anchor = account.expired_at or account.resources_cleaned_at or nowIso()
 
@@ -763,6 +882,28 @@ class Expirer:
         retention = max(self.ctx.config.expired_account_retention_seconds, 0.0)
         if retention <= 0:
             # Return the anchor which would essentially be an immediate deletion
+            return anchor
+        return (datetime.fromisoformat(anchor) + timedelta(seconds=retention)).isoformat()
+
+    def _sessionDeleteDueAt(self, session: SessionRecord) -> str:
+        """Compute the earliest deletion time for a closed session."""
+
+        # Use a base time if it exists in order:
+        # - last time session was updated
+        # - its expiry date
+        # - its creation time
+        # - current time
+        anchor = (
+            session.resources_cleaned_at
+            or session.updated_at
+            or session.expired_at
+            or session.created_at
+            or nowIso()
+        )
+
+        # Check retention time if it exist, compute retention time, if not deletion will be immediate
+        retention = max(self.ctx.config.closed_session_retention_seconds or 0.0, 0.0)
+        if retention <= 0:
             return anchor
         return (datetime.fromisoformat(anchor) + timedelta(seconds=retention)).isoformat()
 

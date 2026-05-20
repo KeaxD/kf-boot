@@ -9,10 +9,13 @@ from kfboot.basing import (
     ACCOUNT_STATE_EXPIRED,
     ACCOUNT_STATE_ONBOARDED,
     CLEANUP_TASK_ACCOUNT_CLEANUP,
+    CLEANUP_TASK_SESSION_CLEANUP,
+    CLEANUP_TASK_SESSION_DELETE,
     CLEANUP_TASK_SESSION_EXPIRE,
     QuotaRecord,
     SESSION_STATE_COMPLETED,
     SESSION_STATE_EXPIRED,
+    SESSION_STATE_FAILED,
     SessionRecord,
 )
 from kfboot.store import (
@@ -323,18 +326,139 @@ def test_refreshSessionLease_extends_expiry_and_tracks_active_ip_sessions(store)
     second.state = SESSION_STATE_COMPLETED
     store.saveSession(second)
 
-    first.expires_at = "2024-01-01T00:00:00+00:00"
+    first.expires_at = "2099-01-01T00:00:00+00:00"
     store.saveSession(first)
 
-    store.refreshSessionLease(first, now="2024-01-01T00:01:00+00:00")
+    store.refreshSessionLease(first, now="2099-01-01T00:01:00+00:00")
 
     refreshed = store.getSession(first.session_id)
-    assert refreshed.updated_at == "2024-01-01T00:01:00+00:00"
-    assert refreshed.expires_at == "2024-01-01T00:02:00+00:00"
+    assert refreshed.updated_at == "2099-01-01T00:01:00+00:00"
+    assert refreshed.expires_at == "2099-01-01T00:02:00+00:00"
 
     active = store.listActiveSessionsForIp("127.0.0.1")
     assert [record.session_id for record in active] == [first.session_id]
     assert store.listActiveSessionsForIp("127.0.0.2")[0].session_id == third.session_id
+
+
+def test_past_due_sessions_are_not_treated_as_active(store):
+    """Test that expired session are not considered when running through the workflow"""
+    # Create a stale session
+    session = store.createSession(
+        ephemeral_aid="E-stale",
+        account_aid="A-stale",
+        account_alias="stale",
+        chosen_profile_code="1-of-1",
+        client_ip="127.0.0.1",
+        region_id="test-region",
+        region_name="Test Region",
+        watcher_required=True,
+        witness_count=1,
+        toad=1,
+        account_tier="trial",
+    )
+    session.expires_at = "2000-01-01T00:00:00+00:00"
+    store.saveSession(session)
+
+    # Assert that workflow does not consider it active/valid
+    assert store.findActiveSessionForEphemeral("E-stale") is None
+    assert store.listActiveSessionsForIp("127.0.0.1") == []
+    assert store.listActiveSessionsForAlias("stale") == []
+
+
+def test_refreshAccountLease_extends_future_expiry_but_not_past_due_accounts(tmp_path):
+    """Test refresh lease for valid accounts but an expired account's lease is not refreshed"""
+    lease_store = Store(
+        str(tmp_path / "account-lease" / "kf-boot"),
+        session_ttl_seconds=60,
+        account_ttl_seconds=120,
+    )
+    try:
+        account = lease_store.buildAccount(
+            account_aid="A-lease",
+            account_alias="lease",
+            witness_profile_code="1-of-1",
+            witness_count=1,
+            toad=1,
+            watcher_required=True,
+            region_id="test-region",
+            region_name="Test Region",
+            session_id="SESSION1",
+            witness_eids=[],
+            watcher_eid="",
+            tier="trial",
+            onboarded=True,
+        )
+
+        # Set the account expiry date
+        account.expires_at = "2024-01-01T00:05:00+00:00"
+        lease_store.saveAccount(account)
+
+        # Attempt to refresh the account lease earlier, before its due date
+        lease_store.refreshAccountLease(account, now="2024-01-01T00:00:00+00:00")
+
+        # Assert its lease was refreshed to a new date which is now + account TTL
+        refreshed = lease_store.getAccount("A-lease")
+        assert refreshed is not None
+        assert refreshed.expires_at == "2024-01-01T00:02:00+00:00"
+
+        # Simulate a past due account 
+        refreshed.expires_at = "2024-01-01T00:00:00+00:00"
+        lease_store.saveAccount(refreshed)
+
+        # Attempt to refresh the account lease after the due date
+        lease_store.refreshAccountLease(refreshed, now="2024-01-01T00:01:00+00:00")
+        
+        # Assert that the account lease is NOT refreshed 
+        preserved = lease_store.getAccount("A-lease")
+        assert preserved is not None
+        assert preserved.expires_at == "2024-01-01T00:00:00+00:00"
+    finally:
+        lease_store.close()
+
+
+def test_closed_sessions_transition_from_cleanup_to_delete_tasks(tmp_path):
+    """Test that session transitions from cleanup state to delete tasks correctly"""
+    lease_store = Store(
+        str(tmp_path / "session-cleanup" / "kf-boot"),
+        session_ttl_seconds=60,
+        closed_session_retention_seconds=90,
+    )
+    try:
+        session = lease_store.createSession(
+            ephemeral_aid="E-close",
+            account_aid="A-close",
+            account_alias="close",
+            chosen_profile_code="1-of-1",
+            client_ip="127.0.0.1",
+            region_id="test-region",
+            region_name="Test Region",
+            watcher_required=True,
+            witness_count=1,
+            toad=1,
+            account_tier="trial",
+        )
+        # Set session state as failed and save it to trigger sync of tasks
+        session.state = SESSION_STATE_FAILED
+        session.updated_at = "2024-01-01T00:00:00+00:00"
+        lease_store.saveSession(session)
+        
+        # Assert session clean up task scheduled for that session
+        cleanup_task = lease_store.getCleanupTask(CLEANUP_TASK_SESSION_CLEANUP, session.session_id)
+        assert cleanup_task is not None
+        assert lease_store.getCleanupTask(CLEANUP_TASK_SESSION_EXPIRE, session.session_id) is None
+        assert lease_store.getCleanupTask(CLEANUP_TASK_SESSION_DELETE, session.session_id) is None
+
+        # Set the session as cleaned up of resources and save it to trigger sync of tasks
+        session.resources_cleaned_at = "2024-01-01T00:01:00+00:00"
+        session.updated_at = session.resources_cleaned_at
+        lease_store.saveSession(session)
+
+        # Assert session delete task scheduled for that session
+        delete_task = lease_store.getCleanupTask(CLEANUP_TASK_SESSION_DELETE, session.session_id)
+        assert delete_task is not None
+        assert delete_task.due_at == "2024-01-01T00:02:30+00:00"
+    finally:
+        lease_store.close()
 
 
 def test_resource_binding_listing_and_api_payloads(store):

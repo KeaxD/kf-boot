@@ -27,6 +27,7 @@ ACCOUNT_STATE_FAILED = "failed"
 
 CLEANUP_TASK_SESSION_EXPIRE = "session_expire"
 CLEANUP_TASK_SESSION_CLEANUP = "session_cleanup"
+CLEANUP_TASK_SESSION_DELETE = "session_delete"
 CLEANUP_TASK_ACCOUNT_EXPIRE = "account_expire"
 CLEANUP_TASK_ACCOUNT_CLEANUP = "account_cleanup"
 CLEANUP_TASK_ACCOUNT_DELETE = "account_delete"

@@ -231,6 +231,8 @@ class Config:
     account_profiles: tuple[AccountProfile, ...] = ()
     witness_backends: tuple[WitnessBackend, ...] = ()
     bootstrap_api_requests_per_minute: int = 10
+    account_ttl_seconds: float = 172800.0       # 48 hours    
+    closed_session_retention_seconds: float | None = None
     cleanup_runner_enabled: bool = True
     cleanup_interval_seconds: float = 60.0
     cleanup_batch_size: int = 100
@@ -245,6 +247,13 @@ class Config:
     def __post_init__(self) -> None:
         if self.bootstrap_api_requests_per_minute < 0:
             raise ValueError("bootstrap_api_requests_per_minute must be greater than or equal to 0.")
+        if self.account_ttl_seconds < 0:
+            raise ValueError("account_ttl_seconds must be greater than or equal to 0.")
+        if (
+            self.closed_session_retention_seconds is not None
+            and self.closed_session_retention_seconds < 0
+        ):
+            raise ValueError("closed_session_retention_seconds must be greater than or equal to 0.")
         if self.cleanup_batch_size <= 0:
             raise ValueError("cleanup_batch_size must be greater than 0.")
         if self.cleanup_time_budget_seconds <= 0:
@@ -265,6 +274,12 @@ class Config:
             raise ValueError("expired_account_retention_seconds must be greater than or equal to 0.")
         if self.cleanup_interval_seconds < 0:
             raise ValueError("cleanup_interval_seconds must be greater than or equal to 0.")
+        if self.closed_session_retention_seconds is None:
+            object.__setattr__(
+                self,
+                "closed_session_retention_seconds",
+                float(max(self.session_ttl_seconds, 0)),
+            )
 
         backends = tuple(self.witness_backends)
         if not backends:
@@ -349,6 +364,8 @@ class Config:
             f"Account Profiles: {', '.join(f'{profile.code} (tier={profile.tier})' for profile in account_profiles)}\n"
             f"Bootstrap Account per IP: {self.bootstrap_accounts_per_ip}\n"
             f"Bootstrap API requests per minute: {self.bootstrap_api_requests_per_minute}\n"
+            f"Account TTL seconds: {self.account_ttl_seconds}\n"
+            f"Closed session retention seconds: {self.closed_session_retention_seconds}\n"
             f"Cleanup runner enabled: {self.cleanup_runner_enabled}\n"
             f"Cleanup interval seconds: {self.cleanup_interval_seconds}\n"
             f"Cleanup batch size: {self.cleanup_batch_size}\n"
@@ -408,6 +425,7 @@ class Config:
 
         account_profiles_env = os.environ.get("KF_BOOT_ACCOUNT_PROFILES", "")
         account_profiles = _parse_account_profiles(account_profiles_env) if account_profiles_env else ()
+        closed_session_retention_env = os.environ.get("KF_BOOT_CLOSED_SESSION_RETENTION_SECONDS")
 
         return cls(
             host=host,
@@ -442,6 +460,14 @@ class Config:
             witness_backends=witness_backends,
             bootstrap_api_requests_per_minute=int(
                 _env("BOOTSTRAP_API_REQUESTS_PER_MINUTE", "10")
+            ),
+            account_ttl_seconds=float(
+                _env("ACCOUNT_TTL_SECONDS", "86400")
+            ),
+            closed_session_retention_seconds=(
+                float(closed_session_retention_env)
+                if closed_session_retention_env is not None
+                else None
             ),
             cleanup_runner_enabled=_parse_bool(
                 _env("CLEANUP_RUNNER_ENABLED", "true"),

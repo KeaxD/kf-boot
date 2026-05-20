@@ -145,6 +145,8 @@ def test_config_from_env_parses_cleanup_settings(monkeypatch):
     )
     monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
     monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example")
+    monkeypatch.setenv("KF_BOOT_ACCOUNT_TTL_SECONDS", "1800")
+    monkeypatch.setenv("KF_BOOT_CLOSED_SESSION_RETENTION_SECONDS", "90")
     monkeypatch.setenv("KF_BOOT_CLEANUP_INTERVAL_SECONDS", "15")
     monkeypatch.setenv("KF_BOOT_CLEANUP_BATCH_SIZE", "7")
     monkeypatch.setenv("KF_BOOT_CLEANUP_TIME_BUDGET_SECONDS", "3")
@@ -157,6 +159,8 @@ def test_config_from_env_parses_cleanup_settings(monkeypatch):
 
     config = Config.from_env()
 
+    assert config.account_ttl_seconds == 1800
+    assert config.closed_session_retention_seconds == 90
     assert config.cleanup_interval_seconds == 15
     assert config.cleanup_batch_size == 7
     assert config.cleanup_time_budget_seconds == 3

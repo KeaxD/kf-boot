@@ -216,7 +216,9 @@ class Limiter:
 
         count += 1
         account.api_used = count
-        if count >= profile.api_budget and not account.expires_at:
+
+        # Make sure an account gets marked for expiry as soon as it reaches its limit even if there is no expiry time
+        if count >= profile.api_budget:
             account.expires_at = nowIso()
             logger.info(
                 f"API budget limit reached for account {account_aid}. "
