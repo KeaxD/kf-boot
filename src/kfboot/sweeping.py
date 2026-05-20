@@ -145,6 +145,11 @@ class CleanupRunner:
         """Return whether this runner is configured to start."""
         return self._enabled and self.interval > 0
 
+    @property
+    def is_running(self) -> bool:
+        """Return whether the cleanup thread is currently alive."""
+        return self._thread is not None and self._thread.is_alive()
+
     def start(self) -> None:
         """Start the background cleanup thread if cleanup is enabled."""
         if not self._enabled:

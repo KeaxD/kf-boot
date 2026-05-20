@@ -744,7 +744,7 @@ class Expirer:
             self._completeTask(task.kind, task.subject)
             return None, None
         
-        # If account resources hasn't been cleaned up yet, task is invalid
+        # If account resources has been cleaned up, task is invalid
         if account.resources_cleaned_at:
             with self._lock:
                 # Save the account to trigger a reprocess of tasks based on its state

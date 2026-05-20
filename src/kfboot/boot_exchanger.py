@@ -185,8 +185,39 @@ class SessionStartHandler(RouteHandler):
                 and existing.session_id in newly_expired_session_ids
             ):
                 existing = None
+            elif (
+                existing is not None
+                and existing.state in {
+                    SESSION_STATE_EXPIRED,
+                    SESSION_STATE_FAILED,
+                    SESSION_STATE_CANCELLED,
+                }
+                and existing.resources_cleaned_at
+            ):
+                # Once a closed session has finished cleanup, it should no longer
+                # shadow fresh starts for the same ephemeral principal.
+                existing = None
         if existing is not None:
             session = existing
+
+        if session is None:
+            # Check if there is an outstanding session for that sender waiting for cleanup
+            blocking = self.exchanger.findCleanupBlockingSession(
+                sender=sender,
+                account_aid=account_aid,
+            )
+            if blocking is not None:
+                logger.warning(
+                    f"Session start rejected because cleanup is still pending for closed session "
+                    f"{blocking.session_id} on account AID {account_aid}"
+                )
+                raise falcon.HTTPConflict(
+                    title="Session cleanup pending",
+                    description=(
+                        "The previous onboarding session is closed but its hosted resources are still "
+                        "being reclaimed. Retry after cleanup completes."
+                    ),
+                )
 
         if session is not None:
             session = self.exchanger.admitter.reconcileExistingStartSession(
@@ -995,6 +1026,40 @@ class BootExchanger(Exchanger):
             )
 
         return account_aid, account
+
+    def findCleanupBlockingSession(self, *, sender: str, account_aid: str) -> SessionRecord | None:
+        """Return a closed session that still owns cleanup debt for this start request.
+
+        We check the latest account-bound and ephemeral-bound sessions because those are
+        the records most likely to be revived by repeated start attempts. A closed session
+        without `resources_cleaned_at` still represents live hosted resources that should
+        be reclaimed before issuing a fresh allocation.
+        """
+        # Create a seen set
+        seen: set[str] = set()
+        
+        # Iterate through session for that account aid/ephemeral
+        for candidate in (
+            self.ctx.store.findSessionForAccount(account_aid),
+            self.ctx.store.findSessionForEphemeral(sender),
+        ):
+            if candidate is None or candidate.session_id in seen:
+                continue
+            seen.add(candidate.session_id)
+
+            # Check if it is in a terminal state
+            if candidate.state not in {
+                SESSION_STATE_EXPIRED,
+                SESSION_STATE_FAILED,
+                SESSION_STATE_CANCELLED,
+            }:
+                continue
+
+            # Check if it was cleaned
+            if candidate.resources_cleaned_at:
+                continue
+            return candidate
+        return None
 
     def accountPastDue(self, account: AccountRecord) -> bool:
         """Checks expiration of an account"""

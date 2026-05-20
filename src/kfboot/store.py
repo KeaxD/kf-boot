@@ -249,6 +249,46 @@ class Store:
         # Remove it from the cleanup task table
         self.baser.cleanup_tasks.rem(keys=(kind, subject))
 
+    def cleanupBacklogSnapshot(self, *, now: str | None = None) -> dict[str, Any]:
+        """Return a lightweight snapshot of cleanup queue health reporting.
+
+        This walks the durable task table directly instead of depending on the due-time
+        index so health remains informative even if the due index ever contains stale rows.
+        """
+
+        current = now or nowIso()
+        current_dt = _parseDt(current)
+        pending_tasks = 0
+        due_tasks = 0
+        oldest_due_dt: datetime | None = None
+
+        for _, task in self.baser.cleanup_tasks.getTopItemIter(keys=()):
+            pending_tasks += 1
+            if not task.due_at:
+                continue
+            try:
+                task_due_dt = _parseDt(task.due_at)
+            except ValueError:
+                continue
+            if task_due_dt > current_dt:
+                continue
+            due_tasks += 1
+            if oldest_due_dt is None or task_due_dt < oldest_due_dt:
+                oldest_due_dt = task_due_dt
+
+        oldest_due_at = oldest_due_dt.isoformat() if oldest_due_dt is not None else None
+        oldest_due_age_seconds = (
+            max((current_dt - oldest_due_dt).total_seconds(), 0.0)
+            if oldest_due_dt is not None
+            else None
+        )
+        return {
+            "pending_tasks": pending_tasks,
+            "due_tasks": due_tasks,
+            "oldest_due_at": oldest_due_at,
+            "oldest_due_age_seconds": oldest_due_age_seconds,
+        }
+
     def listDueCleanupTasks(
         self,
         *,
@@ -593,6 +633,30 @@ class Store:
             ACCOUNT_STATE_EXPIRED,
             ACCOUNT_STATE_FAILED,
         }
+
+        # Failed pending accounts still tied to a failed/expired/cancelled session should
+        # let the session cleanup phase own teardown. This avoids scheduling a second
+        # account_cleanup task on the same resources while the session cleanup
+        # task is already responsible for cleaning it.
+        if (
+            record.status == ACCOUNT_STATE_FAILED
+            and record.session_id
+            and not record.resources_cleaned_at
+        ):
+            linked_session = self.getSession(record.session_id)
+            if (
+                linked_session is not None
+                and linked_session.state in {
+                    SESSION_STATE_EXPIRED,
+                    SESSION_STATE_FAILED,
+                    SESSION_STATE_CANCELLED,
+                }
+                and not linked_session.resources_cleaned_at
+            ):
+                self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_EXPIRE, record.account_aid)
+                self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_CLEANUP, record.account_aid)
+                self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_DELETE, record.account_aid)
+                return
 
         if record.status in closed_states:
             self._deleteCleanupTaskIfPresent(CLEANUP_TASK_ACCOUNT_EXPIRE, record.account_aid)

@@ -9,6 +9,7 @@ from kfboot.basing import (
     ACCOUNT_STATE_EXPIRED,
     ACCOUNT_STATE_ONBOARDED,
     CLEANUP_TASK_ACCOUNT_CLEANUP,
+    CLEANUP_TASK_ACCOUNT_DELETE,
     CLEANUP_TASK_SESSION_CLEANUP,
     CLEANUP_TASK_SESSION_DELETE,
     CLEANUP_TASK_SESSION_EXPIRE,
@@ -457,6 +458,94 @@ def test_closed_sessions_transition_from_cleanup_to_delete_tasks(tmp_path):
         delete_task = lease_store.getCleanupTask(CLEANUP_TASK_SESSION_DELETE, session.session_id)
         assert delete_task is not None
         assert delete_task.due_at == "2024-01-01T00:02:30+00:00"
+    finally:
+        lease_store.close()
+
+
+def test_cleanup_backlog_snapshot_reports_due_work(store):
+    session = store.createSession(
+        ephemeral_aid="E-backlog",
+        account_aid="A-backlog",
+        account_alias="alpha",
+        chosen_profile_code="1-of-1",
+        client_ip="127.0.0.1",
+        region_id="test-region",
+        region_name="Test Region",
+        watcher_required=True,
+        witness_count=1,
+        toad=1,
+        account_tier="trial",
+    )
+    session.expires_at = "2024-01-01T00:00:00+00:00"
+    store.saveSession(session)
+
+    snapshot = store.cleanupBacklogSnapshot(now="2024-01-01T00:00:10+00:00")
+
+    assert snapshot["pending_tasks"] == 1
+    assert snapshot["due_tasks"] == 1
+    assert snapshot["oldest_due_at"] == "2024-01-01T00:00:00+00:00"
+    assert snapshot["oldest_due_age_seconds"] == 10.0
+
+
+def test_failed_pending_account_defers_cleanup_to_linked_session(tmp_path):
+    lease_store = Store(
+        str(tmp_path / "failed-pending-account" / "kf-boot"),
+        session_ttl_seconds=60,
+        closed_session_retention_seconds=90,
+    )
+    try:
+        session = lease_store.createSession(
+            ephemeral_aid="E-failed",
+            account_aid="A-failed",
+            account_alias="alpha",
+            chosen_profile_code="1-of-1",
+            client_ip="127.0.0.1",
+            region_id="test-region",
+            region_name="Test Region",
+            watcher_required=True,
+            witness_count=1,
+            toad=1,
+            account_tier="trial",
+        )
+        # Fail the session
+        session.state = SESSION_STATE_FAILED
+        session.updated_at = "2024-01-01T00:00:00+00:00"
+        lease_store.saveSession(session)
+
+        account = lease_store.buildAccount(
+            account_aid="A-failed",
+            account_alias="alpha",
+            witness_profile_code="1-of-1",
+            witness_count=1,
+            toad=1,
+            watcher_required=True,
+            region_id="test-region",
+            region_name="Test Region",
+            session_id=session.session_id,
+            witness_eids=[],
+            watcher_eid="",
+            tier="trial",
+            onboarded=False,
+        )
+        # Fail the account
+        account.status = ACCOUNT_STATE_FAILED
+        lease_store.saveAccount(account)
+
+        # The failed session should own teardown until it records cleanup, so the
+        # linked failed account must not schedule a second account_cleanup task.
+        assert lease_store.getCleanupTask(CLEANUP_TASK_SESSION_CLEANUP, session.session_id) is not None
+        assert lease_store.getCleanupTask(CLEANUP_TASK_ACCOUNT_CLEANUP, account.account_aid) is None
+
+        # Assert session work
+        session.resources_cleaned_at = "2024-01-01T00:01:00+00:00"
+        session.updated_at = session.resources_cleaned_at
+        lease_store.saveSession(session)
+        account.resources_cleaned_at = session.resources_cleaned_at
+        account.session_id = ""
+        lease_store.saveAccount(account)
+
+        assert lease_store.getCleanupTask(CLEANUP_TASK_ACCOUNT_CLEANUP, account.account_aid) is None
+        assert lease_store.getCleanupTask(CLEANUP_TASK_ACCOUNT_DELETE, account.account_aid) is not None
     finally:
         lease_store.close()
 

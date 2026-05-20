@@ -257,37 +257,50 @@ def test_session_start_rejects_closed_existing_session_without_new_allocations(c
     assert contract.ctx.watcher_boot.create_calls == 1
 
 
-def test_session_start_marks_past_due_session_expired_and_creates_a_fresh_session(contract):
-    """Test that an expired session cannot be 'revived', a new session is created instead"""
+def test_session_start_marks_past_due_session_expired_and_blocks_until_cleanup_finishes(contract):
+    """Expired sessions must finish cleanup before a fresh allocation can be created."""
     with habbing.openHab(name="start-past-due-session", temp=True, transferable=False) as (_, ephemeral):
         register_aid(contract, "/onboarding", ephemeral)
         _, _, first = start_session(contract, ephemeral)
         first_session_id = first.ked["a"]["session_id"]
 
-        # Set the session as expired
+        # Force the existing session past its lease so the next start request
+        # must close it instead of reusing or refreshing it.
         stale = contract.ctx.store.getSession(first_session_id)
         stale.expires_at = "2000-01-01T00:00:00+00:00"
         contract.ctx.store.saveSession(stale)
 
-        # Send a session/start request 
+        # The retry marks the stale session expired, but it should not hand out
+        # a brand-new session until cleanup has reclaimed the old resources.
         retry = post_cesr(
             contract,
             "/onboarding",
             build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
         )
-        _, retry_reply = assert_reply_frame(contract, retry, route="/onboarding/session/start")
-
         refreshed_old = contract.ctx.store.getSession(first_session_id)
 
-        # Assert that the session returned is a new session and not the expired one
-        assert retry.status_code == 200
-        assert retry_reply.ked["a"]["session_id"] != first_session_id
-
-        # Assert that the first session is expired
+        assert retry.status_code == 409
+        assert retry.json["title"] == "Session cleanup pending"
         assert refreshed_old is not None
         assert refreshed_old.state == SESSION_STATE_EXPIRED
+        assert refreshed_old.resources_cleaned_at == ""
+        assert total_witness_create_calls(contract.ctx) == 1
+        assert contract.ctx.watcher_boot.create_calls == 1
 
-        # Assert that the calls for resources was done twice, one for each session
+        # Once cleanup runs, a follow-up start may allocate a fresh session safely.
+        cleaned = contract.ctx.exchanger.expirer.cleanupExpiredSessions(
+            now="2099-01-01T00:00:00+00:00"
+        )
+        assert cleaned == [first_session_id]
+
+        second_retry = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+        )
+        _, retry_reply = assert_reply_frame(contract, second_retry, route="/onboarding/session/start")
+        assert second_retry.status_code == 200
+        assert retry_reply.ked["a"]["session_id"] != first_session_id
         assert total_witness_create_calls(contract.ctx) == 2
         assert contract.ctx.watcher_boot.create_calls == 2
 
@@ -438,7 +451,7 @@ def test_session_status_refreshes_session_lease(contract):
         assert refreshed.expires_at != "2099-01-01T00:00:00+00:00"
 
 
-def test_partial_downstream_failure_marks_sessionFailed_and_blind_retry_does_not_duplicate_resources(contract_factory):
+def test_partial_downstream_failure_cleans_resources_and_allows_fresh_retry(contract_factory):
     contract = contract_factory(
         watcher_boot=FakeWatcherBoot(create_error=boot_error(503, "simulated watcher failure"))
     )
@@ -476,9 +489,16 @@ def test_partial_downstream_failure_marks_sessionFailed_and_blind_retry_does_not
                 payload=start_payload(chosen_profile_code="3-of-4"),
             ),
         )
-        assert retry.status_code == 409
-        assert total_witness_create_calls(contract.ctx) == 4
-        assert contract.ctx.watcher_boot.create_calls == 1
+        # Cleanup already succeeded for the failed session, so the next start
+        # is allowed to attempt a brand-new allocation instead of being blocked
+        # behind stale cleanup debt. The downstream watcher still fails, but the
+        # retry should not leak resources from either attempt.
+        assert retry.status_code == 503
+        assert total_witness_create_calls(contract.ctx) == 8
+        assert contract.ctx.watcher_boot.create_calls == 2
+        assert contract.ctx.store.countResources("witness") == 0
+        assert contract.ctx.store.countResources("watcher") == 0
+        assert sorted(total_witness_delete_calls(contract.ctx)) == sorted(total_witness_created_eids(contract.ctx))
 
 
 def test_failed_session_teardown_is_retried_by_cleanup_tasks(contract_factory, monkeypatch):
@@ -640,8 +660,10 @@ def test_session_start_enforces_watcher_capacity_without_duplicate_witnesses(con
             build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
         )
         assert retry.status_code == 409
-        assert total_witness_create_calls(contract.ctx) == 1
+        assert total_witness_create_calls(contract.ctx) == 2
         assert contract.ctx.watcher_boot.create_calls == 0
+        assert contract.ctx.store.countResources("witness") == 0
+        assert contract.ctx.store.countResources("watcher") == 0
 
 
 def test_session_start_enforces_per_ip_account_limit(contract_factory):

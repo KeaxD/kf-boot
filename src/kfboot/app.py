@@ -70,8 +70,30 @@ class Context:
 
 
 class HealthEnd:
+    def __init__(self, ctx: Context):
+        self.ctx = ctx
+
     def on_get(self, _req: falcon.Request, rep: falcon.Response) -> None:
-        rep.media = {"status": "ok"}
+        runner = self.ctx.cleanup_runner
+        configured = bool(self.ctx.config.cleanup_runner_enabled)
+        expected_running = bool(runner.enabled) if runner is not None else False
+        running = bool(runner.is_running) if runner is not None else False
+
+        # Expose cleanup queue pressure so operators can tell the difference
+        # between "no work pending" and "work is piling up behind the sweeper".
+        cleanup = {
+            "configured": configured,
+            "expected_running": expected_running,
+            "running": running,
+            **self.ctx.store.cleanupBacklogSnapshot(),
+        }
+        if expected_running and not running:
+            rep.status = falcon.HTTP_503
+            cleanup["reason"] = "runner_not_running"
+            rep.media = {"status": "degraded", "cleanup": cleanup}
+            return
+
+        rep.media = {"status": "ok", "cleanup": cleanup}
 
 
 class BootstrapConfigEnd:
@@ -186,7 +208,7 @@ def create_app(config: Config | None = None, *, temp: bool = False) -> tuple[fal
     ctx.cleanup_runner.start()
 
     app = falcon.App()
-    app.add_route("/health", HealthEnd())
+    app.add_route("/health", HealthEnd(ctx))
     app.add_route("/bootstrap/config", BootstrapConfigEnd(ctx))
     app.add_route(config.onboarding_path, CesrSurfaceEnd(ctx, surface="onboarding"))
     app.add_route(config.account_path, CesrSurfaceEnd(ctx, surface="account"))

@@ -19,7 +19,18 @@ from .support import (
 def test_public_discovery_stays_plain_json_and_reply_frames_prepend_boot_kel(contract):
     health = contract.simulate_get("/health")
     assert health.status_code == 200
-    assert health.json == {"status": "ok"}
+    assert health.json == {
+        "status": "ok",
+        "cleanup": {
+            "configured": True,
+            "expected_running": False,
+            "running": False,
+            "pending_tasks": 0,
+            "due_tasks": 0,
+            "oldest_due_at": None,
+            "oldest_due_age_seconds": None,
+        },
+    }
     assert "connection" not in {key.lower() for key in health.headers}
 
     config = contract.simulate_get("/bootstrap/config")
@@ -49,6 +60,22 @@ def test_public_discovery_stays_plain_json_and_reply_frames_prepend_boot_kel(con
         assert reply.ked["r"] == "/onboarding/session/start"
         assert reply.ked["i"] == contract.ctx.host_hab.pre
         assert reply.ked["a"]["session_id"].startswith("sess_")
+
+
+def test_health_reports_cleanup_runner_failure_when_cleanup_should_be_running(contract_factory):
+    contract = contract_factory(cleanup_interval_seconds=60)
+    # Stop the sweeper
+    contract.ctx.cleanup_runner.stop()
+
+    health = contract.simulate_get("/health")   
+    
+    # Assert health report
+    assert health.status_code == 503
+    assert health.json["status"] == "degraded"
+    assert health.json["cleanup"]["configured"] is True
+    assert health.json["cleanup"]["expected_running"] is True
+    assert health.json["cleanup"]["running"] is False
+    assert health.json["cleanup"]["reason"] == "runner_not_running"
 
 
 def test_public_discovery_only_advertises_profiles_supported_by_configured_witness_backends(contract_factory):
