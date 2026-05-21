@@ -128,13 +128,36 @@ class Store:
         try:
             expires_at = _parseDt(record.expires_at)
         except ValueError:
-            return False
+            # Invalid expiry metadata should fail closed so corrupted sessions do
+            # not remain active forever or keep bypassing cleanup accounting.
+            return True
 
         return expires_at <= _parseDt(now or nowIso())
 
     def _sessionIsActive(self, record: SessionRecord, *, now: str | None = None) -> bool:
         """Return True when the session is still usable for admission purposes"""
         return record.state not in TERMINAL_SESSION_STATES and not self._sessionPastDue(record, now=now)
+
+    def _sessionHasCleanupDebt(self, record: SessionRecord) -> bool:
+        """Check if a closed session's resources still needs to be cleaned"""
+        return (
+            record.state in {
+                SESSION_STATE_EXPIRED,
+                SESSION_STATE_FAILED,
+                SESSION_STATE_CANCELLED,
+            }
+            and not record.resources_cleaned_at
+        )
+
+    def _sessionConsumesAdmission(self, record: SessionRecord, *, now: str | None = None) -> bool:
+        """Return True when a session should still count against onboarding admission.
+
+        Active sessions count towards onboarding capacity, but closed sessions that
+        have not finished cleanup still tie up hosted resources. We keep counting that
+        cleanup debt so callers cannot rotate principals or aliases to hoard capacity
+        while the sweeper is still reclaiming the previous session's resources.
+        """
+        return self._sessionIsActive(record, now=now) or self._sessionHasCleanupDebt(record)
 
     def getQuota(self, scope: str, subject: str) -> QuotaRecord | None:
         return self.baser.quotas.get(keys=(scope, subject))
@@ -260,10 +283,20 @@ class Store:
         current_dt = _parseDt(current)
         pending_tasks = 0
         due_tasks = 0
+        claimed_tasks = 0
         oldest_due_dt: datetime | None = None
+        oldest_claimed_dt: datetime | None = None
 
         for _, task in self.baser.cleanup_tasks.getTopItemIter(keys=()):
             pending_tasks += 1
+            if task.claimed_by or task.claimed_at or task.claim_expires_at:
+                claimed_tasks += 1
+                try:
+                    claimed_dt = _parseDt(task.claimed_at or task.updated_at or task.created_at)
+                except ValueError:
+                    claimed_dt = None
+                if claimed_dt is not None and (oldest_claimed_dt is None or claimed_dt < oldest_claimed_dt):
+                    oldest_claimed_dt = claimed_dt
             if not task.due_at:
                 continue
             try:
@@ -282,12 +315,43 @@ class Store:
             if oldest_due_dt is not None
             else None
         )
+        oldest_claimed_at = oldest_claimed_dt.isoformat() if oldest_claimed_dt is not None else None
+        oldest_claimed_age_seconds = (
+            max((current_dt - oldest_claimed_dt).total_seconds(), 0.0)
+            if oldest_claimed_dt is not None
+            else None
+        )
         return {
             "pending_tasks": pending_tasks,
             "due_tasks": due_tasks,
+            "claimed_tasks": claimed_tasks,
             "oldest_due_at": oldest_due_at,
             "oldest_due_age_seconds": oldest_due_age_seconds,
+            "oldest_claimed_at": oldest_claimed_at,
+            "oldest_claimed_age_seconds": oldest_claimed_age_seconds,
         }
+
+    def requeueClaimedCleanupTasks(self, *, now: str | None = None) -> int:
+        """Make previously claimed tasks immediately visible again"""
+
+        current = now or nowIso()
+        recovered = 0
+        tasks = [task for _, task in self.baser.cleanup_tasks.getTopItemIter(keys=())]
+
+        for task in tasks:
+            if not (task.claimed_by or task.claimed_at or task.claim_expires_at):
+                continue
+
+            previous_due_at = task.due_at
+            task.due_at = current
+            task.updated_at = current
+            task.claimed_by = ""
+            task.claimed_at = ""
+            task.claim_expires_at = ""
+            self._saveCleanupTask(task, previous_due_at=previous_due_at)
+            recovered += 1
+
+        return recovered
 
     def listDueCleanupTasks(
         self,
@@ -829,6 +893,17 @@ class Store:
         return record
 
     def saveSession(self, record: SessionRecord) -> None:
+        if record.state not in TERMINAL_SESSION_STATES and record.expires_at:
+            try:
+                _parseDt(record.expires_at)
+            except ValueError:
+                # Fail closed on corrupted session expiry metadata so cleanup can
+                # reclaim staged resources instead of leaving the session open forever.
+                current = nowIso()
+                record.state = SESSION_STATE_EXPIRED
+                record.expired_at = record.expired_at or current
+                record.updated_at = current
+
         # Update session 
         self.baser.sessions.pin(keys=(record.session_id,), val=record)
 
@@ -913,6 +988,16 @@ class Store:
         return rows
 
     def saveAccount(self, record: AccountRecord) -> None:
+        if record.status == ACCOUNT_STATE_ONBOARDED and record.expires_at:
+            try:
+                _parseDt(record.expires_at)
+            except ValueError:
+                # Fail closed on corrupted account expiry metadata so the account
+                # cannot remain indefinitely active while automatic cleanup is disabled.
+                current = nowIso()
+                record.status = ACCOUNT_STATE_EXPIRED
+                record.expired_at = record.expired_at or current
+
         # Save the account in DB
         self.baser.accounts.pin(keys=(record.account_aid,), val=record)
         # Check for account task based on the newly saved session state
@@ -953,6 +1038,18 @@ class Store:
         rows.sort(key=lambda record: _sortValue(record.created_at), reverse=True)
         return rows
 
+    def listAdmissionSessionsForIp(self, client_ip: str, *, now: str | None = None) -> list[SessionRecord]:
+        """Return sessions that still consume onboarding capacity for this IP."""
+        rows = []
+        for _, record in self.baser.sessions.getTopItemIter(keys=()):
+            if record.client_ip != client_ip:
+                continue
+            if not self._sessionConsumesAdmission(record, now=now):
+                continue
+            rows.append(record)
+        rows.sort(key=lambda record: _sortValue(record.created_at), reverse=True)
+        return rows
+
     def listActiveSessionsForAlias(self, account_alias: str) -> list[SessionRecord]:
         """Return a list of active SessionRecords matching the given account alias"""
         rows = []
@@ -960,6 +1057,18 @@ class Store:
             if record.account_alias != account_alias:
                 continue
             if not self._sessionIsActive(record):
+                continue
+            rows.append(record)
+        rows.sort(key=lambda record: _sortValue(record.created_at), reverse=True)
+        return rows
+
+    def listAdmissionSessionsForAlias(self, account_alias: str, *, now: str | None = None) -> list[SessionRecord]:
+        """Return alias sessions that still occupy onboarding capacity."""
+        rows = []
+        for _, record in self.baser.sessions.getTopItemIter(keys=()):
+            if record.account_alias != account_alias:
+                continue
+            if not self._sessionConsumesAdmission(record, now=now):
                 continue
             rows.append(record)
         rows.sort(key=lambda record: _sortValue(record.created_at), reverse=True)

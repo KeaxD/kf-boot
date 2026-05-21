@@ -483,8 +483,131 @@ def test_cleanup_backlog_snapshot_reports_due_work(store):
 
     assert snapshot["pending_tasks"] == 1
     assert snapshot["due_tasks"] == 1
+    assert snapshot["claimed_tasks"] == 0
     assert snapshot["oldest_due_at"] == "2024-01-01T00:00:00+00:00"
     assert snapshot["oldest_due_age_seconds"] == 10.0
+    assert snapshot["oldest_claimed_at"] is None
+    assert snapshot["oldest_claimed_age_seconds"] is None
+
+
+def test_cleanup_backlog_snapshot_reports_claimed_work(store):
+    session = store.createSession(
+        ephemeral_aid="E-claimed",
+        account_aid="A-claimed",
+        account_alias="alpha",
+        chosen_profile_code="1-of-1",
+        client_ip="127.0.0.1",
+        region_id="test-region",
+        region_name="Test Region",
+        watcher_required=True,
+        witness_count=1,
+        toad=1,
+        account_tier="trial",
+    )
+    session.expires_at = "2024-01-01T00:00:00+00:00"
+    store.saveSession(session)
+
+    task = store.claimDueCleanupTask(
+        now="2024-01-01T00:00:05+00:00",
+        owner_id="runner-1",
+        claim_ttl_seconds=300,
+    )
+
+    snapshot = store.cleanupBacklogSnapshot(now="2024-01-01T00:00:10+00:00")
+
+    assert task is not None
+    assert snapshot["pending_tasks"] == 1
+    assert snapshot["due_tasks"] == 0
+    assert snapshot["claimed_tasks"] == 1
+    assert snapshot["oldest_claimed_at"] == "2024-01-01T00:00:05+00:00"
+    assert snapshot["oldest_claimed_age_seconds"] == 5.0
+
+
+def test_requeue_claimed_cleanup_tasks_makes_work_immediately_visible_again(store):
+    session = store.createSession(
+        ephemeral_aid="E-recover",
+        account_aid="A-recover",
+        account_alias="alpha",
+        chosen_profile_code="1-of-1",
+        client_ip="127.0.0.1",
+        region_id="test-region",
+        region_name="Test Region",
+        watcher_required=True,
+        witness_count=1,
+        toad=1,
+        account_tier="trial",
+    )
+    session.expires_at = "2024-01-01T00:00:00+00:00"
+    store.saveSession(session)
+
+    claimed = store.claimDueCleanupTask(
+        now="2024-01-01T00:00:05+00:00",
+        owner_id="runner-1",
+        claim_ttl_seconds=300,
+    )
+
+    recovered = store.requeueClaimedCleanupTasks(now="2024-01-01T00:00:10+00:00")
+    task = store.getCleanupTask(CLEANUP_TASK_SESSION_EXPIRE, session.session_id)
+    due = store.listDueCleanupTasks(now="2024-01-01T00:00:10+00:00")
+
+    assert claimed is not None
+    assert recovered == 1
+    assert task is not None
+    assert task.claimed_by == ""
+    assert task.claimed_at == ""
+    assert task.claim_expires_at == ""
+    assert task.due_at == "2024-01-01T00:00:10+00:00"
+    assert [row.subject for row in due] == [session.session_id]
+
+
+def test_save_session_with_invalid_expiry_fails_closed(store):
+    session = store.createSession(
+        ephemeral_aid="E-invalid-session",
+        account_aid="A-invalid-session",
+        account_alias="alpha",
+        chosen_profile_code="1-of-1",
+        client_ip="127.0.0.1",
+        region_id="test-region",
+        region_name="Test Region",
+        watcher_required=True,
+        witness_count=1,
+        toad=1,
+        account_tier="trial",
+    )
+    session.expires_at = "not-a-timestamp"
+    store.saveSession(session)
+
+    updated = store.getSession(session.session_id)
+    assert updated is not None
+    assert updated.state == SESSION_STATE_EXPIRED
+    assert updated.expired_at
+    assert store.getCleanupTask(CLEANUP_TASK_SESSION_CLEANUP, session.session_id) is not None
+
+
+def test_save_account_with_invalid_expiry_fails_closed(store):
+    account = store.buildAccount(
+        account_aid="A-invalid-account",
+        account_alias="alpha",
+        witness_profile_code="1-of-1",
+        witness_count=1,
+        toad=1,
+        watcher_required=True,
+        region_id="test-region",
+        region_name="Test Region",
+        session_id="sess_invalid",
+        witness_eids=[],
+        watcher_eid="",
+        tier="trial",
+        onboarded=True,
+    )
+    account.expires_at = "not-a-timestamp"
+    store.saveAccount(account)
+
+    updated = store.getAccount(account.account_aid)
+    assert updated is not None
+    assert updated.status == ACCOUNT_STATE_EXPIRED
+    assert updated.expired_at
+    assert store.getCleanupTask(CLEANUP_TASK_ACCOUNT_CLEANUP, account.account_aid) is not None
 
 
 def test_failed_pending_account_defers_cleanup_to_linked_session(tmp_path):

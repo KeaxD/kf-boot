@@ -146,12 +146,13 @@ def test_config_from_env_parses_cleanup_settings(monkeypatch):
     monkeypatch.setenv("KF_BOOT_WAT_BOOT_URL", "http://boot.local/watchers")
     monkeypatch.setenv("KF_BOOT_WAT_PUBLIC_URL", "https://watcher.example")
     monkeypatch.setenv("KF_BOOT_ACCOUNT_TTL_SECONDS", "1800")
+    monkeypatch.setenv("KF_BOOT_BOOT_API_TIMEOUT_SECONDS", "12")
     monkeypatch.setenv("KF_BOOT_CLOSED_SESSION_RETENTION_SECONDS", "90")
     monkeypatch.setenv("KF_BOOT_CLEANUP_INTERVAL_SECONDS", "15")
     monkeypatch.setenv("KF_BOOT_CLEANUP_BATCH_SIZE", "7")
     monkeypatch.setenv("KF_BOOT_CLEANUP_TIME_BUDGET_SECONDS", "3")
+    monkeypatch.setenv("KF_BOOT_CLEANUP_STOP_TIMEOUT_SECONDS", "18")
     monkeypatch.setenv("KF_BOOT_CLEANUP_TASK_CLAIM_TTL_SECONDS", "33")
-    monkeypatch.setenv("KF_BOOT_CLEANUP_LEADER_TTL_SECONDS", "77")
     monkeypatch.setenv("KF_BOOT_CLEANUP_FAILURE_BACKOFF_SECONDS", "45")
     monkeypatch.setenv("KF_BOOT_CLEANUP_FAILURE_BACKOFF_MAX_SECONDS", "300")
     monkeypatch.setenv("KF_BOOT_CLEANUP_FAILURE_JITTER_SECONDS", "2")
@@ -160,12 +161,13 @@ def test_config_from_env_parses_cleanup_settings(monkeypatch):
     config = Config.from_env()
 
     assert config.account_ttl_seconds == 1800
+    assert config.boot_api_timeout_seconds == 12
     assert config.closed_session_retention_seconds == 90
     assert config.cleanup_interval_seconds == 15
     assert config.cleanup_batch_size == 7
     assert config.cleanup_time_budget_seconds == 3
+    assert config.cleanup_stop_timeout_seconds == 18
     assert config.cleanup_task_claim_ttl_seconds == 33
-    assert config.cleanup_leader_ttl_seconds == 77
     assert config.cleanup_failure_backoff_seconds == 45
     assert config.cleanup_failure_backoff_max_seconds == 300
     assert config.cleanup_failure_jitter_seconds == 2
@@ -317,3 +319,8 @@ def test_config_from_env_rejects_malformed_witness_backend_entry(monkeypatch):
 def test_config_rejects_duplicate_witness_backend_identity(tmp_path, witness_backends, message):
     with pytest.raises(ValueError, match=message):
         make_config(tmp_path, witness_backends=witness_backends)
+
+
+def test_config_rejects_nonpositive_session_ttl(tmp_path):
+    with pytest.raises(ValueError, match="session_ttl_seconds must be greater than 0"):
+        make_config(tmp_path, session_ttl_seconds=0)

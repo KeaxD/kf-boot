@@ -53,8 +53,6 @@ class Expirer:
     - Tear down hosted resources for expired sessions and accounts.
     - Delete expired accounts after cleanup and retention windows.
     - Apply exponential‑backoff retry scheduling for cleanup failures.
-    - Maintain cleanup leadership via a lease to prevent multiple workers from
-      processing the same tasks concurrently.
     - Provide helper APIs for session failure, lease refresh, and dynamic
       expiration transitions.
 
@@ -82,8 +80,6 @@ class Expirer:
     ACCOUNT_EXPIRE_TASK = CLEANUP_TASK_ACCOUNT_EXPIRE
     ACCOUNT_CLEANUP_TASK = CLEANUP_TASK_ACCOUNT_CLEANUP
     ACCOUNT_DELETE_TASK = CLEANUP_TASK_ACCOUNT_DELETE
-    SWEEP_LEASE_NAME = "cleanup_sweep"
-
     def __init__(self, ctx, provisioner):
         """
         Initialize the Expirer, the coordinator responsible for all session and
@@ -93,8 +89,7 @@ class Expirer:
         - Store references to the application context and the Provisioner used
         for tearing down hosted resources.
         - Create a per‑process, per‑instance owner_id used when claiming cleanup
-        tasks and acquiring the sweep‑leadership lease. This ensures that each
-        worker has a unique identity in the queue.
+        tasks. This ensures that each worker has a unique identity in the queue.
         - Initialize an internal re‑entrant lock (RLock) to serialize all state
         transitions, DB writes, and cleanup‑task scheduling performed by this
         Expirer instance. This prevents concurrent workers or threads from
@@ -111,7 +106,6 @@ class Expirer:
         the process ID and a short UUID fragment. 
             Used when:
             - claiming cleanup tasks (claimDueCleanupTask)
-            - acquiring the sweep‑leadership lease (acquireSweepLease)
             - marking tasks as owned by this worker
         Guarantees that each worker has a distinct identity in the durable cleanup‑task queue.
         """
@@ -378,23 +372,20 @@ class Expirer:
         self.ctx.store.refreshAccountLease(account, now=now)
         logger.debug(f"Account lease refreshed for account {account.account_aid}")
 
-    def acquireSweepLease(self, *, owner_id: str | None = None, now: str | None = None) -> bool:
-        """Attempt to become the active background cleanup leader"""
-        with self._lock:
-            return self.ctx.store.acquireLease(
-                self.SWEEP_LEASE_NAME,
-                owner_id=owner_id or self.owner_id,
-                ttl_seconds=self.ctx.config.cleanup_leader_ttl_seconds,
-                now=now or nowIso(),
-            )
+    def recoverClaimedCleanupTasks(self, *, now: str | None = None) -> int:
+        """Requeue any previously claimed tasks so a restarted runner can resume work.
 
-    def releaseSweepLease(self, *, owner_id: str | None = None) -> None:
-        """Release background cleanup leadership for this worker"""
+        In the supported deployment model there is a single runner, so any task
+        that still carries claim metadata at startup is assumed to be orphaned by
+        a prior crash or unclean shutdown and is made immediately visible again.
+        """
         with self._lock:
-            self.ctx.store.releaseLease(
-                self.SWEEP_LEASE_NAME,
-                owner_id=owner_id or self.owner_id,
+            recovered = self.ctx.store.requeueClaimedCleanupTasks(now=now or nowIso())
+        if recovered:
+            logger.info(
+                f"Recovered {recovered} claimed cleanup task(s) during runner startup"
             )
+        return recovered
 
     def _drainTaskType(
         self,
@@ -504,9 +495,11 @@ class Expirer:
             logger.warning(
                 f"Session {session.session_id} has invalid expires_at format: {session.expires_at}",
             )
-            # Mark task as complete for removal
-            self._completeTask(task.kind, task.subject)
-            return None, None
+            # Invalid expiry metadata should fail closed instead of silently escaping
+            # the lifecycle. Expire the session immediately so cleanup can reclaim
+            # its resources on the next phase.
+            self.markSessionExpired(session, now=now)
+            return "sessions_expired", session
 
         # If session is not due yet, reschedule task with the updated time
         if expires_at > datetime.fromisoformat(now):
@@ -583,6 +576,9 @@ class Expirer:
                 f"Session resource teardown failed during expiry for session {session.session_id}: {exc}\n"
                 f"Task was reschedule for {retryTime}"
             )
+            # A reschedule means cleanup is still pending, so do not report this task as
+            # successfully cleaned in sweep results or cleanupExpiredSessions().
+            return None, None
         else:
             # Update session record with the resources cleaned up time
             session.resources_cleaned_at = now
@@ -609,8 +605,7 @@ class Expirer:
             logger.info(
                 f"Session resources cleaned after expiry for session {session.session_id}",
             )
-
-        return "sessions_cleaned", session.session_id
+            return "sessions_cleaned", session.session_id
 
     def _processSessionDelete(
         self,
@@ -698,9 +693,10 @@ class Expirer:
             logger.warning(
                 f"Account {account.account_aid} has invalid expires_at format: {account.expires_at}",
             )
-            # Mark task as complete for removal
-            self._completeTask(task.kind, task.subject)
-            return None, None
+            # Invalid expiry metadata should fail closed instead of silently escaping
+            # account cleanup. Mark the account expired so teardown can proceed.
+            self.markAccountExpired(account, now=now)
+            return "accounts_expired", account.account_aid
 
         # If account is not yet due, reschedule task with the new date
         if expires_at > datetime.fromisoformat(now):
@@ -773,6 +769,9 @@ class Expirer:
                 f"Resource teardown failed for expired account {account.account_aid}: {exc}"
                 f"Task was rescheduled for {retryTime}"
             )
+            # The account is still waiting on teardown, so a retry should not count as a
+            # completed cleanup in sweep counters or cleanupExpiredAccounts().
+            return None, None
         else:
             # Update account record with cleaned up time
             account.resources_cleaned_at = now
@@ -782,8 +781,7 @@ class Expirer:
             logger.info(
                 f"Expired account resources cleaned for account AID {account.account_aid}",
             )
-
-        return "accounts_cleaned", account.account_aid
+            return "accounts_cleaned", account.account_aid
 
     def _processAccountDelete(
         self,

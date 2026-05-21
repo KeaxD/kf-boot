@@ -224,29 +224,54 @@ class Config:
     wat_boot_url: str
     wat_public_url: str
     bootstrap_account_options: tuple[str, ...]
+    # Whether newly bootstrapped accounts must allocate a watcher during onboarding
     bootstrap_watcher_required: bool
+    # Max number of concurrent onboarding accounts allowed from one client IP
     bootstrap_accounts_per_ip: int
+    # Max number of onboarding ephemeral AIDs allowed from one client IP
     bootstrap_aids_per_ip: int
+    # How long an open onboarding session stays valid before it becomes expired
     session_ttl_seconds: int
+    # Per-bootstrap-option account policy definitions such as tier and request budgets
     account_profiles: tuple[AccountProfile, ...] = ()
+    # Configured witness boot backends that can allocate hosted witnesses
     witness_backends: tuple[WitnessBackend, ...] = ()
+    # Request rate limit applied to bootstrap API traffic from a single IP
     bootstrap_api_requests_per_minute: int = 10
-    account_ttl_seconds: float = 172800.0       # 48 hours    
+    # HTTP timeout used for downstream witness/watcher boot API calls
+    boot_api_timeout_seconds: float = 10.0
+    # Idle TTL for onboarded accounts before they are expired and cleaned up
+    account_ttl_seconds: float = 172800.0  # 48 hours
+    # How long closed session rows are retained before final session deletion
     closed_session_retention_seconds: float | None = None
+    # Flag for enabling background periodic cleanup runner
     cleanup_runner_enabled: bool = True
+    # Delay between periodic cleanup sweep attempts
     cleanup_interval_seconds: float = 60.0
+    # Max number of cleanup tasks to process in one sweep pass
     cleanup_batch_size: int = 100
+    # Soft budget for one sweep before the runner yields until next interval
     cleanup_time_budget_seconds: float = 5.0
+    # How long shutdown waits for a cleanup sweep to finish
+    cleanup_stop_timeout_seconds: float = 15.0
+    # Visibility timeout for a claimed cleanup task before it can be claimed again
     cleanup_task_claim_ttl_seconds: float = 300.0
-    cleanup_leader_ttl_seconds: float = 120.0
+    # Initial retry delay after a cleanup teardown/delete failure
     cleanup_failure_backoff_seconds: float = 60.0
+    # Maximum retry delay cap for repeated cleanup failures
     cleanup_failure_backoff_max_seconds: float = 900.0
+    # Random jitter added to cleanup retry delays to avoid synchronized retries
     cleanup_failure_jitter_seconds: float = 5.0
+    # Retention delay after account cleanup before final account deletion is allowed
     expired_account_retention_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if self.bootstrap_api_requests_per_minute < 0:
             raise ValueError("bootstrap_api_requests_per_minute must be greater than or equal to 0.")
+        if self.session_ttl_seconds <= 0:
+            raise ValueError("session_ttl_seconds must be greater than 0.")
+        if self.boot_api_timeout_seconds <= 0:
+            raise ValueError("boot_api_timeout_seconds must be greater than 0.")
         if self.account_ttl_seconds < 0:
             raise ValueError("account_ttl_seconds must be greater than or equal to 0.")
         if (
@@ -258,10 +283,10 @@ class Config:
             raise ValueError("cleanup_batch_size must be greater than 0.")
         if self.cleanup_time_budget_seconds <= 0:
             raise ValueError("cleanup_time_budget_seconds must be greater than 0.")
+        if self.cleanup_stop_timeout_seconds <= 0:
+            raise ValueError("cleanup_stop_timeout_seconds must be greater than 0.")
         if self.cleanup_task_claim_ttl_seconds <= 0:
             raise ValueError("cleanup_task_claim_ttl_seconds must be greater than 0.")
-        if self.cleanup_leader_ttl_seconds <= 0:
-            raise ValueError("cleanup_leader_ttl_seconds must be greater than 0.")
         if self.cleanup_failure_backoff_seconds < 0:
             raise ValueError("cleanup_failure_backoff_seconds must be greater than or equal to 0.")
         if self.cleanup_failure_backoff_max_seconds < self.cleanup_failure_backoff_seconds:
@@ -364,14 +389,15 @@ class Config:
             f"Account Profiles: {', '.join(f'{profile.code} (tier={profile.tier})' for profile in account_profiles)}\n"
             f"Bootstrap Account per IP: {self.bootstrap_accounts_per_ip}\n"
             f"Bootstrap API requests per minute: {self.bootstrap_api_requests_per_minute}\n"
+            f"Boot API timeout seconds: {self.boot_api_timeout_seconds}\n"
             f"Account TTL seconds: {self.account_ttl_seconds}\n"
             f"Closed session retention seconds: {self.closed_session_retention_seconds}\n"
             f"Cleanup runner enabled: {self.cleanup_runner_enabled}\n"
             f"Cleanup interval seconds: {self.cleanup_interval_seconds}\n"
             f"Cleanup batch size: {self.cleanup_batch_size}\n"
             f"Cleanup time budget seconds: {self.cleanup_time_budget_seconds}\n"
+            f"Cleanup stop timeout seconds: {self.cleanup_stop_timeout_seconds}\n"
             f"Cleanup task claim ttl seconds: {self.cleanup_task_claim_ttl_seconds}\n"
-            f"Cleanup leader ttl seconds: {self.cleanup_leader_ttl_seconds}\n"
             f"Cleanup failure backoff seconds: {self.cleanup_failure_backoff_seconds}\n"
             f"Cleanup failure backoff max seconds: {self.cleanup_failure_backoff_max_seconds}\n"
             f"Cleanup failure jitter seconds: {self.cleanup_failure_jitter_seconds}\n"
@@ -461,8 +487,11 @@ class Config:
             bootstrap_api_requests_per_minute=int(
                 _env("BOOTSTRAP_API_REQUESTS_PER_MINUTE", "10")
             ),
+            boot_api_timeout_seconds=float(
+                _env("BOOT_API_TIMEOUT_SECONDS", "10")
+            ),
             account_ttl_seconds=float(
-                _env("ACCOUNT_TTL_SECONDS", "86400")
+                _env("ACCOUNT_TTL_SECONDS", "172800")  # 48 hours
             ),
             closed_session_retention_seconds=(
                 float(closed_session_retention_env)
@@ -482,11 +511,11 @@ class Config:
             cleanup_time_budget_seconds=float(
                 _env("CLEANUP_TIME_BUDGET_SECONDS", "5")
             ),
+            cleanup_stop_timeout_seconds=float(
+                _env("CLEANUP_STOP_TIMEOUT_SECONDS", "15")
+            ),
             cleanup_task_claim_ttl_seconds=float(
                 _env("CLEANUP_TASK_CLAIM_TTL_SECONDS", "300")
-            ),
-            cleanup_leader_ttl_seconds=float(
-                _env("CLEANUP_LEADER_TTL_SECONDS", "120")
             ),
             cleanup_failure_backoff_seconds=float(
                 _env("CLEANUP_FAILURE_BACKOFF_SECONDS", "60")

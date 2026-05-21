@@ -573,6 +573,43 @@ def test_failed_session_teardown_is_retried_by_cleanup_tasks(contract_factory, m
         assert attempts == [session_id, session_id]
 
 
+def test_cleanup_expired_sessions_failure_does_not_report_false_success(contract_factory, monkeypatch):
+    """Cleanup retries should stay visible as pending work instead of looking successful."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+    )
+
+    with habbing.openHab(name="cleanup-failure-session", temp=True, transferable=False) as (_, ephemeral):
+        register_aid(contract, "/onboarding", ephemeral)
+        _, _, start_reply = start_session(contract, ephemeral)
+
+        session_id = start_reply.ked["a"]["session_id"]
+        session = contract.ctx.store.getSession(session_id)
+        session.expires_at = "2000-01-01T00:00:00+00:00"
+        contract.ctx.store.saveSession(session)
+        contract.ctx.exchanger.expirer.expireSessions(now="2026-01-01T00:00:00+00:00")
+
+        def always_fail(*, session: Any, account=None) -> None:
+            raise BootError("simulated cleanup retry failure", status_code=502)
+
+        monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownSessionResources", always_fail)
+
+        cleaned = contract.ctx.exchanger.expirer.cleanupExpiredSessions(
+            now="2026-01-01T00:00:00+00:00"
+        )
+
+        updated = contract.ctx.store.getSession(session_id)
+        task = contract.ctx.store.getCleanupTask("session_cleanup", session_id)
+        assert cleaned == []
+        assert updated is not None
+        assert updated.resources_cleaned_at == ""
+        assert task is not None
+        assert task.last_error == "simulated cleanup retry failure"
+        assert task.attempt_count == 1
+        assert task.due_at == "2026-01-01T00:01:00+00:00"
+
+
 def test_expired_sessions_reclaim_hosted_resources_and_fail_pending_account(contract):
     with (
         habbing.openHab(name="expiry-owner-ephemeral", temp=True, transferable=False) as (_, ephemeral),
@@ -683,6 +720,45 @@ def test_session_start_enforces_per_ip_account_limit(contract_factory):
         )
         assert first_response.status_code == 200
 
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(second, route="/onboarding/session/start", payload=start_payload(account_aid="AID_OTHER")),
+            remote_addr="127.0.0.1",
+        )
+
+    assert response.status_code == 429
+    assert response.json["title"] == "Per-IP onboarding account limit exceeded"
+
+
+def test_session_start_counts_uncleaned_closed_sessions_toward_per_ip_limits(contract_factory):
+    """Closed sessions still count against IP admission until their resources are reclaimed."""
+    contract = contract_factory(bootstrap_accounts_per_ip=1, bootstrap_aids_per_ip=10)
+
+    with (
+        habbing.openHab(name="ip-cleanup-debt-owner", temp=True, transferable=False) as (_, first),
+        habbing.openHab(name="ip-cleanup-debt-other", temp=True, transferable=False) as (_, second),
+    ):
+        register_aid(contract, "/onboarding", first)
+        register_aid(contract, "/onboarding", second)
+
+        # Send an Onboarding session start request
+        first_response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(first, route="/onboarding/session/start", payload=start_payload(account_aid="AID_FIRST")),
+            remote_addr="127.0.0.1",
+        )
+        assert first_response.status_code == 200
+        _, first_reply = assert_reply_frame(contract, first_response, route="/onboarding/session/start")
+
+        # Set session as stale
+        stale = contract.ctx.store.getSession(first_reply.ked["a"]["session_id"])
+        stale.expires_at = "2000-01-01T00:00:00+00:00"
+        contract.ctx.store.saveSession(stale)
+        contract.ctx.exchanger.expirer.markSessionExpired(stale, now="2000-01-01T00:00:00+00:00")
+
+        # Try to start a 2nd onboarding session
         response = post_cesr(
             contract,
             "/onboarding",
@@ -1151,6 +1227,60 @@ def test_session_start_rejects_alias_when_existing_account_is_pending(contract_f
     assert response.status_code == 429
     assert response.json["title"] == "Account alias limit exceeded"
     assert "configured limit for tier 'trial' is 1" in response.json["description"]
+
+
+def test_session_start_counts_uncleaned_closed_sessions_toward_alias_limits(contract_factory):
+    """Alias limits should include stale sessions whose resources are still being reclaimed."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=1,
+                max_requests_per_minute=100,
+                api_budget=100,
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="alias-cleanup-debt-1", temp=True, transferable=False) as (_, first),
+        habbing.openHab(name="alias-cleanup-debt-2", temp=True, transferable=False) as (_, second),
+    ):
+        # Register 2 AIDs
+        register_aid(contract, "/onboarding", first)
+        register_aid(contract, "/onboarding", second)
+
+        # Start a session with the 1st AID
+        _, _, first_reply = start_session(
+            contract,
+            first,
+            account_aid="AID_ALIAS_FIRST",
+            account_alias="alpha",
+        )
+        
+        # 1st AID's session becomes stale
+        stale = contract.ctx.store.getSession(first_reply.ked["a"]["session_id"])
+        stale.expires_at = "2000-01-01T00:00:00+00:00"
+        contract.ctx.store.saveSession(stale)
+        contract.ctx.exchanger.expirer.markSessionExpired(stale, now="2000-01-01T00:00:00+00:00")
+
+        # Send another session start request with the 2nd AID 
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(
+                second,
+                route="/onboarding/session/start",
+                payload=start_payload(account_aid="AID_ALIAS_SECOND", account_alias="alpha"),
+            ),
+        )
+    # Assert request was denied because of limit reached
+    assert response.status_code == 429
+    assert response.json["title"] == "Account alias limit exceeded"
 
 
 def test_account_create_rejects_expired_permanent_account(contract_factory):

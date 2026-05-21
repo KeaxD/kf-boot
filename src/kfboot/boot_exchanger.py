@@ -993,7 +993,8 @@ class BootExchanger(Exchanger):
             logger.warning(
                 f"Session {session.session_id} has invalid expires_at format: {session.expires_at}",
             )
-            return False
+            # Fail closed so corrupted lifecycle metadata cannot keep a session open.
+            return True
 
         return expires_at <= datetime.fromisoformat(nowIso())
 
@@ -1073,7 +1074,8 @@ class BootExchanger(Exchanger):
             logger.warning(
                 f"Account {account.account_aid} has invalid expires_at format: {account.expires_at}",
             )
-            return False
+            # Fail closed so corrupted lifecycle metadata cannot keep an account active.
+            return True
 
         return expires_at <= datetime.fromisoformat(nowIso())
 

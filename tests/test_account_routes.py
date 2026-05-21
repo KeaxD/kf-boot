@@ -937,14 +937,14 @@ def test_cleanup_expired_accounts_retries_with_backoff(onboarded_bundle, monkeyp
     assert updated.status == ACCOUNT_STATE_EXPIRED
     assert updated.resources_cleaned_at == ""
 
-    # First sweep processed
-    assert first == [account.pre]
+    # Failed cleanups should reschedule without being reported as successfully cleaned.
+    assert first == []
 
     # Second sweep skipped due to backoff
     assert second == []
 
-    # Third sweep processed after backoff time elapsed
-    assert third == [account.pre]
+    # Third sweep retries after backoff, but still does not report success because cleanup failed again.
+    assert third == []
 
     # Assert attempts only contains the 1st and 3rd attempt
     assert attempts == [account.pre, account.pre]
