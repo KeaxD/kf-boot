@@ -202,7 +202,6 @@ def make_config(tmp_path, *, index: int = 0, **overrides: Any) -> Config:
         "cleanup_batch_size": 100,
         "cleanup_time_budget_seconds": 5,
         "cleanup_stop_timeout_seconds": 15,
-        "cleanup_task_claim_ttl_seconds": 300,
         "cleanup_failure_backoff_seconds": 60,
         "cleanup_failure_backoff_max_seconds": 900,
         "cleanup_failure_jitter_seconds": 0,

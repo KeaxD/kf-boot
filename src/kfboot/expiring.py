@@ -105,7 +105,7 @@ class Expirer:
         - owner_id: A unique, stable identifier for this Expirer worker, constructed from
         the process ID and a short UUID fragment. 
             Used when:
-            - claiming cleanup tasks (claimDueCleanupTask)
+        - marking cleanup tasks in progress (claimDueCleanupTask)
             - marking tasks as owned by this worker
         Guarantees that each worker has a distinct identity in the durable cleanup‑task queue.
         """
@@ -417,12 +417,11 @@ class Expirer:
         owner_id: str,
         kind: str | None = None,
     ) -> CleanupTaskRecord | None:
-        """Claim one due task from the durable queue"""
+        """Mark one due task as in progress in the durable queue."""
         with self._lock:
             return self.ctx.store.claimDueCleanupTask(
                 now=now,
                 owner_id=owner_id,
-                claim_ttl_seconds=self.ctx.config.cleanup_task_claim_ttl_seconds,
                 kind=kind,
             )
 

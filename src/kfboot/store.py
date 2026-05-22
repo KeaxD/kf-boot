@@ -18,7 +18,6 @@ from kfboot.basing import (
     ACCOUNT_STATE_PENDING_ONBOARDING,
     CleanupDueRecord,
     CleanupTaskRecord,
-    LeaseRecord,
     SESSION_STATE_CANCELLED,
     SESSION_STATE_COMPLETED,
     SESSION_STATE_EXPIRED,
@@ -80,19 +79,18 @@ def _resourceToApi(record: ResourceRecord, *, include_boot_url: bool = False) ->
 
 class Store:
     """
-    Persistent state manager for sessions, accounts, resources, cleanup tasks,
-    and distributed leases.
+    Persistent state manager for sessions, accounts, resources, and cleanup tasks.
 
     Responsibilities:
     - Maintain lifecycle‑driven cleanup task graphs.
     - Keep cleanup_tasks and cleanup_due tables synchronized.
     - Provide atomic, idempotent state transitions for sessions and accounts.
-    - Support distributed workers via timestamp‑based task claiming and leases.
+    - Track cleanup work in progress so a single runner can recover after restarts.
 
     Attributes:
     - baser:
         Underlying LMDB‑backed key/value store. All persistent state
-        (sessions, accounts, tasks, leases, resources) is stored here.
+        (sessions, accounts, tasks, resources) is stored here.
 
     - session_ttl_seconds:
         Default TTL applied to newly created sessions. Used by
@@ -220,7 +218,7 @@ class Store:
         
         Responsibilities:
         - Rewrite the task's `due_at` timestamp.
-        - Clear claim metadata (`claimed_by`, `claimed_at`, `claim_expires_at`).
+        - Clear in-progress metadata (`claimed_by`, `claimed_at`, `claim_expires_at`).
         - Optionally reset `attempt_count` and update `last_error`.
         - Maintain consistency between `cleanup_tasks` and `cleanup_due`.
         """
@@ -289,6 +287,8 @@ class Store:
 
         for _, task in self.baser.cleanup_tasks.getTopItemIter(keys=()):
             pending_tasks += 1
+            # Claimed tasks are in progress for the single runner, so they should
+            # be reported separately from due work even if they were originally due.
             if task.claimed_by or task.claimed_at or task.claim_expires_at:
                 claimed_tasks += 1
                 try:
@@ -297,6 +297,7 @@ class Store:
                     claimed_dt = None
                 if claimed_dt is not None and (oldest_claimed_dt is None or claimed_dt < oldest_claimed_dt):
                     oldest_claimed_dt = claimed_dt
+                continue
             if not task.due_at:
                 continue
             try:
@@ -332,7 +333,12 @@ class Store:
         }
 
     def requeueClaimedCleanupTasks(self, *, now: str | None = None) -> int:
-        """Make previously claimed tasks immediately visible again"""
+        """Make previously claimed tasks immediately visible again.
+
+        In single-runner mode, claim metadata only means "this task was in
+        progress." If the process restarted before clearing that marker, we
+        immediately requeue the task instead of waiting for an artificial lease.
+        """
 
         current = now or nowIso()
         recovered = 0
@@ -406,25 +412,19 @@ class Store:
         *,
         now: str | None = None,
         owner_id: str,
-        claim_ttl_seconds: float,
         kind: str | None = None,
     ) -> CleanupTaskRecord | None:
-        """Claim one due cleanup task and push its due time to a claim deadline
-        
-        Workflow:
-        - Select earliest due task.
-        - Validate due‑time index entry.
-        - Advance `due_at` to a claim deadline.
-        - Increment attempt counters.
+        """Claim one due cleanup task and mark it as in progress.
+
+        In the supported single-runner model, claiming a task does not create a
+        time-based lease. Instead, the task is simply removed from the due queue
+        while it is being worked, and startup recovery requeues any task that
+        still carries claim metadata after a crash.
         """
 
         # Get current time and create a key for it
         current = now or nowIso()
         current_key = _dueIndexKey(current)
-        current_dt = _parseDt(current)
-
-        # Create a claim deadline
-        claim_deadline = (current_dt + timedelta(seconds=claim_ttl_seconds)).isoformat()
         stale: list[tuple[str, ...]] = []
 
         # Iterate through due cleanup tasks
@@ -447,12 +447,14 @@ class Store:
             # Update the task fields
             previous_due_at = task.due_at
             
-            # Move the task due_at to the claim deadline
-            task.due_at = claim_deadline
+            # Remove the task from the due queue while the single runner is
+            # actively processing it. Retries or startup recovery will assign a
+            # new due_at if the work is not completed successfully.
+            task.due_at = ""
             task.updated_at = current
             task.claimed_by = owner_id
             task.claimed_at = current
-            task.claim_expires_at = claim_deadline
+            task.claim_expires_at = ""
             task.last_attempt_at = current
             
             # Increase attempt count
@@ -473,83 +475,6 @@ class Store:
             self.baser.cleanup_due.rem(keys=keys)
 
         return None
-
-    def getLease(self, name: str) -> LeaseRecord | None:
-        """Return the persisted lease record for a background activity"""
-        return self.baser.leases.get(keys=(name,))
-
-    def acquireLease(
-        self,
-        name: str,
-        *,
-        owner_id: str,
-        ttl_seconds: float,
-        now: str | None = None,
-    ) -> bool:
-        """Acquire or renew a lease unless another worker still holds it
-        
-        Behavior:
-        - Reject acquisition if another owner holds a non‑expired lease.
-        - Renew lease if caller already owns it.
-        - Write updated lease atomically.
-        """
-        
-        # Get current time
-        current = now or nowIso()
-        current_dt = _parseDt(current)
-
-        # Retrieve the lease
-        existing = self.getLease(name)
-
-        # check if the lease exists and is owned by someone else
-        if existing is not None and existing.owner_id and existing.owner_id != owner_id:
-            try:
-                # If the lease is still valid and someone else's, return False
-                if existing.expires_at and _parseDt(existing.expires_at) > current_dt:
-                    return False
-            except ValueError:
-                pass
-
-        # Retrieve acquisition date of the existing lease. If the same worker renews the lease, 
-        # preserve the original acquisition time. If a new worker acquires it, reset acquired_at.
-        acquired_at = (
-            existing.acquired_at
-            if existing is not None and existing.owner_id == owner_id and existing.acquired_at
-            else current
-        )
-
-        # Calculate expires at using ttl_seconds variable provided
-        expires_at = (current_dt + timedelta(seconds=ttl_seconds)).isoformat()
-
-        # Create the new Lease Record with the new owner
-        record = LeaseRecord(
-            name=name,
-            owner_id=owner_id,
-            acquired_at=acquired_at,
-            heartbeat_at=current,
-            expires_at=expires_at,
-        )
-        
-        # Update the record in the DB
-        self.baser.leases.pin(keys=(name,), val=record)
-
-        # Retrieve it from the DB and return it after checks. 
-        # This ensure that the record matches the intended owner, it also acts as a race condition safety check
-        persisted = self.getLease(name)
-        return persisted is not None and persisted.owner_id == owner_id and persisted.expires_at == expires_at
-
-    def releaseLease(self, name: str, *, owner_id: str) -> None:
-        """Release a lease when it is still owned by the caller"""
-
-        # Get the lease
-        record = self.getLease(name)
-
-        # If lease is not found or owner is not valid, return
-        if record is None or record.owner_id != owner_id:
-            return
-
-        # Remove the lease from DB
-        self.baser.leases.rem(keys=(name,))
 
     def _saveCleanupTask(
         self,

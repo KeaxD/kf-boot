@@ -230,35 +230,6 @@ def test_cleanup_tasks_survive_store_reopen(tmp_path):
     finally:
         second.close()
 
-
-def test_cleanup_leases_are_persisted_and_exclusive(store):
-    """Test that leases are exclusive to their owner and cannot be acquired unless realeased or ttl reached"""
-
-    # owner A gets the lease with a TTL of 30 sec
-    assert store.acquireLease(
-        "cleanup",
-        owner_id="owner-a",
-        ttl_seconds=30,
-        now="2024-01-01T00:00:00+00:00",
-    )
-
-    # owner B tries to acquire the lease after 10 sec, gets denied 
-    assert not store.acquireLease(
-        "cleanup",
-        owner_id="owner-b",
-        ttl_seconds=30,
-        now="2024-01-01T00:00:10+00:00",
-    )
-
-    # Owner B tries again after 21 sec which is 1s after owner A's lease of 30 sec
-    assert store.acquireLease(
-        "cleanup",
-        owner_id="owner-b",
-        ttl_seconds=30,
-        now="2024-01-01T00:00:31+00:00",
-    )
-
-
 def test_quota_records_are_saved_in_lmdb(tmp_path):
     """Test that the quotas records are saved and persistent"""
     path = str(tmp_path / "quota-store" / "kf-boot")
@@ -510,12 +481,12 @@ def test_cleanup_backlog_snapshot_reports_claimed_work(store):
     task = store.claimDueCleanupTask(
         now="2024-01-01T00:00:05+00:00",
         owner_id="runner-1",
-        claim_ttl_seconds=300,
     )
 
     snapshot = store.cleanupBacklogSnapshot(now="2024-01-01T00:00:10+00:00")
 
     assert task is not None
+    assert task.due_at == ""
     assert snapshot["pending_tasks"] == 1
     assert snapshot["due_tasks"] == 0
     assert snapshot["claimed_tasks"] == 1
@@ -543,7 +514,6 @@ def test_requeue_claimed_cleanup_tasks_makes_work_immediately_visible_again(stor
     claimed = store.claimDueCleanupTask(
         now="2024-01-01T00:00:05+00:00",
         owner_id="runner-1",
-        claim_ttl_seconds=300,
     )
 
     recovered = store.requeueClaimedCleanupTasks(now="2024-01-01T00:00:10+00:00")

@@ -147,15 +147,6 @@ class CleanupDueRecord:
     due_at: str = ""
 
 
-@dataclass
-class LeaseRecord:
-    name: str = ""
-    owner_id: str = ""
-    acquired_at: str = ""
-    heartbeat_at: str = ""
-    expires_at: str = ""
-
-
 class PlatformBaser(dbing.LMDBer):
     """LMDB database for the KF boot service."""
 
@@ -171,8 +162,6 @@ class PlatformBaser(dbing.LMDBer):
         self.quotas = None
         self.cleanup_tasks = None
         self.cleanup_due = None
-        self.leases = None
-
         super().__init__(
             name=name,
             headDirPath=headDirPath,
@@ -219,12 +208,6 @@ class PlatformBaser(dbing.LMDBer):
             subkey="cdue.",
             klas=CleanupDueRecord,
         )
-        self.leases = koming.Komer(
-            db=self,
-            subkey="leas.",
-            klas=LeaseRecord,
-        )
-
         return self.env
 
 
