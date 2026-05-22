@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import os
 import random
 import time
 from datetime import datetime, timedelta
 from threading import Event, RLock
-from uuid import uuid4
 
 from keri import help
 
@@ -53,7 +51,7 @@ class Expirer:
     - Tear down hosted resources for expired sessions and accounts.
     - Delete expired accounts after cleanup and retention windows.
     - Apply exponential‑backoff retry scheduling for cleanup failures.
-    - Provide helper APIs for session failure, lease refresh, and dynamic
+    - Provide helper APIs for session failure, TTL refresh, and dynamic
       expiration transitions.
 
     Cleanup‑task lifecycle enforced:
@@ -66,8 +64,8 @@ class Expirer:
     - `account_delete` => delete closed, cleaned account => complete.
 
     High‑level workflow:
-    - sweep(): claim tasks until batch/time budget is exhausted.
-    - _claimDueTask(): atomically claim one due task.
+    - sweep(): drain due tasks until batch/time budget is exhausted.
+    - _claimDueTask(): mark one due task in progress.
     - _processClaimedTask(): dispatch to the appropriate handler.
     - _process*(): perform state transitions, teardown, or deletion.
     - _rescheduleTask(): defer failed tasks with exponential backoff.
@@ -88,8 +86,6 @@ class Expirer:
         Responsibilities:
         - Store references to the application context and the Provisioner used
         for tearing down hosted resources.
-        - Create a per‑process, per‑instance owner_id used when claiming cleanup
-        tasks. This ensures that each worker has a unique identity in the queue.
         - Initialize an internal re‑entrant lock (RLock) to serialize all state
         transitions, DB writes, and cleanup‑task scheduling performed by this
         Expirer instance. This prevents concurrent workers or threads from
@@ -102,17 +98,10 @@ class Expirer:
         session/account cleanup.
         - _lock: A re‑entrant lock (RLock) to ensures thread‑safety and prevents concurrent
         mutation of session/account lifecycle state.
-        - owner_id: A unique, stable identifier for this Expirer worker, constructed from
-        the process ID and a short UUID fragment. 
-            Used when:
-        - marking cleanup tasks in progress (claimDueCleanupTask)
-            - marking tasks as owned by this worker
-        Guarantees that each worker has a distinct identity in the durable cleanup‑task queue.
         """
         self.ctx = ctx
         self.provisioner = provisioner
         self._lock = RLock()
-        self.owner_id = f"cleanup-{os.getpid()}-{uuid4().hex[:12]}"
 
     def sweep(
         self,
@@ -120,10 +109,9 @@ class Expirer:
         batch_size: int | None = None,
         time_budget_seconds: float | None = None,
         now: str | None = None,
-        owner_id: str | None = None,
         stop: Event | None = None,
     ) -> dict[str, int]:
-        """Claim and process due cleanup tasks until count or time budgets are spent."""
+        """Process due cleanup tasks until count or time budgets are spent."""
         
         # Get batch size limit if provided, if None fallback to config
         limit = batch_size if batch_size is not None else self.ctx.config.cleanup_batch_size
@@ -149,8 +137,7 @@ class Expirer:
         if limit <= 0 or budget <= 0:
             return results
 
-        # Set up owner, time and task claimed
-        claim_owner = owner_id or self.owner_id
+        # Set up timing and task counter
         started_at = time.monotonic()
         claimed = 0
 
@@ -164,7 +151,7 @@ class Expirer:
             current = now or nowIso()
 
             # Claim a due task 
-            task = self._claimDueTask(now=current, owner_id=claim_owner)
+            task = self._claimDueTask(now=current)
             if task is None:
                 # If no due tasks are found, break
                 break
@@ -396,11 +383,10 @@ class Expirer:
     ) -> list[object]:
         """Drain one cleanup task kind serially and collect non-empty results"""
         rows: list[object] = []
-        claim_owner = self.owner_id
 
         while limit is None or len(rows) < limit:
             current = now or nowIso()
-            task = self._claimDueTask(now=current, owner_id=claim_owner, kind=task_kind)
+            task = self._claimDueTask(now=current, kind=task_kind)
             if task is None:
                 break
 
@@ -414,14 +400,12 @@ class Expirer:
         self,
         *,
         now: str,
-        owner_id: str,
         kind: str | None = None,
     ) -> CleanupTaskRecord | None:
         """Mark one due task as in progress in the durable queue."""
         with self._lock:
             return self.ctx.store.claimDueCleanupTask(
                 now=now,
-                owner_id=owner_id,
                 kind=kind,
             )
 
@@ -648,7 +632,7 @@ class Expirer:
             return None, None
 
         # Retrieve delete due time, if it has not elapsed yet, reschedule to the new time
-        delete_due_at = self._sessionDeleteDueAt(session)
+        delete_due_at = self.ctx.store.sessionDeleteDueAt(session)
         if delete_due_at > now:
             self._rescheduleTask(
                 task.kind,
@@ -814,7 +798,7 @@ class Expirer:
             return None, None
 
         # Retrieve time account should be deleted at
-        delete_due_at = self._deleteDueAt(account)
+        delete_due_at = self.ctx.store.accountDeleteDueAt(account)
 
         # If account deletion is not due yet, reschedule with the new date
         if delete_due_at > now:
@@ -869,40 +853,6 @@ class Expirer:
             delay += random.uniform(0.0, jitter)
 
         return (datetime.fromisoformat(now) + timedelta(seconds=delay)).isoformat()
-
-    def _deleteDueAt(self, account) -> str:
-        """Compute the earliest deletion time for a closed, cleaned account."""
-        # Get a base time either the account expiration time, resources cleaned or current
-        anchor = account.expired_at or account.resources_cleaned_at or nowIso()
-
-        # Get the retention time from the config if provided, if it is invalid or none = 0
-        retention = max(self.ctx.config.expired_account_retention_seconds, 0.0)
-        if retention <= 0:
-            # Return the anchor which would essentially be an immediate deletion
-            return anchor
-        return (datetime.fromisoformat(anchor) + timedelta(seconds=retention)).isoformat()
-
-    def _sessionDeleteDueAt(self, session: SessionRecord) -> str:
-        """Compute the earliest deletion time for a closed session."""
-
-        # Use a base time if it exists in order:
-        # - last time session was updated
-        # - its expiry date
-        # - its creation time
-        # - current time
-        anchor = (
-            session.resources_cleaned_at
-            or session.updated_at
-            or session.expired_at
-            or session.created_at
-            or nowIso()
-        )
-
-        # Check retention time if it exist, compute retention time, if not deletion will be immediate
-        retention = max(self.ctx.config.closed_session_retention_seconds or 0.0, 0.0)
-        if retention <= 0:
-            return anchor
-        return (datetime.fromisoformat(anchor) + timedelta(seconds=retention)).isoformat()
 
     def _rescheduleTask(
         self,

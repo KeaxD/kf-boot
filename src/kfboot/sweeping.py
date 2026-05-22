@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import threading
 from datetime import UTC, datetime
-from uuid import uuid4
 
 from hio.base import doing
 from keri import help
@@ -23,7 +22,6 @@ class CleanupDoer(doing.Doer):
         interval: float,
         batch_size: int,
         time_budget_seconds: float,
-        owner_id: str,
         runner,
         stop: threading.Event,
         poll_tock: float,
@@ -39,7 +37,6 @@ class CleanupDoer(doing.Doer):
         self.interval = interval
         self.batch_size = batch_size
         self.time_budget_seconds = time_budget_seconds
-        self.owner_id = owner_id
         self.runner = runner
         self.stop = stop
         self._next_run_at = 0.0
@@ -58,7 +55,6 @@ class CleanupDoer(doing.Doer):
             results = self.expirer.sweep(
                 batch_size=self.batch_size,
                 time_budget_seconds=self.time_budget_seconds,
-                owner_id=self.owner_id,
                 stop=self.stop,
             )
         except Exception as exc:
@@ -110,7 +106,6 @@ class CleanupRunner:
         self._last_error_at = ""
         self._last_recovery_at = ""
         self._recovered_claimed_tasks = 0
-        self.owner_id = f"cleanup-runner-{uuid4().hex[:12]}"
 
     @property
     def enabled(self) -> bool:
@@ -223,7 +218,6 @@ class CleanupRunner:
             interval=self.interval,
             batch_size=self.batch_size,
             time_budget_seconds=self.time_budget_seconds,
-            owner_id=self.owner_id,
             runner=self,
             stop=self._stop,
             poll_tock=poll_tock,

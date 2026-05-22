@@ -117,7 +117,7 @@ def test_session_creation_lookup_and_payload_integrity(store):
     assert account.witness_eids == ["W1", "W2", "W3", "W4"]
 
 
-def test_expire_sessions_marks_only_non_terminal_records(store):
+def test_session_expire_tasks_only_track_non_terminal_records(store):
     open_session = store.createSession(
         ephemeral_aid="E-open",
         account_aid="A-open",
@@ -151,11 +151,14 @@ def test_expire_sessions_marks_only_non_terminal_records(store):
     terminal.expires_at = "2024-01-01T00:00:00+00:00"
     store.saveSession(terminal)
 
-    expired = store.expireSessions(now="2024-01-01T00:00:01+00:00")
+    open_task = store.getCleanupTask(CLEANUP_TASK_SESSION_EXPIRE, open_session.session_id)
+    terminal_task = store.getCleanupTask(CLEANUP_TASK_SESSION_EXPIRE, terminal.session_id)
+    terminal_delete = store.getCleanupTask(CLEANUP_TASK_SESSION_DELETE, terminal.session_id)
 
-    assert store.getSession(open_session.session_id).state == SESSION_STATE_EXPIRED
-    assert store.getSession(terminal.session_id).state == SESSION_STATE_COMPLETED
-    assert [record.session_id for record in expired] == [open_session.session_id]
+    assert open_task is not None
+    assert open_task.due_at == "2024-01-01T00:00:00+00:00"
+    assert terminal_task is None
+    assert terminal_delete is not None
 
 
 def test_cleanup_tasks_survive_store_reopen(tmp_path):
@@ -480,7 +483,6 @@ def test_cleanup_backlog_snapshot_reports_claimed_work(store):
 
     task = store.claimDueCleanupTask(
         now="2024-01-01T00:00:05+00:00",
-        owner_id="runner-1",
     )
 
     snapshot = store.cleanupBacklogSnapshot(now="2024-01-01T00:00:10+00:00")
@@ -513,7 +515,6 @@ def test_requeue_claimed_cleanup_tasks_makes_work_immediately_visible_again(stor
 
     claimed = store.claimDueCleanupTask(
         now="2024-01-01T00:00:05+00:00",
-        owner_id="runner-1",
     )
 
     recovered = store.requeueClaimedCleanupTasks(now="2024-01-01T00:00:10+00:00")
@@ -523,9 +524,7 @@ def test_requeue_claimed_cleanup_tasks_makes_work_immediately_visible_again(stor
     assert claimed is not None
     assert recovered == 1
     assert task is not None
-    assert task.claimed_by == ""
     assert task.claimed_at == ""
-    assert task.claim_expires_at == ""
     assert task.due_at == "2024-01-01T00:00:10+00:00"
     assert [row.subject for row in due] == [session.session_id]
 

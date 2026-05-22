@@ -133,9 +133,7 @@ class CleanupTaskRecord:
     attempt_count: int = 0
     created_at: str = ""
     updated_at: str = ""
-    claimed_by: str = ""
     claimed_at: str = ""
-    claim_expires_at: str = ""
     last_attempt_at: str = ""
     last_error: str = ""
 

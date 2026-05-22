@@ -218,7 +218,7 @@ class Store:
         
         Responsibilities:
         - Rewrite the task's `due_at` timestamp.
-        - Clear in-progress metadata (`claimed_by`, `claimed_at`, `claim_expires_at`).
+        - Clear in-progress metadata (`claimed_at`).
         - Optionally reset `attempt_count` and update `last_error`.
         - Maintain consistency between `cleanup_tasks` and `cleanup_due`.
         """
@@ -244,9 +244,7 @@ class Store:
             previous_due_at = record.due_at
             record.due_at = due_at
             record.updated_at = current
-            record.claimed_by = ""
             record.claimed_at = ""
-            record.claim_expires_at = ""
             if reset_attempts:
                 # Reset number of attempts if flag is provided
                 record.attempt_count = 0
@@ -289,7 +287,7 @@ class Store:
             pending_tasks += 1
             # Claimed tasks are in progress for the single runner, so they should
             # be reported separately from due work even if they were originally due.
-            if task.claimed_by or task.claimed_at or task.claim_expires_at:
+            if task.claimed_at:
                 claimed_tasks += 1
                 try:
                     claimed_dt = _parseDt(task.claimed_at or task.updated_at or task.created_at)
@@ -345,15 +343,13 @@ class Store:
         tasks = [task for _, task in self.baser.cleanup_tasks.getTopItemIter(keys=())]
 
         for task in tasks:
-            if not (task.claimed_by or task.claimed_at or task.claim_expires_at):
+            if not task.claimed_at:
                 continue
 
             previous_due_at = task.due_at
             task.due_at = current
             task.updated_at = current
-            task.claimed_by = ""
             task.claimed_at = ""
-            task.claim_expires_at = ""
             self._saveCleanupTask(task, previous_due_at=previous_due_at)
             recovered += 1
 
@@ -411,7 +407,6 @@ class Store:
         self,
         *,
         now: str | None = None,
-        owner_id: str,
         kind: str | None = None,
     ) -> CleanupTaskRecord | None:
         """Claim one due cleanup task and mark it as in progress.
@@ -452,9 +447,7 @@ class Store:
             # new due_at if the work is not completed successfully.
             task.due_at = ""
             task.updated_at = current
-            task.claimed_by = owner_id
             task.claimed_at = current
-            task.claim_expires_at = ""
             task.last_attempt_at = current
             
             # Increase attempt count
@@ -554,7 +547,7 @@ class Store:
                 self.ensureCleanupTask(
                     CLEANUP_TASK_SESSION_DELETE,
                     record.session_id,
-                    due_at=self._sessionDeleteDueAt(record),
+                    due_at=self.sessionDeleteDueAt(record),
                     now=record.resources_cleaned_at or record.updated_at or None,
                 )
             # If the session's resources were not cleaned up
@@ -584,7 +577,7 @@ class Store:
             self.ensureCleanupTask(
                 CLEANUP_TASK_SESSION_DELETE,
                 record.session_id,
-                due_at=self._sessionDeleteDueAt(record),
+                due_at=self.sessionDeleteDueAt(record),
                 now=record.updated_at or None,
             )
             return
@@ -654,7 +647,7 @@ class Store:
                 self.ensureCleanupTask(
                     CLEANUP_TASK_ACCOUNT_DELETE,
                     record.account_aid,
-                    due_at=self._accountDeleteDueAt(record),
+                    due_at=self.accountDeleteDueAt(record),
                     now=record.resources_cleaned_at or None,
                 )
             else:
@@ -685,7 +678,7 @@ class Store:
             reset_attempts=True,
         )
 
-    def _accountDeleteDueAt(self, record: AccountRecord) -> str:
+    def accountDeleteDueAt(self, record: AccountRecord) -> str:
         """Compute when a closed account becomes eligible for final deletion."""
 
         anchor = record.expired_at or record.resources_cleaned_at or nowIso()
@@ -694,7 +687,7 @@ class Store:
             return anchor
         return (_parseDt(anchor) + timedelta(seconds=retention)).isoformat()
 
-    def _sessionDeleteDueAt(self, record: SessionRecord) -> str:
+    def sessionDeleteDueAt(self, record: SessionRecord) -> str:
         """Compute when a closed session becomes eligible for final deletion."""
         anchor = (
             record.resources_cleaned_at
@@ -707,77 +700,6 @@ class Store:
         if retention <= 0:
             return anchor
         return (_parseDt(anchor) + timedelta(seconds=retention)).isoformat()
-
-    def expireSessions(
-        self,
-        *,
-        now: str | None = None,
-        limit: int | None = None,
-    ) -> list[SessionRecord]:
-        """Transition sessions to EXPIRED when their `session_expire` task becomes due
-        Workflow:
-            - Iterate due `session_expire` tasks in due-time order.
-            - Validate that the session still exists and is not terminal.
-            - Compare `expires_at` with the current time.
-            - Mark the session EXPIRED and persist the updated record.
-            - Remove or reschedule tasks based on updated state.
-        """
-
-        # Get current time to compare with the time of the session expiry date
-        current = now or nowIso()
-        current_dt = _parseDt(current)
-
-        # Create expired session list
-        expired: list[SessionRecord] = []
-
-        # Iterate through due cleanup tasks
-        for task in self.listDueCleanupTasks(
-            now=current,
-            kind=CLEANUP_TASK_SESSION_EXPIRE,
-            limit=limit,
-        ):
-            # Get Session record for that task
-            record = self.getSession(task.subject)
-
-            # If session is not found, task is orhpaned so mark as completed for removal
-            if record is None:
-                self.completeCleanupTask(task.kind, task.subject)
-                continue
-            # If session is in terminal state, mark task as completed and continue
-            if record.state in TERMINAL_SESSION_STATES:
-                self.completeCleanupTask(task.kind, task.subject)
-                continue
-            # If session does not have an expiration date, task is invalid so mark as completed for removal
-            if not record.expires_at:
-                self.completeCleanupTask(task.kind, task.subject)
-                continue
-            # If session is not yet expired, reschedule a cleanup task to the updated expiration date
-            if _parseDt(record.expires_at) > current_dt:
-                self.scheduleCleanupTask(
-                    task.kind,
-                    task.subject,
-                    due_at=record.expires_at,
-                    now=current,
-                    reset_attempts=True,
-                )
-                continue
-
-            # Set the session as expired
-            record.state = SESSION_STATE_EXPIRED
-            record.updated_at = current
-
-            # Set the expiration date if None
-            if not record.expired_at:
-                record.expired_at = current
-
-            # Save the session record in the DB
-            self.saveSession(record)
-
-            # Add the session record to expired session list
-            expired.append(record)
-
-        # Return the expired session list
-        return expired
 
     def createSession(
         self,
