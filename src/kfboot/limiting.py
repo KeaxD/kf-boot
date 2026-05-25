@@ -71,7 +71,19 @@ class Limiter:
         self.ctx.store.saveQuota(window)
 
     def enforceAccountQuotas(self, serder) -> None:
-        """Apply account quota enforcement for onboarding and account-side requests."""
+        """Apply account quota enforcement and record successful usage.
+
+        This wrapper is convenient for direct callers and tests, but live route
+        handlers should use the split precheck/record methods so the request
+        that consumes the final API-budget slot can still complete before the
+        account is marked past due.
+        """
+
+        self.precheckAccountQuotas(serder)
+        self.recordSuccessfulAccountQuotaUse(serder)
+
+    def precheckAccountQuotas(self, serder) -> None:
+        """Apply only the pre-handler quota checks for onboarding/account requests."""
 
         # Apply quotas only to onboarding and account routes
         route = str(serder.ked.get("r", "") or "")
@@ -90,7 +102,30 @@ class Limiter:
 
         # Enforce request rate and KEL budget for the account
         self._enforceAccountRequestRate(account_aid, profile)
-        self._enforceAccountApiBudget(account_aid, profile)
+        self._enforceAccountApiBudgetLimit(account_aid, profile)
+
+    def recordSuccessfulAccountQuotaUse(self, serder) -> None:
+        """Record API-budget usage after a business handler succeeds.
+
+        Budget usage is recorded after the handler so the request that just
+        reached the budget still succeeds. Otherwise verifyEvent() could mark
+        the account expired and a second requireOnboardedAccount() inside the
+        handler would reject the very same request mid-flight.
+        """
+
+        route = str(serder.ked.get("r", "") or "")
+        if route not in ONBOARDING_ROUTES and route not in ACCOUNT_ROUTES:
+            return
+
+        payload = extractExnPayload(serder)
+        account_aid, profile = self._accountContextForRoute(serder, payload)
+        if not account_aid or profile is None:
+            logger.debug(
+                f"No account context found for route {route}"
+            )
+            return
+
+        self._recordAccountApiBudgetUse(account_aid, profile)
 
     def enforceAccountDeleteQuota(self, *, sender: str, client_ip: str) -> None:
         """Throttle account deletion with the shared bootstrap API limit, but on delete-specific buckets."""
@@ -187,8 +222,8 @@ class Limiter:
         elif ratio >= 0.85:
             logger.info(f"Approaching request rate limit for account {account_aid}, current rate: 85%")
 
-    def _enforceAccountApiBudget(self, account_aid: str, profile: Any) -> None:
-        """Enforce a fixed per-account API quota on onboarding and account routes."""
+    def _enforceAccountApiBudgetLimit(self, account_aid: str, profile: Any) -> None:
+        """Reject requests when the account has already exhausted its API budget."""
         
         if profile.api_budget <= 0:
             return
@@ -213,6 +248,26 @@ class Limiter:
                     "Request quota has been exhausted for this account tier."
                 ),
             )
+
+    def _recordAccountApiBudgetUse(self, account_aid: str, profile: Any) -> None:
+        """Persist API-budget usage after a request has succeeded."""
+
+        if profile.api_budget <= 0:
+            return
+
+        account = self.ctx.store.getAccount(account_aid)
+        if account is None:
+            logger.info(
+                "Account does not exist yet, skipping API budget accounting"
+            )
+            return
+
+        count = account.api_used
+        if count >= profile.api_budget:
+            logger.warning(
+                f"Skipping API budget increment for account {account_aid} because the budget is already exhausted"
+            )
+            return
 
         count += 1
         account.api_used = count

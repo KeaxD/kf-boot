@@ -147,15 +147,32 @@ class Store:
             and not record.resources_cleaned_at
         )
 
+    def _sessionHasAdmissionDebt(self, record: SessionRecord, *, now: str | None = None) -> bool:
+        """Return True when session-owned resources should still consume capacity.
+
+        Past-due sessions can still have live hosted witnesses/watchers before the
+        expirer marks them terminal and runs cleanup. We keep counting that debt so
+        the caller cannot wait for TTL expiry and immediately allocate a fresh set
+        of resources from the same IP or alias.
+        """
+        if self._sessionHasCleanupDebt(record):
+            return True
+        if record.state == SESSION_STATE_COMPLETED:
+            return False
+        return (
+            record.state not in TERMINAL_SESSION_STATES
+            and self._sessionPastDue(record, now=now)
+        )
+
     def _sessionConsumesAdmission(self, record: SessionRecord, *, now: str | None = None) -> bool:
         """Return True when a session should still count against onboarding admission.
 
-        Active sessions count towards onboarding capacity, but closed sessions that
-        have not finished cleanup still tie up hosted resources. We keep counting that
-        cleanup debt so callers cannot rotate principals or aliases to hoard capacity
+        Active sessions count towards onboarding capacity, but so do past-due or
+        closed sessions that still own hosted resources. We keep counting that
+        debt so callers cannot rotate principals or aliases to hoard capacity
         while the sweeper is still reclaiming the previous session's resources.
         """
-        return self._sessionIsActive(record, now=now) or self._sessionHasCleanupDebt(record)
+        return self._sessionIsActive(record, now=now) or self._sessionHasAdmissionDebt(record, now=now)
 
     def getQuota(self, scope: str, subject: str) -> QuotaRecord | None:
         return self.baser.quotas.get(keys=(scope, subject))

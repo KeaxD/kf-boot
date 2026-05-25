@@ -538,7 +538,7 @@ class AccountWitnessesHandler(RouteHandler):
         sender = serder.pre
         payload = extractExnPayload(serder)
         self.exchanger.requireOnboardedAccount(sender, payload)
-        self.exchanger.limiter.enforceAccountQuotas(serder)
+        self.exchanger.limiter.precheckAccountQuotas(serder)
         return True
 
     def handleEvent(self, serder, **kwa):
@@ -548,6 +548,7 @@ class AccountWitnessesHandler(RouteHandler):
             self.exchanger.ctx.store.listResourcesForAccount(kind="witness", account_aid=sender)
         )
         self.exchanger.expirer.refreshAccountLease(account)
+        self.exchanger.limiter.recordSuccessfulAccountQuotaUse(serder)
         logger.info(
             f"Query response for witnesses for account AID {sender}: {rows}"
         )
@@ -561,7 +562,7 @@ class AccountWatchersHandler(RouteHandler):
         sender = serder.pre
         payload = extractExnPayload(serder)
         self.exchanger.requireOnboardedAccount(sender, payload)
-        self.exchanger.limiter.enforceAccountQuotas(serder)
+        self.exchanger.limiter.precheckAccountQuotas(serder)
         return True
 
     def handleEvent(self, serder, **kwa):
@@ -571,6 +572,7 @@ class AccountWatchersHandler(RouteHandler):
             self.exchanger.ctx.store.listResourcesForAccount(kind="watcher", account_aid=sender)
         )
         self.exchanger.expirer.refreshAccountLease(account)
+        self.exchanger.limiter.recordSuccessfulAccountQuotaUse(serder)
         logger.info(
             f"Query response for watchers for account AID {sender}: {rows}"
         )
@@ -584,7 +586,7 @@ class AccountWatcherStatusHandler(RouteHandler):
         sender = serder.pre
         payload = extractExnPayload(serder)
         self.exchanger.requireOnboardedAccount(sender, payload)
-        self.exchanger.limiter.enforceAccountQuotas(serder)
+        self.exchanger.limiter.precheckAccountQuotas(serder)
         return True
 
     def handleEvent(self, serder, **kwa):
@@ -623,6 +625,7 @@ class AccountWatcherStatusHandler(RouteHandler):
         if isinstance(status, dict):
             watcher.update(status)
         self.exchanger.expirer.refreshAccountLease(account)
+        self.exchanger.limiter.recordSuccessfulAccountQuotaUse(serder)
         self.exchanger.queueReply(
             self.resource,
             sender,
@@ -637,7 +640,7 @@ class AccountWitnessDeleteHandler(RouteHandler):
         sender = serder.pre
         payload = extractExnPayload(serder)
         self.exchanger.requireOnboardedAccount(sender, payload)
-        self.exchanger.limiter.enforceAccountQuotas(serder)
+        self.exchanger.limiter.precheckAccountQuotas(serder)
         return True
 
     def handleEvent(self, serder, **kwa):
@@ -668,6 +671,7 @@ class AccountWitnessDeleteHandler(RouteHandler):
             raise bootErrorToHTTP(exc)
 
         self.exchanger.expirer.refreshAccountLease(account)
+        self.exchanger.limiter.recordSuccessfulAccountQuotaUse(serder)
         self.exchanger.queueReply(
             self.resource,
             sender,
@@ -682,7 +686,7 @@ class AccountWatcherDeleteHandler(RouteHandler):
         sender = serder.pre
         payload = extractExnPayload(serder)
         self.exchanger.requireOnboardedAccount(sender, payload)
-        self.exchanger.limiter.enforceAccountQuotas(serder)
+        self.exchanger.limiter.precheckAccountQuotas(serder)
         return True
 
     def handleEvent(self, serder, **kwa):
@@ -713,6 +717,7 @@ class AccountWatcherDeleteHandler(RouteHandler):
             raise bootErrorToHTTP(exc)
 
         self.exchanger.expirer.refreshAccountLease(account)
+        self.exchanger.limiter.recordSuccessfulAccountQuotaUse(serder)
         self.exchanger.queueReply(
             self.resource,
             sender,

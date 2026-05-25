@@ -770,6 +770,43 @@ def test_session_start_counts_uncleaned_closed_sessions_toward_per_ip_limits(con
     assert response.json["title"] == "Per-IP onboarding account limit exceeded"
 
 
+def test_session_start_counts_past_due_non_terminal_sessions_toward_per_ip_limits(contract_factory):
+    """Past-due sessions should still burn admission capacity until cleanup can run."""
+    contract = contract_factory(bootstrap_accounts_per_ip=1, bootstrap_aids_per_ip=10)
+
+    with (
+        habbing.openHab(name="ip-past-due-owner", temp=True, transferable=False) as (_, first),
+        habbing.openHab(name="ip-past-due-other", temp=True, transferable=False) as (_, second),
+    ):
+        register_aid(contract, "/onboarding", first)
+        register_aid(contract, "/onboarding", second)
+
+        first_response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(first, route="/onboarding/session/start", payload=start_payload(account_aid="AID_FIRST")),
+            remote_addr="127.0.0.1",
+        )
+        assert first_response.status_code == 200
+        _, first_reply = assert_reply_frame(contract, first_response, route="/onboarding/session/start")
+
+        # Leave the session non-terminal, but make its lease past due. The hosted
+        # resources are still live until the sweeper marks and cleans the session.
+        stale = contract.ctx.store.getSession(first_reply.ked["a"]["session_id"])
+        stale.expires_at = "2000-01-01T00:00:00+00:00"
+        contract.ctx.store.saveSession(stale)
+
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(second, route="/onboarding/session/start", payload=start_payload(account_aid="AID_OTHER")),
+            remote_addr="127.0.0.1",
+        )
+
+    assert response.status_code == 429
+    assert response.json["title"] == "Per-IP onboarding account limit exceeded"
+
+
 def test_session_start_enforces_per_ip_onboarding_principal_limit(contract_factory):
     contract = contract_factory(bootstrap_accounts_per_ip=10, bootstrap_aids_per_ip=1)
 

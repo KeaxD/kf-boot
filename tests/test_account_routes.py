@@ -1289,3 +1289,59 @@ def test_account_is_set_to_expire_when_budget_fully_used(tmp_path, monkeypatch):
         assert updated.expires_at == "2026-01-01T00:00:00+00:00"
     finally:
         store.close()
+
+
+def test_last_allowed_account_request_succeeds_before_budget_expiry(contract_factory, monkeypatch):
+    """The request that consumes the last API-budget slot should still succeed."""
+    freeze_boot_time(monkeypatch, datetime(2026, 1, 1, tzinfo=UTC))
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=100,
+                max_requests_per_minute=100,
+                api_budget=1,
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="budget-final-request-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name="budget-final-request-account", temp=True) as (_, account),
+    ):
+        register_aid(contract, "/onboarding", ephemeral)
+        register_aid(contract, "/account", account)
+
+        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
+        create_account(contract, ephemeral, start_reply, account_aid=account.pre)
+        complete_session(
+            contract,
+            ephemeral,
+            session_id=start_reply.ked["a"]["session_id"],
+            account_aid=account.pre,
+        )
+
+        accepted = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+
+        updated = contract.ctx.store.getAccount(account.pre)
+        assert accepted.status_code == 200
+        assert updated is not None
+        assert updated.api_used == 1
+        assert updated.expires_at == "2026-01-01T00:00:00+00:00"
+
+        rejected = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+
+    assert rejected.status_code == 409
+    assert rejected.json["title"] == "Account expired"
