@@ -41,9 +41,12 @@ class Admitter:
         if not client_ip:
             return
 
-        active = self.ctx.store.listActiveSessionsForIp(client_ip)
-        active_accounts = {record.account_aid for record in active if record.account_aid}
-        active_ephemerals = {record.ephemeral_aid for record in active if record.ephemeral_aid}
+        # Count both active sessions and closed sessions that still have cleanup debt.
+        # Otherwise a user can let sessions expire and immediately rotate into fresh
+        # onboarding slots while the old witness/watcher allocations are still live.
+        admission_sessions = self.ctx.store.listAdmissionSessionsForIp(client_ip)
+        active_accounts = {record.account_aid for record in admission_sessions if record.account_aid}
+        active_ephemerals = {record.ephemeral_aid for record in admission_sessions if record.ephemeral_aid}
 
         account_limit = self.ctx.config.bootstrap_accounts_per_ip
         if account_limit > 0 and account_aid and account_aid not in active_accounts and len(active_accounts) >= account_limit:
@@ -83,7 +86,10 @@ class Admitter:
                 if record.status in {ACCOUNT_STATE_PENDING_ONBOARDING, ACCOUNT_STATE_ONBOARDED}
             ]
             # Add any active sessions for the alias
-            active_alias_sessions = self.ctx.store.listActiveSessionsForAlias(account_alias)
+            # Alias limits should continue to count stale sessions whose resources
+            # have not been cleaned yet. That keeps alias admission aligned with the
+            # real resource load instead of only the currently open session count.
+            active_alias_sessions = self.ctx.store.listAdmissionSessionsForAlias(account_alias)
             active_alias_session_count = len(
                 [
                     session

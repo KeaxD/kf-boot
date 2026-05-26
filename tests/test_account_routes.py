@@ -839,15 +839,53 @@ def test_expire_accounts_transitions_onboarded_account_to_expired(onboarded_bund
     assert updated.status == ACCOUNT_STATE_EXPIRED
 
 
-def test_account_route_purges_past_due_account_on_ingress(onboarded_bundle):
-    """Test past-due accounts are expired and then purged before account route handling."""
+def test_account_route_marks_past_due_account_expired_on_ingress(onboarded_bundle):
+    """Past-due accounts are marked expired on ingress without doing heavy cleanup there."""
     contract = onboarded_bundle["contract"]
     account = onboarded_bundle["account"]
     session_id = onboarded_bundle["session_id"]
     witness_ids = onboarded_bundle["witness_ids"]
     watcher_id = onboarded_bundle["watcher_id"]
+
+    # Get record for that account and expire it
     record = contract.ctx.store.getAccount(account.pre)
     record.expires_at = "2000-01-01T00:00:00+00:00"
+
+    # Save it to trigger expiration workflow
+    contract.ctx.store.saveAccount(record)
+
+    # Send an account request
+    response = post_cesr(
+        contract,
+        "/account",
+        build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+    )
+
+    # Retrieve the account record
+    updated = contract.ctx.store.getAccount(account.pre)
+    assert updated is not None
+
+    # Assert that it was expired and request was rejected
+    assert updated.status == ACCOUNT_STATE_EXPIRED
+    assert updated.resources_cleaned_at == ""
+    assert contract.ctx.store.getSession(session_id) is not None
+    assert contract.ctx.store.getResource("watcher", watcher_id) is not None
+    for witness_id in witness_ids:
+        assert contract.ctx.store.getResource("witness", witness_id) is not None
+    assert total_witness_delete_calls(contract.ctx) == []
+    assert contract.ctx.watcher_boot.delete_calls == []
+    assert response.status_code == 409
+    assert response.json["title"] == "Account expired"
+
+
+def test_account_routes_refresh_idle_account_lease(onboarded_bundle):
+    """Test that refreshing an account lease sets it to current time + account TTL even if expires_at is superior"""
+    contract = onboarded_bundle["contract"]
+    account = onboarded_bundle["account"]
+    record = contract.ctx.store.getAccount(account.pre)
+
+    # Expire the account far in the future
+    record.expires_at = "2099-01-01T00:00:00+00:00"
     contract.ctx.store.saveAccount(record)
 
     response = post_cesr(
@@ -856,50 +894,70 @@ def test_account_route_purges_past_due_account_on_ingress(onboarded_bundle):
         build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
     )
 
+    assert response.status_code == 200
     updated = contract.ctx.store.getAccount(account.pre)
-    assert updated is None
-    assert contract.ctx.store.getSession(session_id) is None
-    assert contract.ctx.store.getResource("watcher", watcher_id) is None
-    for witness_id in witness_ids:
-        assert contract.ctx.store.getResource("witness", witness_id) is None
-    assert response.status_code == 404
-    assert response.json["title"] == "Account not found"
+    assert updated is not None
+
+    # Assert that the expires_at variable changed to be current time + account TTL
+    assert updated.expires_at != "2099-01-01T00:00:00+00:00"
 
 
-def test_account_route_rejects_past_due_account_when_expiry_teardown_fails(onboarded_bundle, monkeypatch):
-    """Test past-due accounts stay blocked even when resources teardown has failed"""
+def test_cleanup_expired_accounts_retries_with_backoff(onboarded_bundle, monkeypatch):
+    """Expired account cleanup should back off after teardown failures instead of retrying every sweep."""
     contract = onboarded_bundle["contract"]
     account = onboarded_bundle["account"]
+
+    # Retrieve account and expire it
     record = contract.ctx.store.getAccount(account.pre)
-    record.expires_at = "2000-01-01T00:00:00+00:00"
+    record.status = ACCOUNT_STATE_EXPIRED
+    record.expired_at = "2026-01-01T00:00:00+00:00"
     contract.ctx.store.saveAccount(record)
 
+    # Create an attempts list to track back off behavior
+    attempts: list[str] = []
+
     def fake_teardown(*, account_aid: str, account=None) -> None:
+        attempts.append(account_aid)
         raise BootError("simulated teardown failure", status_code=502)
 
     monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownAccountResources", fake_teardown)
 
-    response = post_cesr(
-        contract,
-        "/account",
-        build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
-    )
+    # First sweep: task is due => teardown attempted => failure => task rescheduled with backoff.
+    first = contract.ctx.exchanger.expirer.cleanupExpiredAccounts(now="2026-01-01T00:00:00+00:00")
 
+    # Second sweep (30 seconds later): backoff window has NOT elapsed => no retry should occur.
+    second = contract.ctx.exchanger.expirer.cleanupExpiredAccounts(now="2026-01-01T00:00:30+00:00")
+
+    # Third sweep (61 seconds later): backoff window HAS elapsed => retry should occur.
+    third = contract.ctx.exchanger.expirer.cleanupExpiredAccounts(now="2026-01-01T00:01:01+00:00")
+
+    # Retrieve the account and assert clean up was not successful
     updated = contract.ctx.store.getAccount(account.pre)
     assert updated is not None
-    assert updated.status == ACCOUNT_STATE_ONBOARDED
-    assert response.status_code == 409
-    assert response.json["title"] == "Account expired"
+    assert updated.status == ACCOUNT_STATE_EXPIRED
+    assert updated.resources_cleaned_at == ""
+
+    # Failed cleanups should reschedule without being reported as successfully cleaned.
+    assert first == []
+
+    # Second sweep skipped due to backoff
+    assert second == []
+
+    # Third sweep retries after backoff, but still does not report success because cleanup failed again.
+    assert third == []
+
+    # Assert attempts only contains the 1st and 3rd attempt
+    assert attempts == [account.pre, account.pre]
 
 
 @pytest.mark.parametrize(
     ("status", "title"),
     [
-        (ACCOUNT_STATE_EXPIRED, "Account not found"),
+        (ACCOUNT_STATE_EXPIRED, "Account expired"),
     ],
 )
 def test_account_routes_reject_expired_accounts(onboarded_bundle, status, title):
-    """Expired accounts are purged before account routes run."""
+    """Expired accounts are rejected locally while cleanup waits for the sweeper."""
     contract = onboarded_bundle["contract"]
     account = onboarded_bundle["account"]
     record = contract.ctx.store.getAccount(account.pre)
@@ -914,12 +972,12 @@ def test_account_routes_reject_expired_accounts(onboarded_bundle, status, title)
         build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
     )
 
-    assert contract.ctx.store.getAccount(account.pre) is None
-    assert response.status_code == 404
+    assert contract.ctx.store.getAccount(account.pre) is not None
+    assert response.status_code == 409
     assert response.json["title"] == title
 
-def test_expire_accounts_triggers_resource_teardown(contract_factory, monkeypatch):
-    """Ensure expired accounts trigger cleanup of allocated resources."""
+def test_cleanup_expired_accounts_triggers_resource_teardown(contract_factory, monkeypatch):
+    """Ensure the cleanup phase tears down resources for already-expired accounts."""
     contract = contract_factory(
         bootstrap_accounts_per_ip=100,
         bootstrap_aids_per_ip=100,
@@ -941,8 +999,10 @@ def test_expire_accounts_triggers_resource_teardown(contract_factory, monkeypatc
         tier="trial",
         onboarded=True,
     )
-    account.status = ACCOUNT_STATE_ONBOARDED
-    account.expires_at = "2000-01-01T00:00:00+00:00"
+
+    # Set account as expired and save it 
+    account.status = ACCOUNT_STATE_EXPIRED
+    account.expired_at = "2000-01-01T00:00:00+00:00"
     contract.ctx.store.saveAccount(account)
 
     cleaned: list[tuple] = []
@@ -957,12 +1017,15 @@ def test_expire_accounts_triggers_resource_teardown(contract_factory, monkeypatc
 
     monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownAccountResources", fake_teardown)
 
-    # Run expiration logic
-    contract.ctx.exchanger.expirer.expireAccounts()
+    # Run cleanup logic
+    cleaned_accounts = contract.ctx.exchanger.expirer.cleanupExpiredAccounts(
+        now="2026-01-01T00:00:00+00:00"
+    )
 
     expired = contract.ctx.store.getAccount("AID_EXPIRED")
     assert expired is not None
     assert expired.status == ACCOUNT_STATE_EXPIRED
+    assert cleaned_accounts == ["AID_EXPIRED"]
 
     # Ensure teardown was invoked exactly once with correct args
     assert cleaned == [("AID_EXPIRED", expired)]
@@ -971,6 +1034,88 @@ def test_expire_accounts_triggers_resource_teardown(contract_factory, monkeypatc
     assert expired.watcher_eid == ""
     assert expired.witness_eids == []
     assert expired.session_id == ""
+    assert expired.resources_cleaned_at == "2026-01-01T00:00:00+00:00"
+
+
+def test_cleanup_sweep_processes_expired_account_in_batches(onboarded_bundle):
+    """Tests a bounded sweep should spread expire, cleanup, and delete across multiple passes."""
+    contract = onboarded_bundle["contract"]
+    account = onboarded_bundle["account"]
+    session_id = onboarded_bundle["session_id"]
+    witness_ids = onboarded_bundle["witness_ids"]
+    watcher_id = onboarded_bundle["watcher_id"]
+    record = contract.ctx.store.getAccount(account.pre)
+    record.expires_at = "2000-01-01T00:00:00+00:00"
+    contract.ctx.store.saveAccount(record)
+
+    # Set batch size to 1 to make sure it only does 1 work
+    first = contract.ctx.exchanger.expirer.sweep(batch_size=1)
+
+    # Get the account after the sweep
+    after_first = contract.ctx.store.getAccount(account.pre)
+
+    # Assert results of the work done
+    assert first == {
+        "sessions_expired": 0,
+        "sessions_cleaned": 0,
+        "sessions_deleted": 0,
+        "accounts_expired": 1,
+        "accounts_cleaned": 0,
+        "accounts_deleted": 0,
+    }
+
+    # Assert account status cleanly transitioned to only expired
+    assert after_first is not None
+    assert after_first.status == ACCOUNT_STATE_EXPIRED
+
+    # Assert resources haven't been cleaned up yet
+    assert after_first.resources_cleaned_at == ""
+    assert contract.ctx.store.getSession(session_id) is not None
+    assert contract.ctx.store.getResource("watcher", watcher_id) is not None
+    for witness_id in witness_ids:
+        assert contract.ctx.store.getResource("witness", witness_id) is not None
+    
+    # Run the second sweep with a batch size to only 1
+    second = contract.ctx.exchanger.expirer.sweep(batch_size=1)
+
+    # Retrieve the account after the 2nd sweep
+    after_second = contract.ctx.store.getAccount(account.pre)
+
+    # Assert results 
+    assert second == {
+        "sessions_expired": 0,
+        "sessions_cleaned": 0,
+        "sessions_deleted": 0,
+        "accounts_expired": 0,
+        "accounts_cleaned": 1,
+        "accounts_deleted": 0,
+    }
+
+    # Assert account is still present and transitioned from expired to cleaned up with resources torndown
+    assert after_second is not None
+    assert after_second.resources_cleaned_at
+    assert contract.ctx.store.getSession(session_id) is not None
+    assert contract.ctx.store.getResource("watcher", watcher_id) is None
+    for witness_id in witness_ids:
+        assert contract.ctx.store.getResource("witness", witness_id) is None
+
+
+    # Run a 3rd sweep with batch size of 1
+    third = contract.ctx.exchanger.expirer.sweep(batch_size=1)
+
+    # Assert results
+    assert third == {
+        "sessions_expired": 0,
+        "sessions_cleaned": 0,
+        "sessions_deleted": 0,
+        "accounts_expired": 0,
+        "accounts_cleaned": 0,
+        "accounts_deleted": 1,
+    }
+
+    # Assert account and session got deleted
+    assert contract.ctx.store.getAccount(account.pre) is None
+    assert contract.ctx.store.getSession(session_id) is None
 
 
 def test_delete_expired_accounts_removes_account(onboarded_bundle):
@@ -984,6 +1129,8 @@ def test_delete_expired_accounts_removes_account(onboarded_bundle):
     # Get the record and set it as expired
     record = contract.ctx.store.getAccount(account.pre)
     record.status = ACCOUNT_STATE_EXPIRED
+    record.expired_at = "2026-01-01T00:00:00+00:00"
+    record.resources_cleaned_at = "2026-01-01T00:00:00+00:00"
 
     # Save the changes
     contract.ctx.store.saveAccount(record)
@@ -992,9 +1139,10 @@ def test_delete_expired_accounts_removes_account(onboarded_bundle):
     contract.ctx.store.addBinding(account.pre, "cid-to-delete")
 
     # Run the function
-    contract.ctx.exchanger.expirer.deleteExpiredAccounts()
+    deleted = contract.ctx.exchanger.expirer.deleteExpiredAccounts()
 
     # Assert correct deletion behavior
+    assert deleted == [account.pre]
     assert contract.ctx.store.baser.bindings.get(keys=(account.pre, "cid-to-delete")) is None
     assert contract.ctx.store.getAccount(account.pre) is None
     assert contract.ctx.store.getSession(session_id) is None
@@ -1141,3 +1289,59 @@ def test_account_is_set_to_expire_when_budget_fully_used(tmp_path, monkeypatch):
         assert updated.expires_at == "2026-01-01T00:00:00+00:00"
     finally:
         store.close()
+
+
+def test_last_allowed_account_request_succeeds_before_budget_expiry(contract_factory, monkeypatch):
+    """The request that consumes the last API-budget slot should still succeed."""
+    freeze_boot_time(monkeypatch, datetime(2026, 1, 1, tzinfo=UTC))
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=100,
+                max_requests_per_minute=100,
+                api_budget=1,
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="budget-final-request-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name="budget-final-request-account", temp=True) as (_, account),
+    ):
+        register_aid(contract, "/onboarding", ephemeral)
+        register_aid(contract, "/account", account)
+
+        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
+        create_account(contract, ephemeral, start_reply, account_aid=account.pre)
+        complete_session(
+            contract,
+            ephemeral,
+            session_id=start_reply.ked["a"]["session_id"],
+            account_aid=account.pre,
+        )
+
+        accepted = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+
+        updated = contract.ctx.store.getAccount(account.pre)
+        assert accepted.status_code == 200
+        assert updated is not None
+        assert updated.api_used == 1
+        assert updated.expires_at == "2026-01-01T00:00:00+00:00"
+
+        rejected = post_cesr(
+            contract,
+            "/account",
+            build_exn(account, route="/account/witnesses", payload={"account_aid": account.pre}),
+        )
+
+    assert rejected.status_code == 409
+    assert rejected.json["title"] == "Account expired"

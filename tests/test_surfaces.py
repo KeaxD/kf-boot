@@ -5,10 +5,13 @@ from keri.app import habbing
 from keri.app.httping import CESR_ATTACHMENT_HEADER, CESR_CONTENT_TYPE
 from keri.core import eventing
 
+from kfboot.app import create_app
+
 from .support import (
     build_exn,
     build_signed_serder,
     make_witness_backends,
+    make_config,
     post_cesr,
     register_aid,
     split_cesr_message,
@@ -19,7 +22,30 @@ from .support import (
 def test_public_discovery_stays_plain_json_and_reply_frames_prepend_boot_kel(contract):
     health = contract.simulate_get("/health")
     assert health.status_code == 200
-    assert health.json == {"status": "ok"}
+    assert health.json == {
+        "status": "ok",
+        "cleanup": {
+            "configured": True,
+            "expected_running": False,
+            "running": False,
+            "pending_tasks": 0,
+            "due_tasks": 0,
+            "claimed_tasks": 0,
+            "oldest_due_at": None,
+            "oldest_due_age_seconds": None,
+            "oldest_claimed_at": None,
+            "oldest_claimed_age_seconds": None,
+            "last_sweep_started_at": None,
+            "last_sweep_finished_at": None,
+            "last_progress_at": None,
+            "current_sweep_started_at": None,
+            "current_sweep_age_seconds": None,
+            "last_error_at": None,
+            "last_error": None,
+            "last_recovery_at": None,
+            "recovered_claimed_tasks": 0,
+        },
+    }
     assert "connection" not in {key.lower() for key in health.headers}
 
     config = contract.simulate_get("/bootstrap/config")
@@ -49,6 +75,33 @@ def test_public_discovery_stays_plain_json_and_reply_frames_prepend_boot_kel(con
         assert reply.ked["r"] == "/onboarding/session/start"
         assert reply.ked["i"] == contract.ctx.host_hab.pre
         assert reply.ked["a"]["session_id"].startswith("sess_")
+
+
+def test_health_reports_cleanup_runner_failure_when_cleanup_should_be_running(contract_factory):
+    contract = contract_factory(cleanup_interval_seconds=60)
+    # Stop the sweeper
+    contract.ctx.cleanup_runner.stop()
+
+    health = contract.simulate_get("/health")   
+    
+    # Assert health report
+    assert health.status_code == 503
+    assert health.json["status"] == "degraded"
+    assert health.json["cleanup"]["configured"] is True
+    assert health.json["cleanup"]["expected_running"] is True
+    assert health.json["cleanup"]["running"] is False
+    assert health.json["cleanup"]["reason"] == "runner_not_running"
+    assert health.json["cleanup"]["reasons"] == ["runner_not_running"]
+
+
+def test_create_app_applies_boot_api_timeout_to_real_boot_clients(tmp_path):
+    config = make_config(tmp_path, boot_api_timeout_seconds=7, cleanup_interval_seconds=0)
+    _app, ctx = create_app(config=config, temp=True)
+    try:
+        assert all(client.timeout == 7 for client in ctx.witness_boots.values())
+        assert ctx.watcher_boot.timeout == 7
+    finally:
+        ctx.close(clear=True)
 
 
 def test_public_discovery_only_advertises_profiles_supported_by_configured_witness_backends(contract_factory):

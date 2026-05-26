@@ -10,6 +10,7 @@ from keri.app import habbing
 from kfboot.basing import (
     ACCOUNT_STATE_FAILED,
     ACCOUNT_STATE_ONBOARDED,
+    ACCOUNT_STATE_EXPIRED,
     ACCOUNT_STATE_PENDING_ONBOARDING,
     SESSION_STATE_ACCOUNT_CREATED,
     SESSION_STATE_CANCELLED,
@@ -18,6 +19,7 @@ from kfboot.basing import (
     SESSION_STATE_FAILED,
     SESSION_STATE_WITNESS_POOL_ALLOCATED,
 )
+from kfboot.boot_client import BootError
 from kfboot.config import AccountProfile
 from kfboot.limiting import Limiter
 from .support import (
@@ -105,6 +107,43 @@ def test_onboarding_flow_persists_state_transitions_and_bound_resources(contract
         assert session.state == SESSION_STATE_COMPLETED
         assert account_record.status == ACCOUNT_STATE_ONBOARDED
         assert account_record.onboarded_at
+
+
+def test_session_status_rejects_expired_session_without_refreshing_lease(contract):
+    """Test that requests are rejected if session is expired"""
+    with (
+        habbing.openHab(name="expired-status-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name="expired-status-account", temp=True) as (_, account),
+    ):
+        register_aid(contract, "/onboarding", ephemeral)
+        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
+
+        # Retrieve session and expire it 
+        session_id = start_reply.ked["a"]["session_id"]
+        session = contract.ctx.store.getSession(session_id)
+        session.expires_at = "2000-01-01T00:00:00+00:00"
+
+        # Save session to trigger clean up tasks
+        contract.ctx.store.saveSession(session)
+
+        # Send an onboarding status request
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(
+                ephemeral,
+                route="/onboarding/session/status",
+                payload={"session_id": session_id},
+            ),
+        )
+
+        # Assert session is expired and request is rejected
+        updated = contract.ctx.store.getSession(session_id)
+        assert response.status_code == 410
+        assert response.json["title"] == "Session expired"
+        assert updated is not None
+        assert updated.state == SESSION_STATE_EXPIRED
+        assert updated.expires_at == "2000-01-01T00:00:00+00:00"
 
 
 def test_session_start_is_idempotent_and_does_not_duplicate_allocations(contract):
@@ -216,6 +255,54 @@ def test_session_start_rejects_closed_existing_session_without_new_allocations(c
     assert contract.ctx.store.getSession(session_id).state == state
     assert total_witness_create_calls(contract.ctx) == 1
     assert contract.ctx.watcher_boot.create_calls == 1
+
+
+def test_session_start_marks_past_due_session_expired_and_blocks_until_cleanup_finishes(contract):
+    """Expired sessions must finish cleanup before a fresh allocation can be created."""
+    with habbing.openHab(name="start-past-due-session", temp=True, transferable=False) as (_, ephemeral):
+        register_aid(contract, "/onboarding", ephemeral)
+        _, _, first = start_session(contract, ephemeral)
+        first_session_id = first.ked["a"]["session_id"]
+
+        # Force the existing session past its lease so the next start request
+        # must close it instead of reusing or refreshing it.
+        stale = contract.ctx.store.getSession(first_session_id)
+        stale.expires_at = "2000-01-01T00:00:00+00:00"
+        contract.ctx.store.saveSession(stale)
+
+        # The retry marks the stale session expired, but it should not hand out
+        # a brand-new session until cleanup has reclaimed the old resources.
+        retry = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+        )
+        refreshed_old = contract.ctx.store.getSession(first_session_id)
+
+        assert retry.status_code == 409
+        assert retry.json["title"] == "Session cleanup pending"
+        assert refreshed_old is not None
+        assert refreshed_old.state == SESSION_STATE_EXPIRED
+        assert refreshed_old.resources_cleaned_at == ""
+        assert total_witness_create_calls(contract.ctx) == 1
+        assert contract.ctx.watcher_boot.create_calls == 1
+
+        # Once cleanup runs, a follow-up start may allocate a fresh session safely.
+        cleaned = contract.ctx.exchanger.expirer.cleanupExpiredSessions(
+            now="2099-01-01T00:00:00+00:00"
+        )
+        assert cleaned == [first_session_id]
+
+        second_retry = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
+        )
+        _, retry_reply = assert_reply_frame(contract, second_retry, route="/onboarding/session/start")
+        assert second_retry.status_code == 200
+        assert retry_reply.ked["a"]["session_id"] != first_session_id
+        assert total_witness_create_calls(contract.ctx) == 2
+        assert contract.ctx.watcher_boot.create_calls == 2
 
 
 @pytest.mark.parametrize(
@@ -364,7 +451,7 @@ def test_session_status_refreshes_session_lease(contract):
         assert refreshed.expires_at != "2099-01-01T00:00:00+00:00"
 
 
-def test_partial_downstream_failure_marks_sessionFailed_and_blind_retry_does_not_duplicate_resources(contract_factory):
+def test_partial_downstream_failure_cleans_resources_and_allows_fresh_retry(contract_factory):
     contract = contract_factory(
         watcher_boot=FakeWatcherBoot(create_error=boot_error(503, "simulated watcher failure"))
     )
@@ -383,7 +470,7 @@ def test_partial_downstream_failure_marks_sessionFailed_and_blind_retry_does_not
         )
         assert response.status_code == 503
 
-        session = contract.ctx.store.findActiveSessionForEphemeral(ephemeral.pre)
+        session = contract.ctx.store.findSessionForEphemeral(ephemeral.pre)
         assert session.state == SESSION_STATE_FAILED
         assert session.witness_eids == []
         assert session.watcher_eid == ""
@@ -402,9 +489,125 @@ def test_partial_downstream_failure_marks_sessionFailed_and_blind_retry_does_not
                 payload=start_payload(chosen_profile_code="3-of-4"),
             ),
         )
-        assert retry.status_code == 409
-        assert total_witness_create_calls(contract.ctx) == 4
-        assert contract.ctx.watcher_boot.create_calls == 1
+        # Cleanup already succeeded for the failed session, so the next start
+        # is allowed to attempt a brand-new allocation instead of being blocked
+        # behind stale cleanup debt. The downstream watcher still fails, but the
+        # retry should not leak resources from either attempt.
+        assert retry.status_code == 503
+        assert total_witness_create_calls(contract.ctx) == 8
+        assert contract.ctx.watcher_boot.create_calls == 2
+        assert contract.ctx.store.countResources("witness") == 0
+        assert contract.ctx.store.countResources("watcher") == 0
+        assert sorted(total_witness_delete_calls(contract.ctx)) == sorted(total_witness_created_eids(contract.ctx))
+
+
+def test_failed_session_teardown_is_retried_by_cleanup_tasks(contract_factory, monkeypatch):
+    """Test that teardown failure can be picked up again for cleanup"""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+    )
+
+    with (
+        habbing.openHab(name="failed-cleanup-ephemeral", temp=True, transferable=False) as (_, ephemeral),
+        habbing.openHab(name="failed-cleanup-account", temp=True) as (_, account),
+    ):
+        register_aid(contract, "/onboarding", ephemeral)
+        _, _, start_reply = start_session(contract, ephemeral, account_aid=account.pre)
+        create_account(contract, ephemeral, start_reply, account_aid=account.pre)
+
+        session_id = start_reply.ked["a"]["session_id"]
+        witness_id = start_reply.ked["a"]["witnesses"][0]["eid"]
+        watcher_id = start_reply.ked["a"]["watcher"]["eid"]
+        session = contract.ctx.store.getSession(session_id)
+        account_record = contract.ctx.store.getAccount(account.pre)
+        attempts: list[str] = []
+
+        # Create a fake failed teardown where the 1st attempt fails
+        def flaky_teardown(*, session: Any, account=None) -> None:
+            attempts.append(session.session_id)
+            if len(attempts) == 1:
+                raise BootError("simulated cleanup failure", status_code=502)
+            contract.ctx.store.deleteResource("witness", witness_id)
+            contract.ctx.store.deleteResource("watcher", watcher_id)
+            session.witness_eids = []
+            session.watcher_eid = ""
+            if account is not None:
+                account.witness_eids = []
+                account.watcher_eid = ""
+                account.session_id = ""
+
+        monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownSessionResources", flaky_teardown)
+
+        # Fail session clean up
+        contract.ctx.exchanger.expirer.failSession(
+            session=session,
+            reason="simulated provisioning failure",
+            account=account_record,
+            teardown=True,
+        )
+        
+        # Assert failed session
+        failed = contract.ctx.store.getSession(session_id)
+        assert failed is not None
+        assert failed.state == SESSION_STATE_FAILED
+        assert failed.resources_cleaned_at == ""
+
+        # Run the cleanup
+        cleaned = contract.ctx.exchanger.expirer.cleanupExpiredSessions(
+            now="2099-01-01T00:00:00+00:00"
+        )
+
+        # Assert sucessful teardown
+        recovered = contract.ctx.store.getSession(session_id)
+        failed_account = contract.ctx.store.getAccount(account.pre)
+        assert cleaned == [session_id]
+        assert recovered is not None
+        assert recovered.resources_cleaned_at == "2099-01-01T00:00:00+00:00"
+        assert failed_account is not None
+        assert failed_account.status == ACCOUNT_STATE_FAILED
+        assert failed_account.resources_cleaned_at == "2099-01-01T00:00:00+00:00"
+        assert failed_account.session_id == ""
+        assert contract.ctx.store.getResource("witness", witness_id) is None
+        assert contract.ctx.store.getResource("watcher", watcher_id) is None
+        assert attempts == [session_id, session_id]
+
+
+def test_cleanup_expired_sessions_failure_does_not_report_false_success(contract_factory, monkeypatch):
+    """Cleanup retries should stay visible as pending work instead of looking successful."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+    )
+
+    with habbing.openHab(name="cleanup-failure-session", temp=True, transferable=False) as (_, ephemeral):
+        register_aid(contract, "/onboarding", ephemeral)
+        _, _, start_reply = start_session(contract, ephemeral)
+
+        session_id = start_reply.ked["a"]["session_id"]
+        session = contract.ctx.store.getSession(session_id)
+        session.expires_at = "2000-01-01T00:00:00+00:00"
+        contract.ctx.store.saveSession(session)
+        contract.ctx.exchanger.expirer.expireSessions(now="2026-01-01T00:00:00+00:00")
+
+        def always_fail(*, session: Any, account=None) -> None:
+            raise BootError("simulated cleanup retry failure", status_code=502)
+
+        monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownSessionResources", always_fail)
+
+        cleaned = contract.ctx.exchanger.expirer.cleanupExpiredSessions(
+            now="2026-01-01T00:00:00+00:00"
+        )
+
+        updated = contract.ctx.store.getSession(session_id)
+        task = contract.ctx.store.getCleanupTask("session_cleanup", session_id)
+        assert cleaned == []
+        assert updated is not None
+        assert updated.resources_cleaned_at == ""
+        assert task is not None
+        assert task.last_error == "simulated cleanup retry failure"
+        assert task.attempt_count == 1
+        assert task.due_at == "2026-01-01T00:01:00+00:00"
 
 
 def test_expired_sessions_reclaim_hosted_resources_and_fail_pending_account(contract):
@@ -425,6 +628,8 @@ def test_expired_sessions_reclaim_hosted_resources_and_fail_pending_account(cont
         expired.expires_at = "2024-01-01T00:00:00+00:00"
         contract.ctx.store.saveSession(expired)
 
+        sweep = contract.ctx.exchanger.expirer.sweep(batch_size=10)
+
         register_aid(contract, "/onboarding", next_ephemeral)
         response = post_cesr(
             contract,
@@ -436,8 +641,11 @@ def test_expired_sessions_reclaim_hosted_resources_and_fail_pending_account(cont
 
         expired = contract.ctx.store.getSession(session_id)
         account_record = contract.ctx.store.getAccount(account.pre)
-        assert expired.state == SESSION_STATE_EXPIRED
-        assert account_record.status == ACCOUNT_STATE_FAILED
+        assert sweep["sessions_expired"] == 1
+        assert sweep["sessions_cleaned"] == 1
+        assert sweep["accounts_deleted"] == 1
+        assert expired is None
+        assert account_record is None
         assert contract.ctx.store.getResource("witness", witness_id) is None
         assert contract.ctx.store.getResource("watcher", watcher_id) is None
         assert witness_id in total_witness_delete_calls(contract.ctx)
@@ -456,7 +664,7 @@ def test_session_start_enforces_witness_capacity(contract_factory):
         )
 
     assert response.status_code == 409
-    session = contract.ctx.store.findActiveSessionForEphemeral(ephemeral.pre)
+    session = contract.ctx.store.findSessionForEphemeral(ephemeral.pre)
     assert session.state == SESSION_STATE_FAILED
     assert session.witness_eids == []
     assert session.watcher_eid == ""
@@ -475,7 +683,7 @@ def test_session_start_enforces_watcher_capacity_without_duplicate_witnesses(con
         )
         assert response.status_code == 409
 
-        session = contract.ctx.store.findActiveSessionForEphemeral(ephemeral.pre)
+        session = contract.ctx.store.findSessionForEphemeral(ephemeral.pre)
         assert session.state == SESSION_STATE_FAILED
         assert session.witness_eids == []
         assert session.watcher_eid == ""
@@ -489,8 +697,10 @@ def test_session_start_enforces_watcher_capacity_without_duplicate_witnesses(con
             build_exn(ephemeral, route="/onboarding/session/start", payload=start_payload()),
         )
         assert retry.status_code == 409
-        assert total_witness_create_calls(contract.ctx) == 1
+        assert total_witness_create_calls(contract.ctx) == 2
         assert contract.ctx.watcher_boot.create_calls == 0
+        assert contract.ctx.store.countResources("witness") == 0
+        assert contract.ctx.store.countResources("watcher") == 0
 
 
 def test_session_start_enforces_per_ip_account_limit(contract_factory):
@@ -509,6 +719,82 @@ def test_session_start_enforces_per_ip_account_limit(contract_factory):
             remote_addr="127.0.0.1",
         )
         assert first_response.status_code == 200
+
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(second, route="/onboarding/session/start", payload=start_payload(account_aid="AID_OTHER")),
+            remote_addr="127.0.0.1",
+        )
+
+    assert response.status_code == 429
+    assert response.json["title"] == "Per-IP onboarding account limit exceeded"
+
+
+def test_session_start_counts_uncleaned_closed_sessions_toward_per_ip_limits(contract_factory):
+    """Closed sessions still count against IP admission until their resources are reclaimed."""
+    contract = contract_factory(bootstrap_accounts_per_ip=1, bootstrap_aids_per_ip=10)
+
+    with (
+        habbing.openHab(name="ip-cleanup-debt-owner", temp=True, transferable=False) as (_, first),
+        habbing.openHab(name="ip-cleanup-debt-other", temp=True, transferable=False) as (_, second),
+    ):
+        register_aid(contract, "/onboarding", first)
+        register_aid(contract, "/onboarding", second)
+
+        # Send an Onboarding session start request
+        first_response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(first, route="/onboarding/session/start", payload=start_payload(account_aid="AID_FIRST")),
+            remote_addr="127.0.0.1",
+        )
+        assert first_response.status_code == 200
+        _, first_reply = assert_reply_frame(contract, first_response, route="/onboarding/session/start")
+
+        # Set session as stale
+        stale = contract.ctx.store.getSession(first_reply.ked["a"]["session_id"])
+        stale.expires_at = "2000-01-01T00:00:00+00:00"
+        contract.ctx.store.saveSession(stale)
+        contract.ctx.exchanger.expirer.markSessionExpired(stale, now="2000-01-01T00:00:00+00:00")
+
+        # Try to start a 2nd onboarding session
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(second, route="/onboarding/session/start", payload=start_payload(account_aid="AID_OTHER")),
+            remote_addr="127.0.0.1",
+        )
+
+    assert response.status_code == 429
+    assert response.json["title"] == "Per-IP onboarding account limit exceeded"
+
+
+def test_session_start_counts_past_due_non_terminal_sessions_toward_per_ip_limits(contract_factory):
+    """Past-due sessions should still burn admission capacity until cleanup can run."""
+    contract = contract_factory(bootstrap_accounts_per_ip=1, bootstrap_aids_per_ip=10)
+
+    with (
+        habbing.openHab(name="ip-past-due-owner", temp=True, transferable=False) as (_, first),
+        habbing.openHab(name="ip-past-due-other", temp=True, transferable=False) as (_, second),
+    ):
+        register_aid(contract, "/onboarding", first)
+        register_aid(contract, "/onboarding", second)
+
+        first_response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(first, route="/onboarding/session/start", payload=start_payload(account_aid="AID_FIRST")),
+            remote_addr="127.0.0.1",
+        )
+        assert first_response.status_code == 200
+        _, first_reply = assert_reply_frame(contract, first_response, route="/onboarding/session/start")
+
+        # Leave the session non-terminal, but make its lease past due. The hosted
+        # resources are still live until the sweeper marks and cleans the session.
+        stale = contract.ctx.store.getSession(first_reply.ked["a"]["session_id"])
+        stale.expires_at = "2000-01-01T00:00:00+00:00"
+        contract.ctx.store.saveSession(stale)
 
         response = post_cesr(
             contract,
@@ -980,6 +1266,60 @@ def test_session_start_rejects_alias_when_existing_account_is_pending(contract_f
     assert "configured limit for tier 'trial' is 1" in response.json["description"]
 
 
+def test_session_start_counts_uncleaned_closed_sessions_toward_alias_limits(contract_factory):
+    """Alias limits should include stale sessions whose resources are still being reclaimed."""
+    contract = contract_factory(
+        bootstrap_accounts_per_ip=100,
+        bootstrap_aids_per_ip=100,
+        bootstrap_account_options=("1-of-1",),
+        account_profiles=(
+            AccountProfile(
+                tier="trial",
+                code="1-of-1",
+                max_accounts=1,
+                max_requests_per_minute=100,
+                api_budget=100,
+            ),
+        ),
+    )
+
+    with (
+        habbing.openHab(name="alias-cleanup-debt-1", temp=True, transferable=False) as (_, first),
+        habbing.openHab(name="alias-cleanup-debt-2", temp=True, transferable=False) as (_, second),
+    ):
+        # Register 2 AIDs
+        register_aid(contract, "/onboarding", first)
+        register_aid(contract, "/onboarding", second)
+
+        # Start a session with the 1st AID
+        _, _, first_reply = start_session(
+            contract,
+            first,
+            account_aid="AID_ALIAS_FIRST",
+            account_alias="alpha",
+        )
+        
+        # 1st AID's session becomes stale
+        stale = contract.ctx.store.getSession(first_reply.ked["a"]["session_id"])
+        stale.expires_at = "2000-01-01T00:00:00+00:00"
+        contract.ctx.store.saveSession(stale)
+        contract.ctx.exchanger.expirer.markSessionExpired(stale, now="2000-01-01T00:00:00+00:00")
+
+        # Send another session start request with the 2nd AID 
+        response = post_cesr(
+            contract,
+            "/onboarding",
+            build_exn(
+                second,
+                route="/onboarding/session/start",
+                payload=start_payload(account_aid="AID_ALIAS_SECOND", account_alias="alpha"),
+            ),
+        )
+    # Assert request was denied because of limit reached
+    assert response.status_code == 429
+    assert response.json["title"] == "Account alias limit exceeded"
+
+
 def test_account_create_rejects_expired_permanent_account(contract_factory):
     """Verify that onboarding rejects account creation when the account is expired."""
     contract = contract_factory(
@@ -1002,7 +1342,7 @@ def test_account_create_rejects_expired_permanent_account(contract_factory):
         assert record is not None
 
         # Set the account status to expired
-        record.status = 'expired'
+        record.status = ACCOUNT_STATE_EXPIRED
         contract.ctx.store.saveAccount(record)
 
         response = post_cesr(
@@ -1014,13 +1354,13 @@ def test_account_create_rejects_expired_permanent_account(contract_factory):
                 payload=account_create_payload(start_reply, account.pre),
             ),
         )
-    # Assert the account creation is rejected
-    assert response.status_code == 404
-    assert response.json["title"] == "Session not found"
+    assert response.status_code == 409
+    assert response.json["title"] == "Account not available"
+    assert "expired" in response.json["description"]
 
 
-def test_expire_sessions_cleans_up_stale_staging_allocations(contract_factory, monkeypatch):
-    """Ensure expired staging sessions trigger cleanup of stale allocations."""
+def test_cleanup_expired_sessions_cleans_up_stale_staging_allocations(contract_factory, monkeypatch):
+    """Ensure expired staging sessions are cleaned by the sweeper cleanup phase."""
     contract = contract_factory(
         bootstrap_accounts_per_ip=100,
         bootstrap_aids_per_ip=100,
@@ -1049,11 +1389,17 @@ def test_expire_sessions_cleans_up_stale_staging_allocations(contract_factory, m
 
     monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownSessionResources", fake_teardown)
 
-    contract.ctx.exchanger.expirer.expireSessions()
+    expired = contract.ctx.exchanger.expirer.expireSessions(now="2026-01-01T00:00:00+00:00")
+    cleaned_sessions = contract.ctx.exchanger.expirer.cleanupExpiredSessions(
+        now="2026-01-01T00:00:00+00:00"
+    )
 
     expired_session = contract.ctx.store.getSession(session.session_id)
     assert expired_session is not None
     assert expired_session.state == SESSION_STATE_EXPIRED
+    assert [record.session_id for record in expired] == [session.session_id]
+    assert cleaned_sessions == [session.session_id]
+    assert expired_session.resources_cleaned_at == "2026-01-01T00:00:00+00:00"
     assert cleaned == [(session.session_id, None)]
 
 

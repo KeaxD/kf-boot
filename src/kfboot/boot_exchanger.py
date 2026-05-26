@@ -9,6 +9,7 @@ from keri import help
 from keri.peer.exchanging import Exchanger
 
 from kfboot.basing import (
+    ACCOUNT_STATE_FAILED,
     ACCOUNT_STATE_ONBOARDED,
     ACCOUNT_STATE_PENDING_ONBOARDING,
     ACCOUNT_STATE_EXPIRED,
@@ -135,7 +136,22 @@ class SessionStartHandler(RouteHandler):
             )
 
         session = None
+        existing = None
+        newly_expired_session_ids: set[str] = set()
         session_for_account = self.exchanger.ctx.store.findSessionForAccount(account_aid)
+
+        # First check if the account exists, is not in a terminal state BUT is expired
+        # If so, mark it as expired to enter the cleanup process
+        # This prevents session who are due for expiry from 'reviving' 
+        if (
+            session_for_account is not None
+            and session_for_account.state not in TERMINAL_SESSION_STATES
+            and self.exchanger.sessionPastDue(session_for_account)
+        ):
+            self.exchanger.expirer.markSessionExpired(session_for_account)
+            newly_expired_session_ids.add(session_for_account.session_id)
+            session_for_account = None
+
         if session_for_account is not None and session_for_account.state not in TERMINAL_SESSION_STATES:
             if session_for_account.ephemeral_aid != sender:
                 logger.warning(
@@ -147,8 +163,61 @@ class SessionStartHandler(RouteHandler):
                     description="A different onboarding principal already owns the active session for this account AID.",
                 )
             session = session_for_account
-        elif (existing := self.exchanger.ctx.store.findActiveSessionForEphemeral(sender)) is not None:
+        # Session is bound by an ephemeral sender 
+        else:
+            # Retrieve the existing session for that ephemeral
+            existing = self.exchanger.ctx.store.findSessionForEphemeral(sender)
+            
+            # Check if it exists, is not in a terminal state, and is not expired
+            if (
+                existing is not None
+                and existing.state not in TERMINAL_SESSION_STATES
+                and self.exchanger.sessionPastDue(existing)
+            ):
+                # If so, mark it as expired for cleanup process
+                self.exchanger.expirer.markSessionExpired(existing)
+                newly_expired_session_ids.add(existing.session_id)
+                existing = None
+            
+            # Check if it was expired earlier
+            elif (
+                existing is not None
+                and existing.session_id in newly_expired_session_ids
+            ):
+                existing = None
+            elif (
+                existing is not None
+                and existing.state in {
+                    SESSION_STATE_EXPIRED,
+                    SESSION_STATE_FAILED,
+                    SESSION_STATE_CANCELLED,
+                }
+                and existing.resources_cleaned_at
+            ):
+                # Once a closed session has finished cleanup, it should no longer
+                # shadow fresh starts for the same ephemeral principal.
+                existing = None
+        if existing is not None:
             session = existing
+
+        if session is None:
+            # Check if there is an outstanding session for that sender waiting for cleanup
+            blocking = self.exchanger.findCleanupBlockingSession(
+                sender=sender,
+                account_aid=account_aid,
+            )
+            if blocking is not None:
+                logger.warning(
+                    f"Session start rejected because cleanup is still pending for closed session "
+                    f"{blocking.session_id} on account AID {account_aid}"
+                )
+                raise falcon.HTTPConflict(
+                    title="Session cleanup pending",
+                    description=(
+                        "The previous onboarding session is closed but its hosted resources are still "
+                        "being reclaimed. Retry after cleanup completes."
+                    ),
+                )
 
         if session is not None:
             session = self.exchanger.admitter.reconcileExistingStartSession(
@@ -198,7 +267,7 @@ class SessionStartHandler(RouteHandler):
             self.exchanger.expirer.failSession(session=session, reason=str(exc), teardown=True)
             raise
         self.exchanger.expirer.refreshSessionLease(session)
-        self.exchanger.replySession(self.resource, recipient=sender, session=session)
+        self.exchanger.replySession(self.resource, receiver=sender, session=session)
 
 
 class SessionStatusHandler(RouteHandler):
@@ -208,12 +277,13 @@ class SessionStatusHandler(RouteHandler):
         sender = serder.pre
         session = self.exchanger.requireSession(requiredStr(extractExnPayload(serder), "session_id"))
         self.exchanger.requireOnboardingPrincipal(sender=sender, session=session)
+        self.exchanger.requireOpenSession(session)
         self.exchanger.expirer.refreshSessionLease(session)
         logger.info(
             f"Session status requested for session {session.session_id}"
             f" from sender {sender}"
         )
-        self.exchanger.replySession(self.resource, recipient=sender, session=session)
+        self.exchanger.replySession(self.resource, receiver=sender, session=session)
 
 
 class AccountCreateHandler(RouteHandler):
@@ -279,7 +349,7 @@ class AccountCreateHandler(RouteHandler):
                 f"Account creation request reconciled with existing account"
                 f" for account {account_aid} in session {session.session_id}",
             )
-            self.exchanger.replyAccount(self.resource, recipient=sender, session=session)
+            self.exchanger.replyAccount(self.resource, receiver=sender, session=session)
             return
 
         try:
@@ -305,6 +375,10 @@ class AccountCreateHandler(RouteHandler):
                 account.witness_eids = list(session.witness_eids)
                 account.watcher_eid = session.watcher_eid
                 account.session_id = session.session_id
+                account.onboarded_at = ""
+                account.expired_at = ""
+                account.resources_cleaned_at = ""
+                account.expires_at = ""
 
             session.account_aid = account_aid
             session.state = SESSION_STATE_ACCOUNT_CREATED
@@ -328,7 +402,7 @@ class AccountCreateHandler(RouteHandler):
             )
             raise
 
-        self.exchanger.replyAccount(self.resource, recipient=sender, session=session)
+        self.exchanger.replyAccount(self.resource, receiver=sender, session=session)
 
 
 class CompleteHandler(RouteHandler):
@@ -365,10 +439,12 @@ class CompleteHandler(RouteHandler):
             )
 
         if session.state == SESSION_STATE_COMPLETED and account.status == ACCOUNT_STATE_ONBOARDED:
+            # Refresh the account lease on the account because it is active
+            self.exchanger.expirer.refreshAccountLease(account)
             logger.info(
                 f"Onboarding request reconciled with existing completed session and onboarded account {account_aid}"
             )
-            self.exchanger.replyAccount(self.resource, recipient=sender, session=session)
+            self.exchanger.replyAccount(self.resource, receiver=sender, session=session)
             return
 
         if session.watcher_required and not session.watcher_eid:
@@ -392,10 +468,12 @@ class CompleteHandler(RouteHandler):
         account.onboarded_at = nowIso()
         self.exchanger.ctx.store.saveSession(session)
         self.exchanger.ctx.store.saveAccount(account)
+        # Refresh the account lease to the onboarded time 
+        self.exchanger.expirer.refreshAccountLease(account, now=account.onboarded_at)
         logger.info(
             f"Onboarding completed for account AID {account_aid}"
         )
-        self.exchanger.replyAccount(self.resource, recipient=sender, session=session)
+        self.exchanger.replyAccount(self.resource, receiver=sender, session=session)
 
 
 class CancelHandler(RouteHandler):
@@ -434,6 +512,8 @@ class CancelHandler(RouteHandler):
 
             session.state = SESSION_STATE_CANCELLED
             session.updated_at = nowIso()
+            # Set cleaned flag
+            session.resources_cleaned_at = session.updated_at
             self.exchanger.ctx.store.saveSession(session)
             logger.info(
                 f"Session cancelled for session {session.session_id}"
@@ -441,12 +521,14 @@ class CancelHandler(RouteHandler):
 
             failed = accountFailed(account)
             if failed is not None:
+                failed.resources_cleaned_at = session.updated_at
+                failed.session_id = ""
                 self.exchanger.ctx.store.saveAccount(failed)
                 logger.info(
                     f"Account failed due to session cancellation for account AID {account.account_aid}"
                 )
 
-        self.exchanger.replySession(self.resource, recipient=sender, session=session)
+        self.exchanger.replySession(self.resource, receiver=sender, session=session)
 
 
 class AccountWitnessesHandler(RouteHandler):
@@ -456,15 +538,17 @@ class AccountWitnessesHandler(RouteHandler):
         sender = serder.pre
         payload = extractExnPayload(serder)
         self.exchanger.requireOnboardedAccount(sender, payload)
-        self.exchanger.limiter.enforceAccountQuotas(serder)
+        self.exchanger.limiter.precheckAccountQuotas(serder)
         return True
 
     def handleEvent(self, serder, **kwa):
         sender = serder.pre
-        self.exchanger.requireOnboardedAccount(sender, extractExnPayload(serder))
+        account = self.exchanger.requireOnboardedAccount(sender, extractExnPayload(serder))
         rows = resourcesToApi(
             self.exchanger.ctx.store.listResourcesForAccount(kind="witness", account_aid=sender)
         )
+        self.exchanger.expirer.refreshAccountLease(account)
+        self.exchanger.limiter.recordSuccessfulAccountQuotaUse(serder)
         logger.info(
             f"Query response for witnesses for account AID {sender}: {rows}"
         )
@@ -478,15 +562,17 @@ class AccountWatchersHandler(RouteHandler):
         sender = serder.pre
         payload = extractExnPayload(serder)
         self.exchanger.requireOnboardedAccount(sender, payload)
-        self.exchanger.limiter.enforceAccountQuotas(serder)
+        self.exchanger.limiter.precheckAccountQuotas(serder)
         return True
 
     def handleEvent(self, serder, **kwa):
         sender = serder.pre
-        self.exchanger.requireOnboardedAccount(sender, extractExnPayload(serder))
+        account = self.exchanger.requireOnboardedAccount(sender, extractExnPayload(serder))
         rows = resourcesToApi(
             self.exchanger.ctx.store.listResourcesForAccount(kind="watcher", account_aid=sender)
         )
+        self.exchanger.expirer.refreshAccountLease(account)
+        self.exchanger.limiter.recordSuccessfulAccountQuotaUse(serder)
         logger.info(
             f"Query response for watchers for account AID {sender}: {rows}"
         )
@@ -500,13 +586,13 @@ class AccountWatcherStatusHandler(RouteHandler):
         sender = serder.pre
         payload = extractExnPayload(serder)
         self.exchanger.requireOnboardedAccount(sender, payload)
-        self.exchanger.limiter.enforceAccountQuotas(serder)
+        self.exchanger.limiter.precheckAccountQuotas(serder)
         return True
 
     def handleEvent(self, serder, **kwa):
         sender = serder.pre
         payload = extractExnPayload(serder)
-        self.exchanger.requireOnboardedAccount(sender, payload)
+        account = self.exchanger.requireOnboardedAccount(sender, payload)
 
         watcher_id = optionalStr(payload, "watcher_eid") or requiredStr(payload, "watcher_id")
         logger.info(
@@ -538,6 +624,8 @@ class AccountWatcherStatusHandler(RouteHandler):
         watcher = resourcesToApi([record])[0]
         if isinstance(status, dict):
             watcher.update(status)
+        self.exchanger.expirer.refreshAccountLease(account)
+        self.exchanger.limiter.recordSuccessfulAccountQuotaUse(serder)
         self.exchanger.queueReply(
             self.resource,
             sender,
@@ -552,7 +640,7 @@ class AccountWitnessDeleteHandler(RouteHandler):
         sender = serder.pre
         payload = extractExnPayload(serder)
         self.exchanger.requireOnboardedAccount(sender, payload)
-        self.exchanger.limiter.enforceAccountQuotas(serder)
+        self.exchanger.limiter.precheckAccountQuotas(serder)
         return True
 
     def handleEvent(self, serder, **kwa):
@@ -582,6 +670,8 @@ class AccountWitnessDeleteHandler(RouteHandler):
             )
             raise bootErrorToHTTP(exc)
 
+        self.exchanger.expirer.refreshAccountLease(account)
+        self.exchanger.limiter.recordSuccessfulAccountQuotaUse(serder)
         self.exchanger.queueReply(
             self.resource,
             sender,
@@ -596,7 +686,7 @@ class AccountWatcherDeleteHandler(RouteHandler):
         sender = serder.pre
         payload = extractExnPayload(serder)
         self.exchanger.requireOnboardedAccount(sender, payload)
-        self.exchanger.limiter.enforceAccountQuotas(serder)
+        self.exchanger.limiter.precheckAccountQuotas(serder)
         return True
 
     def handleEvent(self, serder, **kwa):
@@ -626,6 +716,8 @@ class AccountWatcherDeleteHandler(RouteHandler):
             )
             raise bootErrorToHTTP(exc)
 
+        self.exchanger.expirer.refreshAccountLease(account)
+        self.exchanger.limiter.recordSuccessfulAccountQuotaUse(serder)
         self.exchanger.queueReply(
             self.resource,
             sender,
@@ -780,6 +872,31 @@ class BootExchanger(Exchanger):
         )
 
     def requireOpenSession(self, session: SessionRecord, *, allow_completed: bool = False) -> None:
+        """
+        Ensure the session is in an open, non-terminal lifecycle state.
+
+        Responsibilities:
+        - Reject sessions that have reached a terminal state
+        (FAILED, CANCELLED, EXPIRED, COMPLETED unless explicitly allowed).
+        - Reject sessions that are missing required lifecycle fields.
+        - Provide a consistent guardrail for all onboarding routes that require
+        an active session.
+
+        Lifecycle rules enforced:
+        - If session.state is in TERMINAL_SESSION_STATES = reject.
+        - If session.state == COMPLETED and allow_completed is False = reject.
+        - Otherwise, the session is considered open and usable.
+
+        Raises:
+        - falcon.HTTPConflict if the session is closed or completed when not allowed.
+        - falcon.HTTPUnauthorized if the session is missing or invalid.
+        """
+
+        # Check if a session is not in a terminal state but its expiration date is due, expire it now then rejects
+        if session.state not in TERMINAL_SESSION_STATES and self.sessionPastDue(session):
+            self.expirer.markSessionExpired(session)
+            logger.warning(f"Session {session.session_id} expired")
+            raise falcon.HTTPGone(title="Session expired")
         if session.state == SESSION_STATE_EXPIRED:
             logger.warning(f"Session {session.session_id} expired")
             raise falcon.HTTPGone(title="Session expired")
@@ -797,6 +914,35 @@ class BootExchanger(Exchanger):
             raise falcon.HTTPConflict(title="Session completed")
 
     def requireOnboardedAccount(self, sender: str, payload: dict[str, Any]) -> AccountRecord:
+        """
+        Ensure the authenticated sender corresponds to a valid, non‑expired,
+        fully onboarded account.
+
+        Responsibilities:
+        - Enforce that the authenticated sender is the principal for the
+        requested account (account_aid must match sender when provided).
+        - Retrieve the account record for the sender and validate that it exists.
+        - Reject accounts that are expired or past due, performing a dynamic
+        expiration transition when necessary.
+        - Reject accounts that have not completed onboarding.
+        - Provide a consistent guardrail for all routes that require an
+        onboarded account principal.
+
+        Lifecycle rules enforced:
+        - If account_aid is provided and does not match sender => reject (401).
+        - If no account exists for sender => reject (404).
+        - If account.status == EXPIRED => reject (409).
+        - If account is past due (TTL exceeded), mark it expired and reject (409).
+        - If account.status != ONBOARDED => reject (409).
+
+        Returns:
+        - The validated AccountRecord for the authenticated sender.
+
+        Raises:
+        - falcon.HTTPUnauthorized for principal mismatch.
+        - falcon.HTTPNotFound if the account does not exist.
+        - falcon.HTTPConflict for expired, past‑due, or non‑onboarded accounts.
+        """
         account_aid = optionalStr(payload, "account_aid")
         if account_aid and account_aid != sender:
             logger.warning(
@@ -823,6 +969,7 @@ class BootExchanger(Exchanger):
                 description="This account has expired and must be renewed or deleted before accessing account routes.",
             )
         if self.accountPastDue(account):
+            self.expirer.markAccountExpired(account)
             logger.warning(
                 f"Account {account.account_aid} is past due and cannot access account routes"
             )
@@ -838,6 +985,24 @@ class BootExchanger(Exchanger):
             )
         return account
 
+    def sessionPastDue(self, session: SessionRecord) -> bool:
+        """Check if a session's expiration is due"""
+
+        # Get expiration date, return if None
+        if not session.expires_at:
+            return False
+
+        try:
+            expires_at = datetime.fromisoformat(session.expires_at)
+        except ValueError:
+            logger.warning(
+                f"Session {session.session_id} has invalid expires_at format: {session.expires_at}",
+            )
+            # Fail closed so corrupted lifecycle metadata cannot keep a session open.
+            return True
+
+        return expires_at <= datetime.fromisoformat(nowIso())
+
     def requireDeletableAccount(self, sender: str, payload: dict[str, Any]) -> tuple[str, AccountRecord | None]:
         """Checks the identity of the sender and if the account is in a valid state for deletion"""
         account_aid = optionalStr(payload, "account_aid") 
@@ -851,9 +1016,12 @@ class BootExchanger(Exchanger):
             )
 
         account = self.ctx.store.getAccount(sender)
+
+        # Accounts that are onboarded, expired and failed are valid for deletion
         if account is not None and account.status not in {
             ACCOUNT_STATE_ONBOARDED,
             ACCOUNT_STATE_EXPIRED,
+            ACCOUNT_STATE_FAILED,
         }:
             logger.warning(
                 f"Account delete request rejected due to account {account_aid} being in invalid state: {account.status}"
@@ -864,6 +1032,40 @@ class BootExchanger(Exchanger):
             )
 
         return account_aid, account
+
+    def findCleanupBlockingSession(self, *, sender: str, account_aid: str) -> SessionRecord | None:
+        """Return a closed session that still owns cleanup debt for this start request.
+
+        We check the latest account-bound and ephemeral-bound sessions because those are
+        the records most likely to be revived by repeated start attempts. A closed session
+        without `resources_cleaned_at` still represents live hosted resources that should
+        be reclaimed before issuing a fresh allocation.
+        """
+        # Create a seen set
+        seen: set[str] = set()
+        
+        # Iterate through session for that account aid/ephemeral
+        for candidate in (
+            self.ctx.store.findSessionForAccount(account_aid),
+            self.ctx.store.findSessionForEphemeral(sender),
+        ):
+            if candidate is None or candidate.session_id in seen:
+                continue
+            seen.add(candidate.session_id)
+
+            # Check if it is in a terminal state
+            if candidate.state not in {
+                SESSION_STATE_EXPIRED,
+                SESSION_STATE_FAILED,
+                SESSION_STATE_CANCELLED,
+            }:
+                continue
+
+            # Check if it was cleaned
+            if candidate.resources_cleaned_at:
+                continue
+            return candidate
+        return None
 
     def accountPastDue(self, account: AccountRecord) -> bool:
         """Checks expiration of an account"""
@@ -877,22 +1079,23 @@ class BootExchanger(Exchanger):
             logger.warning(
                 f"Account {account.account_aid} has invalid expires_at format: {account.expires_at}",
             )
-            return False
+            # Fail closed so corrupted lifecycle metadata cannot keep an account active.
+            return True
 
         return expires_at <= datetime.fromisoformat(nowIso())
 
 
-    def replySession(self, route: str, *, recipient: str, session: SessionRecord) -> None:
+    def replySession(self, route: str, *, receiver: str, session: SessionRecord) -> None:
         payload = self.sessionPayload(session)
-        self.queueReply(route, recipient, payload)
+        self.queueReply(route, receiver, payload)
 
-    def replyAccount(self, route: str, *, recipient: str, session: SessionRecord) -> None:
+    def replyAccount(self, route: str, *, receiver: str, session: SessionRecord) -> None:
         payload = self.sessionPayload(session)
         if session.account_aid:
             account = self.ctx.store.getAccount(session.account_aid)
             if account is not None:
                 payload["account"] = self.ctx.store.accountPayload(account)
-        self.queueReply(route, recipient, payload)
+        self.queueReply(route, receiver, payload)
 
     def sessionPayload(self, session: SessionRecord) -> dict[str, Any]:
         witnesses = resourcesToApi(
@@ -919,12 +1122,12 @@ class BootExchanger(Exchanger):
             payload["account_aid"] = session.account_aid
         return payload
 
-    def queueReply(self, route: str, recipient: str, payload: dict[str, Any]) -> None:
+    def queueReply(self, route: str, receiver: str, payload: dict[str, Any]) -> None:
         stream = bytearray(self.host_hab.replay())
-        stream.extend(self.host_hab.exchange(route=route, payload=payload, recipient=recipient or None))
+        stream.extend(self.host_hab.exchange(route=route, payload=payload, receiver=receiver or None))
         self.reply_streams.append(bytes(stream))
         logger.debug(
-            f"Reply queued for route {route} to recipient {recipient}",
+            f"Reply queued for route {route} to receiver {receiver}",
         )
 
     def processEvent(self, serder, tsgs=None, cigars=None, ptds=None, essrs=None, **kwa):

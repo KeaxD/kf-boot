@@ -22,7 +22,7 @@ class BootError(RuntimeError):
 @dataclass(frozen=True)
 class BootClient:
     base_url: str
-    timeout: int = 10
+    timeout: float = 10.0
 
     def allocateWitness(self, account_aid: str) -> dict:
         """Allocate a hosted witness for the permanent account AID."""
