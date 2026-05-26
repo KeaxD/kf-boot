@@ -267,7 +267,7 @@ class SessionStartHandler(RouteHandler):
             self.exchanger.expirer.failSession(session=session, reason=str(exc), teardown=True)
             raise
         self.exchanger.expirer.refreshSessionLease(session)
-        self.exchanger.replySession(self.resource, recipient=sender, session=session)
+        self.exchanger.replySession(self.resource, receiver=sender, session=session)
 
 
 class SessionStatusHandler(RouteHandler):
@@ -283,7 +283,7 @@ class SessionStatusHandler(RouteHandler):
             f"Session status requested for session {session.session_id}"
             f" from sender {sender}"
         )
-        self.exchanger.replySession(self.resource, recipient=sender, session=session)
+        self.exchanger.replySession(self.resource, receiver=sender, session=session)
 
 
 class AccountCreateHandler(RouteHandler):
@@ -349,7 +349,7 @@ class AccountCreateHandler(RouteHandler):
                 f"Account creation request reconciled with existing account"
                 f" for account {account_aid} in session {session.session_id}",
             )
-            self.exchanger.replyAccount(self.resource, recipient=sender, session=session)
+            self.exchanger.replyAccount(self.resource, receiver=sender, session=session)
             return
 
         try:
@@ -402,7 +402,7 @@ class AccountCreateHandler(RouteHandler):
             )
             raise
 
-        self.exchanger.replyAccount(self.resource, recipient=sender, session=session)
+        self.exchanger.replyAccount(self.resource, receiver=sender, session=session)
 
 
 class CompleteHandler(RouteHandler):
@@ -444,7 +444,7 @@ class CompleteHandler(RouteHandler):
             logger.info(
                 f"Onboarding request reconciled with existing completed session and onboarded account {account_aid}"
             )
-            self.exchanger.replyAccount(self.resource, recipient=sender, session=session)
+            self.exchanger.replyAccount(self.resource, receiver=sender, session=session)
             return
 
         if session.watcher_required and not session.watcher_eid:
@@ -473,7 +473,7 @@ class CompleteHandler(RouteHandler):
         logger.info(
             f"Onboarding completed for account AID {account_aid}"
         )
-        self.exchanger.replyAccount(self.resource, recipient=sender, session=session)
+        self.exchanger.replyAccount(self.resource, receiver=sender, session=session)
 
 
 class CancelHandler(RouteHandler):
@@ -528,7 +528,7 @@ class CancelHandler(RouteHandler):
                     f"Account failed due to session cancellation for account AID {account.account_aid}"
                 )
 
-        self.exchanger.replySession(self.resource, recipient=sender, session=session)
+        self.exchanger.replySession(self.resource, receiver=sender, session=session)
 
 
 class AccountWitnessesHandler(RouteHandler):
@@ -1085,17 +1085,17 @@ class BootExchanger(Exchanger):
         return expires_at <= datetime.fromisoformat(nowIso())
 
 
-    def replySession(self, route: str, *, recipient: str, session: SessionRecord) -> None:
+    def replySession(self, route: str, *, receiver: str, session: SessionRecord) -> None:
         payload = self.sessionPayload(session)
-        self.queueReply(route, recipient, payload)
+        self.queueReply(route, receiver, payload)
 
-    def replyAccount(self, route: str, *, recipient: str, session: SessionRecord) -> None:
+    def replyAccount(self, route: str, *, receiver: str, session: SessionRecord) -> None:
         payload = self.sessionPayload(session)
         if session.account_aid:
             account = self.ctx.store.getAccount(session.account_aid)
             if account is not None:
                 payload["account"] = self.ctx.store.accountPayload(account)
-        self.queueReply(route, recipient, payload)
+        self.queueReply(route, receiver, payload)
 
     def sessionPayload(self, session: SessionRecord) -> dict[str, Any]:
         witnesses = resourcesToApi(
@@ -1122,12 +1122,12 @@ class BootExchanger(Exchanger):
             payload["account_aid"] = session.account_aid
         return payload
 
-    def queueReply(self, route: str, recipient: str, payload: dict[str, Any]) -> None:
+    def queueReply(self, route: str, receiver: str, payload: dict[str, Any]) -> None:
         stream = bytearray(self.host_hab.replay())
-        stream.extend(self.host_hab.exchange(route=route, payload=payload, recipient=recipient or None))
+        stream.extend(self.host_hab.exchange(route=route, payload=payload, receiver=receiver or None))
         self.reply_streams.append(bytes(stream))
         logger.debug(
-            f"Reply queued for route {route} to recipient {recipient}",
+            f"Reply queued for route {route} to receiver {receiver}",
         )
 
     def processEvent(self, serder, tsgs=None, cigars=None, ptds=None, essrs=None, **kwa):
