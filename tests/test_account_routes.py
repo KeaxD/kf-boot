@@ -849,7 +849,7 @@ def test_account_route_marks_past_due_account_expired_on_ingress(onboarded_bundl
 
     # Get record for that account and expire it
     record = contract.ctx.store.getAccount(account.pre)
-    record.expires_at = "2000-01-01T00:00:00+00:00"\
+    record.expires_at = "2000-01-01T00:00:00+00:00"
 
     # Save it to trigger expiration workflow
     contract.ctx.store.saveAccount(record)
