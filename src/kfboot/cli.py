@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import logging
 import sys
-from wsgiref.simple_server import make_server
 
+from hio.base import doing
 from keri import help
 
-from kfboot.app import create_app
+from kfboot.runtime import setup
 
 logger = help.ogler.getLogger(__name__)
 
@@ -65,15 +65,15 @@ def configure_logging(level: int = logging.INFO) -> None:
 
 def main() -> None:
     configure_logging()
-    app, ctx = create_app()
-    server = make_server(ctx.config.host, ctx.config.port, app)
+    _app, ctx, doers = setup()
     try:
         logger.info(
             f"Server starting on http://{ctx.config.host}:{ctx.config.port}\n"
             f"Onboarding surface: {ctx.config.onboarding_public_url}\n"
             f"Account surface: {ctx.config.account_public_url}"
         )
-        server.serve_forever()
+        doist = doing.Doist(name="kf-boot", real=True, tock=0.00125)
+        doist.do(doers=doers)
     finally:
         ctx.close()
         logger.info(
