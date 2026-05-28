@@ -30,6 +30,12 @@ class Provisioner:
     def __init__(self, ctx, exchanger):
         self.ctx = ctx
         self.exchanger = exchanger
+        self.cleanup_witness_boots: dict[str, Any] = {}
+        self.cleanup_watcher_boot: Any | None = None
+
+    def configureCleanupBootClients(self, *, witness_boots, watcher_boot) -> None:
+        self.cleanup_witness_boots = witness_boots
+        self.cleanup_watcher_boot = watcher_boot
 
     def provisionSessionResources(self, *, session: SessionRecord) -> None:
         if session.state in TERMINAL_SESSION_STATES:
@@ -225,20 +231,22 @@ class Provisioner:
                 return backend
         raise BootError(f"Witness backend '{backend_id}' is not configured.", status_code=503)
 
-    def _witnessClient(self, backend_id: str) -> Any:
-        client = self.ctx.witness_boots.get(backend_id)
+    def _witnessClient(self, backend_id: str, *, witness_boots=None) -> Any:
+        boots = self.ctx.witness_boots if witness_boots is None else witness_boots
+        client = boots.get(backend_id)
         if client is None:
             raise BootError(f"Witness backend '{backend_id}' is not configured.", status_code=503)
         return client
 
-    def _witnessClientForRecord(self, record) -> Any:
+    def _witnessClientForRecord(self, record, *, witness_boots=None) -> Any:
+        boots = self.ctx.witness_boots if witness_boots is None else witness_boots
         if record.backend_id:
-            return self._witnessClient(record.backend_id)
+            return self._witnessClient(record.backend_id, witness_boots=boots)
 
         if record.boot_url:
             for backend in self.ctx.config.witness_backends:
                 if backend.boot_url == record.boot_url:
-                    return self._witnessClient(backend.id)
+                    return self._witnessClient(backend.id, witness_boots=boots)
 
         public_url = (record.url or "").rstrip("/")
         if public_url:
@@ -246,7 +254,7 @@ class Provisioner:
                 backend for backend in self.ctx.config.witness_backends if backend.public_url == public_url
             ]
             if len(matches) == 1:
-                return self._witnessClient(matches[0].id)
+                return self._witnessClient(matches[0].id, witness_boots=boots)
 
         if record.public_host:
             matches = [
@@ -255,10 +263,10 @@ class Provisioner:
                 if parsePublicUrl(backend.public_url) == (record.public_host, record.public_port)
             ]
             if len(matches) == 1:
-                return self._witnessClient(matches[0].id)
+                return self._witnessClient(matches[0].id, witness_boots=boots)
 
-        if len(self.ctx.witness_boots) == 1:
-            return next(iter(self.ctx.witness_boots.values()))
+        if len(boots) == 1:
+            return next(iter(boots.values()))
 
         raise BootError(
             f"No witness backend matches stored routing data for witness '{record.eid}'.",
@@ -266,50 +274,35 @@ class Provisioner:
         )
 
     def teardownSessionResources(self, *, session: SessionRecord, account=None) -> None:
-        errors: list[BootError] = []
-        watcher_ids = self._collectSessionResourceIDs(kind="watcher", session=session, account=account)
-        witness_ids = self._collectSessionResourceIDs(kind="witness", session=session, account=account)
+        operations = self._sessionResourceDeleteOps(session=session, account=account)
         logger.info(
             f"Session resource teardown started for session {session.session_id}"
         )
 
-        for watcher_id in watcher_ids:
-            try:
-                self.deleteHostedResource(
-                    kind="watcher",
-                    eid=watcher_id,
-                    session=session,
-                    account=account,
-                    tolerate_missing_remote=True,
-                )
-            except BootError as exc:
-                errors.append(exc)
-                logger.warning(
-                    f"Failed to delete watcher {watcher_id} during teardown for session {session.session_id}"
-                )
+        self._deleteHostedResourceOps(
+            operations,
+            session=session,
+            account=account,
+            context=f"session {session.session_id} teardown",
+        )
+        logger.info(
+            f"Session resources teardown completed for session {session.session_id}"
+        )
 
-        for witness_id in witness_ids:
-            try:
-                self.deleteHostedResource(
-                    kind="witness",
-                    eid=witness_id,
-                    session=session,
-                    account=account,
-                    tolerate_missing_remote=True,
-                )
-            except BootError as exc:
-                errors.append(exc)
-                logger.warning(
-                    f"Failed to delete witness {witness_id} during teardown of session {session.session_id}"
-                )
+    def teardownSessionResourcesDo(self, *, session: SessionRecord, account=None, tymth, tock: float = 0.0):
+        operations = self._sessionResourceDeleteOps(session=session, account=account)
+        logger.info(
+            f"Session resource teardown started for session {session.session_id}"
+        )
 
-        if errors:
-            first = errors[0]
-            detail = "; ".join(str(error) for error in errors)
-            logger.warning(
-                f"Session resource teardown completed with errors ({len(errors)}) for session {session.session_id}: {detail}"
-            )
-            raise BootError(detail, status_code=first.status_code)
+        yield from self._deleteHostedResourceOpsDo(
+            operations,
+            session=session,
+            account=account,
+            context=f"session {session.session_id} teardown",
+            tymth=tymth,
+            tock=tock,
+        )
         logger.info(
             f"Session resources teardown completed for session {session.session_id}"
         )
@@ -319,15 +312,7 @@ class Provisioner:
         It gets triggered when an account is marked as 'expired'
         """
         sessions = self.ctx.store.listSessionsForAccount(account_aid)
-        errors: list[BootError] = []
-        watcher_ids = self._collectAccountResourceIDs(
-            kind="watcher",
-            account_aid=account_aid,
-            account=account,
-            sessions=sessions,
-        )
-        witness_ids = self._collectAccountResourceIDs(
-            kind="witness",
+        operations = self._accountResourceDeleteOps(
             account_aid=account_aid,
             account=account,
             sessions=sessions,
@@ -336,41 +321,11 @@ class Provisioner:
             f"Resources teardown started for account AID {account_aid}"
         )
 
-        for watcher_id in watcher_ids:
-            try:
-                self.deleteHostedResource(
-                    kind="watcher",
-                    eid=watcher_id,
-                    account=account,
-                    tolerate_missing_remote=True,
-                )
-            except BootError as exc:
-                errors.append(exc)
-                logger.warning(
-                    f"Teardown of watcher resource failed for watcher {watcher_id}: {exc}"
-                )
-
-        for witness_id in witness_ids:
-            try:
-                self.deleteHostedResource(
-                    kind="witness",
-                    eid=witness_id,
-                    account=account,
-                    tolerate_missing_remote=True,
-                )
-            except BootError as exc:
-                errors.append(exc)
-                logger.warning(
-                    f"Teardown of witness resource failed for witness {witness_id}: {exc}"
-                )
-
-        if errors:
-            first = errors[0]
-            detail = "; ".join(str(error) for error in errors)
-            logger.warning(
-                f"Account resources teardown completed with errors ({len(errors)}) for account AID {account_aid}: {detail}"
-            )
-            raise BootError(detail, status_code=first.status_code)
+        self._deleteHostedResourceOps(
+            operations,
+            account=account,
+            context=f"account {account_aid} resource teardown",
+        )
 
         # Clear account bindings
         if account is not None:
@@ -381,9 +336,99 @@ class Provisioner:
 
         logger.info(f"Resources teardown completed for account AID {account_aid}")
 
+    def teardownAccountResourcesDo(self, *, account_aid: str, account=None, tymth, tock: float = 0.0):
+        sessions = self.ctx.store.listSessionsForAccount(account_aid)
+        operations = self._accountResourceDeleteOps(
+            account_aid=account_aid,
+            account=account,
+            sessions=sessions,
+        )
+        logger.info(
+            f"Resources teardown started for account AID {account_aid}"
+        )
+
+        yield from self._deleteHostedResourceOpsDo(
+            operations,
+            account=account,
+            context=f"account {account_aid} resource teardown",
+            tymth=tymth,
+            tock=tock,
+        )
+
+        if account is not None:
+            account.watcher_eid = ""
+            account.witness_eids = []
+            account.session_id = ""
+            self.ctx.store.saveAccount(account)
+
+        logger.info(f"Resources teardown completed for account AID {account_aid}")
+
     def deleteAccount(self, *, account_aid: str, account=None) -> None:
         sessions = self.ctx.store.listSessionsForAccount(account_aid)
-        errors: list[BootError] = []
+        operations = self._accountResourceDeleteOps(
+            account_aid=account_aid,
+            account=account,
+            sessions=sessions,
+        )
+        logger.info(
+            f"Account deletion started for account AID {account_aid}"
+        )
+        self._deleteHostedResourceOps(
+            operations,
+            account=account,
+            context=f"account {account_aid} deletion",
+        )
+
+        self.ctx.store.deleteBindingsForPrincipal(account_aid)
+        self.ctx.store.deleteAccount(account_aid)
+        for session in sessions:
+            self.ctx.store.deleteSession(session.session_id)
+        logger.info(
+            f"Account deletion completed for account AID {account_aid}"
+            f" with {len(sessions)} sessions, {self._operationCount(operations, 'watcher')} watchers,"
+            f" and {self._operationCount(operations, 'witness')} witnesses deleted"
+        )
+
+    def deleteAccountDo(self, *, account_aid: str, account=None, tymth, tock: float = 0.0):
+        sessions = self.ctx.store.listSessionsForAccount(account_aid)
+        operations = self._accountResourceDeleteOps(
+            account_aid=account_aid,
+            account=account,
+            sessions=sessions,
+        )
+        logger.info(
+            f"Account deletion started for account AID {account_aid}"
+        )
+        yield from self._deleteHostedResourceOpsDo(
+            operations,
+            account=account,
+            context=f"account {account_aid} deletion",
+            tymth=tymth,
+            tock=tock,
+        )
+
+        self.ctx.store.deleteBindingsForPrincipal(account_aid)
+        self.ctx.store.deleteAccount(account_aid)
+        for session in sessions:
+            self.ctx.store.deleteSession(session.session_id)
+        logger.info(
+            f"Account deletion completed for account AID {account_aid}"
+            f" with {len(sessions)} sessions, {self._operationCount(operations, 'watcher')} watchers,"
+            f" and {self._operationCount(operations, 'witness')} witnesses deleted"
+        )
+
+    def _sessionResourceDeleteOps(self, *, session: SessionRecord, account=None) -> list[tuple[str, str]]:
+        watcher_ids = self._collectSessionResourceIDs(kind="watcher", session=session, account=account)
+        witness_ids = self._collectSessionResourceIDs(kind="witness", session=session, account=account)
+        return self._resourceDeleteOps(watcher_ids=watcher_ids, witness_ids=witness_ids)
+
+    def _accountResourceDeleteOps(
+        self,
+        *,
+        account_aid: str,
+        account=None,
+        sessions: list[SessionRecord],
+    ) -> list[tuple[str, str]]:
         watcher_ids = self._collectAccountResourceIDs(
             kind="watcher",
             account_aid=account_aid,
@@ -396,53 +441,78 @@ class Provisioner:
             account=account,
             sessions=sessions,
         )
-        logger.info(
-            f"Account deletion started for account AID {account_aid}"
-        )
-        for watcher_id in watcher_ids:
+        return self._resourceDeleteOps(watcher_ids=watcher_ids, witness_ids=witness_ids)
+
+    @staticmethod
+    def _resourceDeleteOps(*, watcher_ids: list[str], witness_ids: list[str]) -> list[tuple[str, str]]:
+        return [("watcher", eid) for eid in watcher_ids] + [
+            ("witness", eid) for eid in witness_ids
+        ]
+
+    @staticmethod
+    def _operationCount(operations: list[tuple[str, str]], kind: str) -> int:
+        return sum(1 for operation_kind, _eid in operations if operation_kind == kind)
+
+    def _deleteHostedResourceOps(
+        self,
+        operations: list[tuple[str, str]],
+        *,
+        session: SessionRecord | None = None,
+        account=None,
+        context: str,
+    ) -> None:
+        errors: list[BootError] = []
+        for kind, eid in operations:
             try:
                 self.deleteHostedResource(
-                    kind="watcher",
-                    eid=watcher_id,
+                    kind=kind,
+                    eid=eid,
+                    session=session,
                     account=account,
                     tolerate_missing_remote=True,
                 )
             except BootError as exc:
                 errors.append(exc)
-                logger.warning(
-                    f"Account deletion of watcher resource failed for watcher {watcher_id}: {exc}"
-                )
+                logger.warning(f"{context} failed to delete {kind} resource {eid}: {exc}")
 
-        for witness_id in witness_ids:
+        self._raiseResourceDeleteErrors(errors, context=context)
+
+    def _deleteHostedResourceOpsDo(
+        self,
+        operations: list[tuple[str, str]],
+        *,
+        session: SessionRecord | None = None,
+        account=None,
+        context: str,
+        tymth,
+        tock: float = 0.0,
+    ):
+        errors: list[BootError] = []
+        for kind, eid in operations:
             try:
-                self.deleteHostedResource(
-                    kind="witness",
-                    eid=witness_id,
+                yield from self.deleteHostedResourceDo(
+                    kind=kind,
+                    eid=eid,
+                    session=session,
                     account=account,
                     tolerate_missing_remote=True,
+                    tymth=tymth,
+                    tock=tock,
                 )
             except BootError as exc:
                 errors.append(exc)
-                logger.warning(
-                    f"Account deletion of witness resource failed for witness {witness_id}: {exc}"
-                )
+                logger.warning(f"{context} failed to delete {kind} resource {eid}: {exc}")
 
-        if errors:
-            first = errors[0]
-            detail = "; ".join(str(error) for error in errors)
-            logger.warning(
-                f"Account deletion completed with errors ({len(errors)}) for account AID {account_aid}: {detail}"
-            )
-            raise BootError(detail, status_code=first.status_code)
+        self._raiseResourceDeleteErrors(errors, context=context)
 
-        self.ctx.store.deleteBindingsForPrincipal(account_aid)
-        self.ctx.store.deleteAccount(account_aid)
-        for session in sessions:
-            self.ctx.store.deleteSession(session.session_id)
-        logger.info(
-            f"Account deletion completed for account AID {account_aid}"
-            f" with {len(sessions)} sessions, {len(watcher_ids)} watchers, and {len(witness_ids)} witnesses deleted"
-        )
+    @staticmethod
+    def _raiseResourceDeleteErrors(errors: list[BootError], *, context: str) -> None:
+        if not errors:
+            return
+        first = errors[0]
+        detail = "; ".join(str(error) for error in errors)
+        logger.warning(f"{context} completed with errors ({len(errors)}): {detail}")
+        raise BootError(detail, status_code=first.status_code)
 
     def _collectAccountResourceIDs(
         self,
@@ -541,16 +611,7 @@ class Provisioner:
             logger.info(
                 f"Resource record not found for deletion for {kind} with EID {eid}"
             )
-            if session is not None:
-                if kind == "witness":
-                    session.witness_eids = [item for item in session.witness_eids if item != eid]
-                elif session.watcher_eid == eid:
-                    session.watcher_eid = ""
-            if account is not None:
-                if kind == "witness":
-                    account.witness_eids = [item for item in account.witness_eids if item != eid]
-                elif account.watcher_eid == eid:
-                    account.watcher_eid = ""
+            self._removeResourceFromOwners(kind=kind, eid=eid, session=session, account=account)
             self._persistOwnerState(session=session, account=account)
             return
         if kind == "witness":
@@ -567,11 +628,85 @@ class Provisioner:
                 logger.warning(
                     f"Resource deletion failed for {kind} with EID {eid}: {exc}",
                 )
-                raise 
+                raise
             logger.info(
                 f"Resource not found during deletion for {kind} with EID {eid}, but tolerated: {exc}",
             )
+        self._deleteLocalHostedResource(kind=kind, eid=eid, session=session, account=account)
+        logger.info(
+            f"Resource deletion completed for {kind} with EID {eid}"
+        )
+
+    def deleteHostedResourceDo(
+        self,
+        *,
+        kind: str,
+        eid: str,
+        session: SessionRecord | None = None,
+        account=None,
+        tolerate_missing_remote: bool = False,
+        tymth,
+        tock: float = 0.0,
+    ):
+        if not eid:
+            return
+
+        record = self.ctx.store.getResource(kind, eid)
+        if record is None:
+            logger.info(
+                f"Resource record not found for deletion for {kind} with EID {eid}"
+            )
+            self._removeResourceFromOwners(kind=kind, eid=eid, session=session, account=account)
+            self._persistOwnerState(session=session, account=account)
+            return
+        if kind == "witness":
+            delete_remote = self._witnessClientForRecord(
+                record,
+                witness_boots=self.cleanup_witness_boots,
+            ).deleteWitnessDo
+        else:
+            if self.cleanup_watcher_boot is None:
+                raise BootError("Cleanup watcher boot client is not configured.", status_code=503)
+            delete_remote = self.cleanup_watcher_boot.deleteWatcherDo
+        logger.info(
+            f"Resource deletion started for {kind} with EID {eid}",
+        )
+        try:
+            yield from delete_remote(eid, tymth=tymth, tock=tock)
+        except BootError as exc:
+            if not (tolerate_missing_remote and exc.status_code == 404):
+                logger.warning(
+                    f"Resource deletion failed for {kind} with EID {eid}: {exc}",
+                )
+                raise
+            logger.info(
+                f"Resource not found during deletion for {kind} with EID {eid}, but tolerated: {exc}",
+            )
+        self._deleteLocalHostedResource(kind=kind, eid=eid, session=session, account=account)
+        logger.info(
+            f"Resource deletion completed for {kind} with EID {eid}"
+        )
+
+    def _deleteLocalHostedResource(
+        self,
+        *,
+        kind: str,
+        eid: str,
+        session: SessionRecord | None = None,
+        account=None,
+    ) -> None:
         self.ctx.store.deleteResource(kind, eid)
+        self._removeResourceFromOwners(kind=kind, eid=eid, session=session, account=account)
+        self._persistOwnerState(session=session, account=account)
+
+    def _removeResourceFromOwners(
+        self,
+        *,
+        kind: str,
+        eid: str,
+        session: SessionRecord | None = None,
+        account=None,
+    ) -> None:
         if session is not None:
             if kind == "witness":
                 session.witness_eids = [item for item in session.witness_eids if item != eid]
@@ -583,11 +718,6 @@ class Provisioner:
                 account.witness_eids = [item for item in account.witness_eids if item != eid]
             elif account.watcher_eid == eid:
                 account.watcher_eid = ""
-
-        self._persistOwnerState(session=session, account=account)
-        logger.info(
-            f"Resource deletion completed for {kind} with EID {eid}"
-        )
 
     def _persistOwnerState(self, *, session: SessionRecord | None = None, account=None) -> None:
         if session is not None:

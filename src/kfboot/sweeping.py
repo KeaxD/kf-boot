@@ -87,11 +87,12 @@ class CleanupState:
         }
 
 
-class CleanupDoer(doing.Doer):
+class CleanupDoer(doing.DoDoer):
     def __init__(
         self,
         *,
         expirer,
+        clienter=None,
         interval: float,
         batch_size: int,
         time_budget_seconds: float,
@@ -103,16 +104,22 @@ class CleanupDoer(doing.Doer):
         This doer is attached to the root service Doist. It reports progress to
         CleanupState so health can distinguish "alive" from "making progress."
         """
-        poll_tock = max(0.25, min(interval, 1.0))
-        super().__init__(tock=poll_tock)
+        run_tock = 0.05
         self.expirer = expirer
+        self.clienter = clienter
         self.interval = interval
         self.batch_size = batch_size
         self.time_budget_seconds = time_budget_seconds
         self.state = state
-        self._next_run_at = 0.0
 
-    def enter(self, *, temp=None):
+        doers = []
+        if self.clienter is not None:
+            doers.append(self.clienter)
+        doers.append(doing.doify(self.cleanupDo, tock=run_tock))
+        super().__init__(doers=doers, tock=run_tock)
+
+    def cleanupDo(self, tymth, tock=0.0, **kwa):
+        """Run periodic cleanup while yielding to the shared HIO scheduler."""
         if not self.state.expected_running:
             return
 
@@ -125,41 +132,46 @@ class CleanupDoer(doing.Doer):
             f"(interval={self.interval}s, batch_size={self.batch_size}, time_budget={self.time_budget_seconds}s)"
         )
 
-    def recur(self, tyme):
-        """Run one scheduled cleanup attempt for the local cleanup doer."""
-
-        if not self.state.expected_running:
-            return True
-
-        if tyme < self._next_run_at:
-            return False
-
-        self.state.noteSweepStarted(_nowIso())
+        next_run_at = 0.0
         try:
-            results = self.expirer.sweep(
-                batch_size=self.batch_size,
-                time_budget_seconds=self.time_budget_seconds,
+            yield tock
+            while self.state.expected_running:
+                tyme = tymth()
+                if tyme < next_run_at:
+                    yield tock
+                    continue
+
+                self.state.noteSweepStarted(_nowIso())
+                try:
+                    results = yield from self.expirer.sweepDo(
+                        batch_size=self.batch_size,
+                        time_budget_seconds=self.time_budget_seconds,
+                        tymth=tymth,
+                        tock=tock,
+                    )
+                except Exception as exc:
+                    self.state.noteSweepFailed(_nowIso(), str(exc))
+                    logger.exception("Periodic cleanup sweep failed unexpectedly")
+                else:
+                    self.state.noteSweepFinished(_nowIso(), results)
+                    self._logSweepResults(results)
+
+                next_run_at = tyme + self.interval
+                yield tock
+        finally:
+            if self.state.is_running:
+                self.state.noteStopped()
+                logger.info("Periodic cleanup sweeper stopped")
+
+    @staticmethod
+    def _logSweepResults(results: dict[str, int]) -> None:
+        if any(results.values()):
+            logger.info(
+                "Periodic cleanup sweep completed: "
+                f"sessions_expired={results['sessions_expired']}, "
+                f"sessions_cleaned={results['sessions_cleaned']}, "
+                f"sessions_deleted={results['sessions_deleted']}, "
+                f"accounts_expired={results['accounts_expired']}, "
+                f"accounts_cleaned={results['accounts_cleaned']}, "
+                f"accounts_deleted={results['accounts_deleted']}"
             )
-        except Exception as exc:
-            self.state.noteSweepFailed(_nowIso(), str(exc))
-            logger.exception("Periodic cleanup sweep failed unexpectedly")
-        else:
-            self.state.noteSweepFinished(_nowIso(), results)
-            if any(results.values()):
-                logger.info(
-                    "Periodic cleanup sweep completed: "
-                    f"sessions_expired={results['sessions_expired']}, "
-                    f"sessions_cleaned={results['sessions_cleaned']}, "
-                    f"sessions_deleted={results['sessions_deleted']}, "
-                    f"accounts_expired={results['accounts_expired']}, "
-                    f"accounts_cleaned={results['accounts_cleaned']}, "
-                    f"accounts_deleted={results['accounts_deleted']}"
-                )
-
-        self._next_run_at = tyme + self.interval
-        return False
-
-    def exit(self):
-        if self.state.is_running:
-            self.state.noteStopped()
-            logger.info("Periodic cleanup sweeper stopped")

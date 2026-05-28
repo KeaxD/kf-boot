@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections import deque
+
 import pytest
 
 import kfboot.boot_client as boot_client_module
-from kfboot.boot_client import BootClient, BootError
+from kfboot.boot_client import BootClient, BootError, HioBootClient
 from kfboot.utils import bootErrorToHTTP
 
 
@@ -48,6 +50,44 @@ class RecordingRequests:
         if self.error is not None:
             raise self.error
         return self.responses.pop(0)
+
+
+class FakeHioClient:
+    def __init__(self, responses=None):
+        self.responses = deque(responses or [])
+
+    def respond(self):
+        if self.responses:
+            return self.responses.popleft()
+        return None
+
+
+class RecordingHioClienter:
+    def __init__(self, clients=None, *, error: Exception | None = None):
+        self.clients = list(clients or [])
+        self.error = error
+        self.calls: list[dict[str, object]] = []
+        self.removed: list[FakeHioClient] = []
+
+    def request(self, method, url):
+        self.calls.append({"method": method, "url": url})
+        if self.error is not None:
+            raise self.error
+        return self.clients.pop(0)
+
+    def remove(self, client):
+        self.removed.append(client)
+
+
+def drain(gen, *, tick=None, max_steps: int = 20):
+    for _ in range(max_steps):
+        try:
+            next(gen)
+        except StopIteration as ex:
+            return ex.value
+        if tick is not None:
+            tick()
+    raise AssertionError("generator did not finish")
 
 
 def test_allocate_methods_send_expected_requests(monkeypatch):
@@ -234,3 +274,88 @@ def test_missing_requests_dependency_raisesbootError(monkeypatch):
 
     assert str(excinfo.value) == "requests is required to call the downstream boot API"
     assert excinfo.value.status_code is None
+
+
+def test_hio_delete_waits_for_response_and_removes_client():
+    hio_client = FakeHioClient()
+    clienter = RecordingHioClienter([hio_client])
+    clock = {"tyme": 0.0}
+    client = HioBootClient("http://boot.local", clienter=clienter, timeout=1.0)
+
+    gen = client.deleteWitnessDo("W1", tymth=lambda: clock["tyme"], tock=0.0)
+
+    assert next(gen) == 0.0
+    assert clienter.calls == [{"method": "DELETE", "url": "http://boot.local/witnesses/W1"}]
+    assert clienter.removed == []
+
+    hio_client.responses.append({"status": 204, "body": b""})
+
+    with pytest.raises(StopIteration) as done:
+        next(gen)
+
+    assert done.value.value is None
+    assert clienter.removed == [hio_client]
+
+
+def test_hio_delete_error_preserves_status_and_removes_client():
+    hio_client = FakeHioClient([{"status": 503, "body": b"downstream unavailable"}])
+    clienter = RecordingHioClienter([hio_client])
+    client = HioBootClient("http://boot.local", clienter=clienter)
+
+    with pytest.raises(BootError) as excinfo:
+        drain(client.deleteWatcherDo("WA1", tymth=lambda: 0.0, tock=0.0))
+
+    assert str(excinfo.value) == "downstream unavailable"
+    assert excinfo.value.status_code == 503
+    assert clienter.removed == [hio_client]
+
+
+def test_hio_request_exception_raises_boot_error():
+    clienter = RecordingHioClienter(error=RuntimeError("boom"))
+    client = HioBootClient("http://boot.local", clienter=clienter)
+
+    with pytest.raises(BootError) as excinfo:
+        drain(client.deleteWatcherDo("WA1", tymth=lambda: 0.0, tock=0.0))
+
+    assert str(excinfo.value) == "Boot API request failed: boom"
+    assert excinfo.value.status_code is None
+    assert clienter.calls == [{"method": "DELETE", "url": "http://boot.local/watchers/WA1"}]
+    assert clienter.removed == []
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        ({"body": b"missing status"}, "Boot API response missing status"),
+        ({"status": "wat", "body": b"invalid status"}, "Boot API response has invalid status: 'wat'"),
+        ({"status": 0, "body": b"zero status"}, "Boot API response has invalid status: 0"),
+    ],
+)
+def test_hio_delete_malformed_status_raises_boot_error_and_removes_client(response, message):
+    hio_client = FakeHioClient([response])
+    clienter = RecordingHioClienter([hio_client])
+    client = HioBootClient("http://boot.local", clienter=clienter)
+
+    with pytest.raises(BootError) as excinfo:
+        drain(client.deleteWatcherDo("WA1", tymth=lambda: 0.0, tock=0.0))
+
+    assert str(excinfo.value) == message
+    assert excinfo.value.status_code is None
+    assert clienter.removed == [hio_client]
+
+
+def test_hio_delete_timeout_removes_client():
+    hio_client = FakeHioClient()
+    clienter = RecordingHioClienter([hio_client])
+    clock = {"tyme": 0.0}
+    client = HioBootClient("http://boot.local", clienter=clienter, timeout=0.2)
+
+    with pytest.raises(BootError) as excinfo:
+        drain(
+            client.deleteWitnessDo("W1", tymth=lambda: clock["tyme"], tock=0.0),
+            tick=lambda: clock.__setitem__("tyme", clock["tyme"] + 0.1),
+        )
+
+    assert str(excinfo.value) == "Boot API request timed out"
+    assert excinfo.value.status_code is None
+    assert clienter.removed == [hio_client]
