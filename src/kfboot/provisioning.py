@@ -279,6 +279,7 @@ class Provisioner:
             f"Session resource teardown started for session {session.session_id}"
         )
 
+        # Delete each hosted resource, preserving per-resource logging and aggregate retry behavior.
         self._deleteHostedResourceOps(
             operations,
             session=session,
@@ -295,6 +296,7 @@ class Provisioner:
             f"Session resource teardown started for session {session.session_id}"
         )
 
+        # Delete each hosted resource cooperatively while keeping the sync error semantics.
         yield from self._deleteHostedResourceOpsDo(
             operations,
             session=session,
@@ -321,6 +323,7 @@ class Provisioner:
             f"Resources teardown started for account AID {account_aid}"
         )
 
+        # Delete account resources while collecting every BootError before retrying.
         self._deleteHostedResourceOps(
             operations,
             account=account,
@@ -347,6 +350,7 @@ class Provisioner:
             f"Resources teardown started for account AID {account_aid}"
         )
 
+        # Delete account resources cooperatively while collecting every BootError before retrying.
         yield from self._deleteHostedResourceOpsDo(
             operations,
             account=account,
@@ -355,6 +359,7 @@ class Provisioner:
             tock=tock,
         )
 
+        # Clear account bindings
         if account is not None:
             account.watcher_eid = ""
             account.witness_eids = []
@@ -373,6 +378,7 @@ class Provisioner:
         logger.info(
             f"Account deletion started for account AID {account_aid}"
         )
+        # Delete hosted resources before removing local account/session rows.
         self._deleteHostedResourceOps(
             operations,
             account=account,
@@ -399,6 +405,7 @@ class Provisioner:
         logger.info(
             f"Account deletion started for account AID {account_aid}"
         )
+        # Delete hosted resources cooperatively before removing local account/session rows.
         yield from self._deleteHostedResourceOpsDo(
             operations,
             account=account,
@@ -461,6 +468,7 @@ class Provisioner:
         account=None,
         context: str,
     ) -> None:
+        # Shared by sync and HIO cleanup paths so both keep the same error contract.
         errors: list[BootError] = []
         for kind, eid in operations:
             try:
@@ -487,6 +495,7 @@ class Provisioner:
         tymth,
         tock: float = 0.0,
     ):
+        # Shared by sync and HIO cleanup paths so both keep the same error contract.
         errors: list[BootError] = []
         for kind, eid in operations:
             try:

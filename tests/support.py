@@ -310,7 +310,7 @@ def build_signed_serder(hab, serder: SerderKERI, *, end: bytes | bytearray = b""
 
 
 def build_exn(hab, *, route: str, payload: dict[str, Any]) -> bytes:
-    serder, end = exchanging.exchange(route=route, payload=payload, sender=hab.pre)
+    serder, end = exchanging.exchange(route=route, attributes=payload, sender=hab.pre)
     return build_signed_serder(hab, serder, end=end)
 
 

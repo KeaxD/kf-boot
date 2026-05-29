@@ -77,6 +77,7 @@ class Expirer:
     ACCOUNT_EXPIRE_TASK = CLEANUP_TASK_ACCOUNT_EXPIRE
     ACCOUNT_CLEANUP_TASK = CLEANUP_TASK_ACCOUNT_CLEANUP
     ACCOUNT_DELETE_TASK = CLEANUP_TASK_ACCOUNT_DELETE
+
     def __init__(self, ctx, provisioner):
         """
         Initialize the Expirer, the coordinator responsible for all session and
@@ -106,12 +107,17 @@ class Expirer:
     ):
         """Process due cleanup tasks cooperatively under the HIO runtime."""
 
+        # Get batch size limit if provided, if None fallback to config
         limit = batch_size if batch_size is not None else self.ctx.config.cleanup_batch_size
+
+        # Get budget limit if provided, if None fallback to config
         budget = (
             time_budget_seconds
             if time_budget_seconds is not None
             else self.ctx.config.cleanup_time_budget_seconds
         )
+
+        # Create result object for logging work done
         results = {
             "sessions_expired": 0,
             "sessions_cleaned": 0,
@@ -120,21 +126,32 @@ class Expirer:
             "accounts_cleaned": 0,
             "accounts_deleted": 0,
         }
+
+        # Return if limit or budget is 0
         if limit <= 0 or budget <= 0:
             return results
 
+        # Set up timing and task counter
         started_at = time.monotonic()
         claimed = 0
         while claimed < limit:
+            # Stop after this cooperative pass spends its configured time budget.
             if time.monotonic() - started_at >= budget:
                 break
 
+            # Get current time to set task start time
             current = now or nowIso()
+
+            # Claim a due task
             task = self._claimDueTask(now=current)
             if task is None:
+                # If no due tasks are found, break
                 break
 
+            # Increment task claimed number
             claimed += 1
+
+            # Process task cooperatively
             category, _value = yield from self._processClaimedTaskDo(
                 task,
                 now=current,
@@ -142,7 +159,10 @@ class Expirer:
                 tock=tock,
             )
             if category is not None:
+                # Increment the work done based on the category
                 results[category] += 1
+
+            # Yield to the root HIO scheduler between claimed tasks.
             yield tock
 
         return results
@@ -283,7 +303,12 @@ class Expirer:
         tymth,
         tock: float = 0.0,
     ):
-        """Dispatch a claimed task to the HIO-cooperative cleanup handler."""
+        """
+        Process a single claimed cleanup task cooperatively.
+
+        - Session tasks: mark expired, clean resources, delete after retention.
+        - Account tasks: mark expired, clean resources, delete after retention.
+        """
         if task.kind == self.SESSION_EXPIRE_TASK:
             return self._processSessionExpire(task, now=now)
         if task.kind == self.SESSION_CLEANUP_TASK:
@@ -297,6 +322,7 @@ class Expirer:
         if task.kind == self.ACCOUNT_DELETE_TASK:
             return (yield from self._processAccountDeleteDo(task, now=now, tymth=tymth, tock=tock))
 
+        # Unknown tasks are invalid, mark as complete for removal.
         logger.warning(f"Unknown cleanup task kind '{task.kind}' for subject {task.subject}")
         self._completeTask(task.kind, task.subject)
         return None, None
@@ -368,11 +394,15 @@ class Expirer:
     ):
         """Tear down hosted resources for one expired session cooperatively."""
 
+        # Retrieve session
         session = self.ctx.store.getSession(task.subject)
+
+        # If session is None, task is invalid, mark as complete for removal
         if session is None:
             self._completeTask(task.kind, task.subject)
             return None, None
 
+        # If session is not expired, failed or cancelled session cleanup task is invalid
         if session.state not in {
             SESSION_STATE_EXPIRED,
             SESSION_STATE_FAILED,
@@ -381,14 +411,17 @@ class Expirer:
             self._completeTask(task.kind, task.subject)
             return None, None
 
+        # If session resources have already been cleaned, re-sync to the delete phase
         if session.resources_cleaned_at:
             self.ctx.store.saveSession(session)
             self._completeTask(task.kind, task.subject)
             return None, None
 
+        # Retrieve the account for that session
         account = self.ctx.store.getAccount(session.account_aid) if session.account_aid else None
 
         try:
+            # Teardown session resources cooperatively
             yield from self.provisioner.teardownSessionResourcesDo(
                 session=session,
                 account=account,
@@ -396,9 +429,12 @@ class Expirer:
                 tock=tock,
             )
         except BootError as exc:
+            # If error, log and save it
             session.failure_reason = f"Cleanup failed after expiry: {exc}"
             session.updated_at = now
             self.ctx.store.saveSession(session)
+
+            # Reschedule session cleanup
             retryTime = self._nextRetryAt(task, now=now)
             self._rescheduleTask(
                 task.kind,
@@ -415,6 +451,7 @@ class Expirer:
             # as successfully cleaned in sweep results.
             return None, None
 
+        # Update session record with the resources cleaned up time
         session.resources_cleaned_at = now
         session.updated_at = now
         self.ctx.store.saveSession(session)
@@ -427,12 +464,15 @@ class Expirer:
             failed = accountFailed(account)
 
         if failed is not None:
+            # If account exists in failed state, mark as resources cleaned
             failed.resources_cleaned_at = now
             failed.session_id = ""
             self.ctx.store.saveAccount(failed)
             logger.info(
                 f"Account failed due to session expiry for account {account.account_aid}",
             )
+
+        # Mark task as complete for removal
         self._completeTask(task.kind, task.subject)
         logger.info(
             f"Session resources cleaned after expiry for session {session.session_id}",
@@ -561,6 +601,7 @@ class Expirer:
             return None, None
 
         try:
+            # Teardown Account resources cooperatively
             yield from self.provisioner.teardownAccountResourcesDo(
                 account_aid=account.account_aid,
                 account=account,
@@ -645,6 +686,7 @@ class Expirer:
             return None, None
 
         try:
+            # Delete account cooperatively
             yield from self.provisioner.deleteAccountDo(
                 account_aid=account.account_aid,
                 account=account,
