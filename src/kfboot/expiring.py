@@ -5,7 +5,6 @@ from __future__ import annotations
 import random
 import time
 from datetime import datetime, timedelta
-from threading import Event, RLock
 
 from keri import help
 
@@ -41,8 +40,8 @@ class Expirer:
     Purpose:
     - Act as the lifecycle controller for sessions and accounts whose TTLs,
       cleanup requirements, or retention windows have elapsed.
-    - Provide a single, serialized execution path for all expiration‑related
-      state transitions, ensuring correctness even under concurrency.
+    - Provide one durable-queue execution path for all expiration-related
+      state transitions.
     - Drive the durable cleanup‑task queue by claiming, processing, rescheduling,
       and completing tasks in due‑time order.
 
@@ -65,9 +64,9 @@ class Expirer:
     - `account_delete` => delete closed, cleaned account => complete.
 
     High‑level workflow:
-    - sweep(): drain due tasks until batch/time budget is exhausted.
+    - sweepDo(): drain due tasks until batch/time budget is exhausted.
     - _claimDueTask(): mark one due task in progress.
-    - _processClaimedTask(): dispatch to the appropriate handler.
+    - _processClaimedTaskDo(): dispatch to the appropriate handler.
     - _process*(): perform state transitions, teardown, or deletion.
     - _rescheduleTask(): defer failed tasks with exponential backoff.
     - _completeTask(): remove finished tasks from the durable queue.
@@ -79,6 +78,7 @@ class Expirer:
     ACCOUNT_EXPIRE_TASK = CLEANUP_TASK_ACCOUNT_EXPIRE
     ACCOUNT_CLEANUP_TASK = CLEANUP_TASK_ACCOUNT_CLEANUP
     ACCOUNT_DELETE_TASK = CLEANUP_TASK_ACCOUNT_DELETE
+
     def __init__(self, ctx, provisioner):
         """
         Initialize the Expirer, the coordinator responsible for all session and
@@ -87,36 +87,30 @@ class Expirer:
         Responsibilities:
         - Store references to the application context and the Provisioner used
         for tearing down hosted resources.
-        - Initialize an internal re‑entrant lock (RLock) to serialize all state
-        transitions, DB writes, and cleanup‑task scheduling performed by this
-        Expirer instance. This prevents concurrent workers or threads from
-        racing during expiration or cleanup operations.
 
         Attributes:
         - ctx: The BootContext providing configuration, store access, and
         environment dependencies.
         - provisioner: The Provisioner responsible for resource teardown during
         session/account cleanup.
-        - _lock: A re‑entrant lock (RLock) to ensures thread‑safety and prevents concurrent
-        mutation of session/account lifecycle state.
         """
         self.ctx = ctx
         self.provisioner = provisioner
-        self._lock = RLock()
 
-    def sweep(
+    def sweepDo(
         self,
         *,
         batch_size: int | None = None,
         time_budget_seconds: float | None = None,
         now: str | None = None,
-        stop: Event | None = None,
-    ) -> dict[str, int]:
-        """Process due cleanup tasks until count or time budgets are spent."""
-        
+        tymth,
+        tock: float = 0.0,
+    ):
+        """Process due cleanup tasks cooperatively under the HIO runtime."""
+
         # Get batch size limit if provided, if None fallback to config
         limit = batch_size if batch_size is not None else self.ctx.config.cleanup_batch_size
-        
+
         # Get budget limit if provided, if None fallback to config
         budget = (
             time_budget_seconds
@@ -141,30 +135,36 @@ class Expirer:
         # Set up timing and task counter
         started_at = time.monotonic()
         claimed = 0
-
         while claimed < limit:
-            if stop is not None and stop.is_set():
-                break
+            # Stop after this cooperative pass spends its configured time budget.
             if time.monotonic() - started_at >= budget:
                 break
 
             # Get current time to set task start time
             current = now or nowIso()
 
-            # Claim a due task 
+            # Claim a due task
             task = self._claimDueTask(now=current)
             if task is None:
                 # If no due tasks are found, break
                 break
-            
+
             # Increment task claimed number
             claimed += 1
 
-            # Process task
-            category, _value = self._processClaimedTask(task, now=current)
+            # Process task cooperatively
+            category, _value = yield from self._processClaimedTaskDo(
+                task,
+                now=current,
+                tymth=tymth,
+                tock=tock,
+            )
             if category is not None:
                 # Increment the work done based on the category
                 results[category] += 1
+
+            # Yield to the root HIO scheduler between claimed tasks.
+            yield tock
 
         return results
 
@@ -174,18 +174,16 @@ class Expirer:
         # Determine the timestamp to use for the expiration event if provided else use current time
         current = now or nowIso()
 
-        # Serialize the state transition
-        with self._lock:
-            # Set the session as expired 
-            session.state = SESSION_STATE_EXPIRED
-            session.updated_at = current
+        # Set the session as expired
+        session.state = SESSION_STATE_EXPIRED
+        session.updated_at = current
 
-            # Set expiration date if none
-            if not session.expired_at:
-                session.expired_at = current
-            
-            # Save the record to DB
-            self.ctx.store.saveSession(session)
+        # Set expiration date if none
+        if not session.expired_at:
+            session.expired_at = current
+
+        # Save the record to DB
+        self.ctx.store.saveSession(session)
 
         # Return the updated session
         return session
@@ -196,106 +194,18 @@ class Expirer:
         # Use time provided if not use current time
         current = now or nowIso()
 
-        # Serialize the state transition with the lock
-        with self._lock:
+        # Set the account as expired
+        account.status = ACCOUNT_STATE_EXPIRED
 
-            # Set the account as expired
-            account.status = ACCOUNT_STATE_EXPIRED
+        # Update the account expired_at to current if none
+        if not account.expired_at:
+            account.expired_at = current
 
-            # Update the account expired_at to current if none
-            if not account.expired_at:
-                account.expired_at = current
-
-            # Save account to DB
-            self.ctx.store.saveAccount(account)
+        # Save account to DB
+        self.ctx.store.saveAccount(account)
 
         # Return updated account
         return account
-
-    def expireSessions(
-        self,
-        *,
-        limit: int | None = None,
-        now: str | None = None,
-    ) -> list[SessionRecord]:
-        """Return expired sessions from `session_expire` tasks"""
-        return [
-            # Iterate through session expire task and return the record of that session
-            record for record in self._drainTaskType(
-                self.SESSION_EXPIRE_TASK,
-                limit=limit,
-                now=now,
-            )
-            if isinstance(record, SessionRecord)
-        ]
-
-    def cleanupExpiredSessions(
-        self,
-        *,
-        limit: int | None = None,
-        now: str | None = None,
-    ) -> list[str]:
-        """Return session ids from `session_cleanup` tasks"""
-        return [
-            session_id
-            for session_id in self._drainTaskType(
-                self.SESSION_CLEANUP_TASK,
-                limit=limit,
-                now=now,
-            )
-            if isinstance(session_id, str)
-        ]
-
-    def expireAccounts(
-        self,
-        *,
-        limit: int | None = None,
-        now: str | None = None,
-    ) -> list[str]:
-        """Return account ids from `account_expire` tasks"""
-        return [
-            account_aid
-            for account_aid in self._drainTaskType(
-                self.ACCOUNT_EXPIRE_TASK,
-                limit=limit,
-                now=now,
-            )
-            if isinstance(account_aid, str)
-        ]
-
-    def cleanupExpiredAccounts(
-        self,
-        *,
-        limit: int | None = None,
-        now: str | None = None,
-    ) -> list[str]:
-        """Return account ids from `account_cleanup` tasks"""
-        return [
-            account_aid
-            for account_aid in self._drainTaskType(
-                self.ACCOUNT_CLEANUP_TASK,
-                limit=limit,
-                now=now,
-            )
-            if isinstance(account_aid, str)
-        ]
-
-    def deleteExpiredAccounts(
-        self,
-        *,
-        limit: int | None = None,
-        now: str | None = None,
-    ) -> list[str]:
-        """Return account ids from `account_delete` tasks"""
-        return [
-            account_aid
-            for account_aid in self._drainTaskType(
-                self.ACCOUNT_DELETE_TASK,
-                limit=limit,
-                now=now,
-            )
-            if isinstance(account_aid, str)
-        ]
 
     def failSession(
         self,
@@ -367,35 +277,12 @@ class Expirer:
         that still carries claim metadata at startup is assumed to be orphaned by
         a prior crash or unclean shutdown and is made immediately visible again.
         """
-        with self._lock:
-            recovered = self.ctx.store.requeueClaimedCleanupTasks(now=now or nowIso())
+        recovered = self.ctx.store.requeueClaimedCleanupTasks(now=now or nowIso())
         if recovered:
             logger.info(
                 f"Recovered {recovered} claimed cleanup task(s) during runner startup"
             )
         return recovered
-
-    def _drainTaskType(
-        self,
-        task_kind: str,
-        *,
-        limit: int | None = None,
-        now: str | None = None,
-    ) -> list[object]:
-        """Drain one cleanup task kind serially and collect non-empty results"""
-        rows: list[object] = []
-
-        while limit is None or len(rows) < limit:
-            current = now or nowIso()
-            task = self._claimDueTask(now=current, kind=task_kind)
-            if task is None:
-                break
-
-            _category, value = self._processClaimedTask(task, now=current)
-            if value is not None:
-                rows.append(value)
-
-        return rows
 
     def _claimDueTask(
         self,
@@ -404,42 +291,59 @@ class Expirer:
         kind: str | None = None,
     ) -> CleanupTaskRecord | None:
         """Mark one due task as in progress in the durable queue."""
-        with self._lock:
-            return self.ctx.store.claimDueCleanupTask(
-                now=now,
-                kind=kind,
-            )
+        return self.ctx.store.claimDueCleanupTask(
+            now=now,
+            kind=kind,
+        )
 
-    def _processClaimedTask(
+    def _processClaimedTaskDo(
         self,
         task: CleanupTaskRecord,
         *,
         now: str,
-    ) -> tuple[str | None, object | None]:
-        """Dispatch a claimed task to its task-specific handler
-        - Session tasks:
-            - Expire a session
-            - Clean up a session
-            - Delete a session
-        
-        - Account tasks:
-            - Expire a session
-            - Clean up a session
-            - Delete a session
+        tymth,
+        tock: float = 0.0,
+    ):
+        """
+        Process a single claimed cleanup task cooperatively.
+
+        - Session tasks: mark expired, clean resources, delete after retention.
+        - Account tasks: mark expired, clean resources, delete after retention.
         """
         try:
             if task.kind == self.SESSION_EXPIRE_TASK:
                 return self._processSessionExpire(task, now=now)
             if task.kind == self.SESSION_CLEANUP_TASK:
-                return self._processSessionCleanup(task, now=now)
+                return (
+                    yield from self._processSessionCleanupDo(
+                        task,
+                        now=now,
+                        tymth=tymth,
+                        tock=tock,
+                    )
+                )
             if task.kind == self.SESSION_DELETE_TASK:
                 return self._processSessionDelete(task, now=now)
             if task.kind == self.ACCOUNT_EXPIRE_TASK:
                 return self._processAccountExpire(task, now=now)
             if task.kind == self.ACCOUNT_CLEANUP_TASK:
-                return self._processAccountCleanup(task, now=now)
+                return (
+                    yield from self._processAccountCleanupDo(
+                        task,
+                        now=now,
+                        tymth=tymth,
+                        tock=tock,
+                    )
+                )
             if task.kind == self.ACCOUNT_DELETE_TASK:
-                return self._processAccountDelete(task, now=now)
+                return (
+                    yield from self._processAccountDeleteDo(
+                        task,
+                        now=now,
+                        tymth=tymth,
+                        tock=tock,
+                    )
+                )
         except Exception as exc:
             logger.exception(
                 "Unexpected cleanup task failure: kind=%s subject=%s",
@@ -456,9 +360,8 @@ class Expirer:
             )
             return None, None
 
+        # Unknown tasks are invalid, mark as complete for removal.
         logger.warning(f"Unknown cleanup task kind '{task.kind}' for subject {task.subject}")
-        
-        # Task is invalid: task is not from the expected task list, mark as complete for removal
         self._completeTask(task.kind, task.subject)
         return None, None
 
@@ -469,10 +372,10 @@ class Expirer:
         now: str,
     ) -> tuple[str | None, object | None]:
         """Set a session as expired when its stored expiry time is due"""
-        
+
         # Retrieve session
         session = self.ctx.store.getSession(task.subject)
-        
+
         # If session is not found, it is an orphaned task, mark as complete for removal
         if session is None:
             self._completeTask(task.kind, task.subject)
@@ -519,22 +422,24 @@ class Expirer:
         )
         return "sessions_expired", session
 
-    def _processSessionCleanup(
+    def _processSessionCleanupDo(
         self,
         task: CleanupTaskRecord,
         *,
         now: str,
-    ) -> tuple[str | None, object | None]:
-        """Tear down hosted resources for one expired session"""
+        tymth,
+        tock: float = 0.0,
+    ):
+        """Tear down hosted resources for one expired session cooperatively."""
 
         # Retrieve session
         session = self.ctx.store.getSession(task.subject)
-        
+
         # If session is None, task is invalid, mark as complete for removal
         if session is None:
             self._completeTask(task.kind, task.subject)
             return None, None
-        
+
         # If session is not expired, failed or cancelled session cleanup task is invalid
         if session.state not in {
             SESSION_STATE_EXPIRED,
@@ -546,23 +451,26 @@ class Expirer:
 
         # If session resources have already been cleaned, re-sync to the delete phase
         if session.resources_cleaned_at:
-            with self._lock:
-                self.ctx.store.saveSession(session)
-                self._completeTask(task.kind, task.subject)
+            self.ctx.store.saveSession(session)
+            self._completeTask(task.kind, task.subject)
             return None, None
 
         # Retrieve the account for that session
         account = self.ctx.store.getAccount(session.account_aid) if session.account_aid else None
 
         try:
-            # Teardown session resources
-            self.provisioner.teardownSessionResources(session=session, account=account)
+            # Teardown session resources cooperatively
+            yield from self.provisioner.teardownSessionResourcesDo(
+                session=session,
+                account=account,
+                tymth=tymth,
+                tock=tock,
+            )
         except BootError as exc:
             # If error, log and save it
             session.failure_reason = f"Cleanup failed after expiry: {exc}"
             session.updated_at = now
-            with self._lock:
-                self.ctx.store.saveSession(session)
+            self.ctx.store.saveSession(session)
             self._handleTaskFailure(
                 task,
                 exc,
@@ -570,35 +478,36 @@ class Expirer:
                 operation="session cleanup",
             )
             # Retry or block both mean cleanup is still pending, so do not report this
-            # task as successfully cleaned in sweep results or cleanupExpiredSessions().
+            # task as successfully cleaned in sweep results.
             return None, None
+
+        # Update session record with the resources cleaned up time
+        session.resources_cleaned_at = now
+        session.updated_at = now
+        self.ctx.store.saveSession(session)
+
+        if account is None:
+            failed = None
+        elif account.status == ACCOUNT_STATE_ONBOARDED:
+            failed = None
         else:
-            # Update session record with the resources cleaned up time
-            session.resources_cleaned_at = now
-            session.updated_at = now
-            with self._lock:
-                self.ctx.store.saveSession(session)
+            failed = accountFailed(account)
 
-                if account is None:
-                    failed = None
-                elif account.status == ACCOUNT_STATE_ONBOARDED:
-                    failed = None
-                else:
-                    failed = accountFailed(account)
-
-                if failed is not None:
-                    failed.resources_cleaned_at = now
-                    failed.session_id = ""
-                    self.ctx.store.saveAccount(failed)
-                    logger.info(
-                        f"Account failed due to session expiry for account {account.account_aid}",
-                    )
-                # Mark task as complete for removal
-                self._completeTask(task.kind, task.subject)
+        if failed is not None:
+            # If account exists in failed state, mark as resources cleaned
+            failed.resources_cleaned_at = now
+            failed.session_id = ""
+            self.ctx.store.saveAccount(failed)
             logger.info(
-                f"Session resources cleaned after expiry for session {session.session_id}",
+                f"Account failed due to session expiry for account {account.account_aid}",
             )
-            return "sessions_cleaned", session.session_id
+
+        # Mark task as complete for removal
+        self._completeTask(task.kind, task.subject)
+        logger.info(
+            f"Session resources cleaned after expiry for session {session.session_id}",
+        )
+        return "sessions_cleaned", session.session_id
 
     def _processSessionDelete(
         self,
@@ -610,7 +519,7 @@ class Expirer:
 
         # Retrieve session for that task/subject pair
         session = self.ctx.store.getSession(task.subject)
-        
+
         # If session is not found, task is invalid 
         if session is None:
             self._completeTask(task.kind, task.subject)
@@ -625,7 +534,7 @@ class Expirer:
         }:
             self._completeTask(task.kind, task.subject)
             return None, None
-        
+
         # If session is not expired, failed, or cancelled, and resources haven't been cleaned yet,
         # session delete task is invalid
         if (
@@ -636,9 +545,8 @@ class Expirer:
             }
             and not session.resources_cleaned_at
         ):
-            with self._lock:
-                self.ctx.store.saveSession(session)
-                self._completeTask(task.kind, task.subject)
+            self.ctx.store.saveSession(session)
+            self._completeTask(task.kind, task.subject)
             return None, None
 
         # Retrieve delete due time, if it has not elapsed yet, reschedule to the new time
@@ -653,8 +561,7 @@ class Expirer:
             return None, None
 
         # Session is valid for deletion, proceed to deletion
-        with self._lock:
-            self.ctx.store.deleteSession(session.session_id)
+        self.ctx.store.deleteSession(session.session_id)
         logger.info(f"Closed session deleted for session {session.session_id}")
         return "sessions_deleted", session.session_id
 
@@ -701,7 +608,7 @@ class Expirer:
                 reset_attempts=True,
             )
             return None, None
-        
+
         # Mark the account as expired
         self.markAccountExpired(account, now=now)
         logger.info(
@@ -709,43 +616,27 @@ class Expirer:
         )
         return "accounts_expired", account.account_aid
 
-    def _processAccountCleanup(
+    def _processAccountCleanupDo(
         self,
         task: CleanupTaskRecord,
         *,
         now: str,
-    ) -> tuple[str | None, object | None]:
-        """Tear down hosted resources for one expired account"""
+        tymth,
+        tock: float = 0.0,
+    ):
+        """Tear down hosted resources for one expired account cooperatively."""
 
-        # Retrieve the account for that task
-        account = self.ctx.store.getAccount(task.subject)
-
-        # If account is not found, task is invalid, mark as complete for removal
+        account = self._prepareAccountCleanupTask(task)
         if account is None:
-            self._completeTask(task.kind, task.subject)
-            return None, None
-
-        # If account is not expired, or failed, account cleanup task is invalid
-        if account.status not in {
-            ACCOUNT_STATE_EXPIRED,
-            ACCOUNT_STATE_FAILED,
-        }:
-            self._completeTask(task.kind, task.subject)
-            return None, None
-        
-        # If account resources has been cleaned up, task is invalid
-        if account.resources_cleaned_at:
-            with self._lock:
-                # Save the account to trigger a reprocess of tasks based on its state
-                self.ctx.store.saveAccount(account)
-                self._completeTask(task.kind, task.subject)
             return None, None
 
         try:
-            # Teardown Account resources
-            self.provisioner.teardownAccountResources(
+            # Teardown Account resources cooperatively
+            yield from self.provisioner.teardownAccountResourcesDo(
                 account_aid=account.account_aid,
                 account=account,
+                tymth=tymth,
+                tock=tock,
             )
         except BootError as exc:
             self._handleTaskFailure(
@@ -755,69 +646,68 @@ class Expirer:
                 operation="account cleanup",
             )
             # The account is still waiting on teardown, so retrying or blocking
-            # should not count as a completed cleanup in sweep counters or
-            # cleanupExpiredAccounts().
+            # should not count as a completed cleanup in sweep counters.
             return None, None
-        else:
-            # Update account record with cleaned up time
-            account.resources_cleaned_at = now
-            with self._lock:
-                self.ctx.store.saveAccount(account)
-                self._completeTask(task.kind, task.subject)
-            logger.info(
-                f"Expired account resources cleaned for account AID {account.account_aid}",
-            )
-            return "accounts_cleaned", account.account_aid
 
-    def _processAccountDelete(
-        self,
-        task: CleanupTaskRecord,
-        *,
-        now: str,
-    ) -> tuple[str | None, object | None]:
-        """Delete one expired account after cleanup and retention has been done"""
+        return self._finishAccountCleanupTask(task, account, now=now)
 
-        # Retrieve account for that task
+    def _prepareAccountCleanupTask(self, task: CleanupTaskRecord):
         account = self.ctx.store.getAccount(task.subject)
-
-        # If account is not found, task is invalid, mark as completed for removal
         if account is None:
             self._completeTask(task.kind, task.subject)
-            return None, None
-        
-        # If account is not expired or failed, account delete task is invalid
+            return None
+
         if account.status not in {
             ACCOUNT_STATE_EXPIRED,
             ACCOUNT_STATE_FAILED,
         }:
             self._completeTask(task.kind, task.subject)
-            return None, None
+            return None
 
-        # If account resources hasn't been cleaned up yet, task is invalid
-        if not account.resources_cleaned_at:
-            with self._lock:
-                self.ctx.store.saveAccount(account)
-                self._completeTask(task.kind, task.subject)
-            return None, None
+        if account.resources_cleaned_at:
+            # Re-save so store task syncing can advance this account to the delete phase.
+            self.ctx.store.saveAccount(account)
+            self._completeTask(task.kind, task.subject)
+            return None
 
-        # Retrieve time account should be deleted at
-        delete_due_at = self.ctx.store.accountDeleteDueAt(account)
+        return account
 
-        # If account deletion is not due yet, reschedule with the new date
-        if delete_due_at > now:
-            self._rescheduleTask(
-                task.kind,
-                task.subject,
-                due_at=delete_due_at,
-                now=now,
-            )
+    def _finishAccountCleanupTask(
+        self,
+        task: CleanupTaskRecord,
+        account,
+        *,
+        now: str,
+    ) -> tuple[str, str]:
+        account.resources_cleaned_at = now
+        self.ctx.store.saveAccount(account)
+        self._completeTask(task.kind, task.subject)
+        logger.info(
+            f"Expired account resources cleaned for account AID {account.account_aid}",
+        )
+        return "accounts_cleaned", account.account_aid
+
+    def _processAccountDeleteDo(
+        self,
+        task: CleanupTaskRecord,
+        *,
+        now: str,
+        tymth,
+        tock: float = 0.0,
+    ):
+        """Delete one expired account cooperatively after retention elapses."""
+
+        account = self._prepareAccountDeleteTask(task, now=now)
+        if account is None:
             return None, None
 
         try:
-            # Delete account
-            self.provisioner.deleteAccount(
+            # Delete account cooperatively
+            yield from self.provisioner.deleteAccountDo(
                 account_aid=account.account_aid,
                 account=account,
+                tymth=tymth,
+                tock=tock,
             )
         except BootError as exc:
             self._handleTaskFailure(
@@ -826,15 +716,41 @@ class Expirer:
                 now=now,
                 operation="account delete",
             )
-        else:
-            with self._lock:
-                self._completeTask(task.kind, task.subject)
-            logger.info(
-                f"Expired account deleted for account AID {account.account_aid}",
-            )
-            return "accounts_deleted", account.account_aid
+            return None, None
 
-        return None, None
+        return self._finishAccountDeleteTask(task, account)
+
+    def _prepareAccountDeleteTask(self, task: CleanupTaskRecord, *, now: str):
+        account = self.ctx.store.getAccount(task.subject)
+        if account is None:
+            self._completeTask(task.kind, task.subject)
+            return None
+
+        if account.status not in {
+            ACCOUNT_STATE_EXPIRED,
+            ACCOUNT_STATE_FAILED,
+        }:
+            self._completeTask(task.kind, task.subject)
+            return None
+
+        if not account.resources_cleaned_at:
+            # Cleanup must finish before account deletion can be considered valid.
+            self.ctx.store.saveAccount(account)
+            self._completeTask(task.kind, task.subject)
+            return None
+
+        delete_due_at = self.ctx.store.accountDeleteDueAt(account)
+        if delete_due_at > now:
+            # Retention has not elapsed yet; put the delete task back at its due time.
+            self._rescheduleTask(
+                task.kind,
+                task.subject,
+                due_at=delete_due_at,
+                now=now,
+            )
+            return None
+
+        return account
 
     def _handleTaskFailure(
         self,
@@ -872,15 +788,14 @@ class Expirer:
                 first_failed_at=first_failed_at,
                 immediate_block=immediate_block,
             )
-            with self._lock:
-                self.ctx.store.blockCleanupTask(
-                    task.kind,
-                    task.subject,
-                    now=now,
-                    blocked_reason=blocked_reason,
-                    last_error=error_text,
-                    first_failed_at=first_failed_at,
-                )
+            self.ctx.store.blockCleanupTask(
+                task.kind,
+                task.subject,
+                now=now,
+                blocked_reason=blocked_reason,
+                last_error=error_text,
+                first_failed_at=first_failed_at,
+            )
             logger.warning(
                 "Cleanup task blocked: kind=%s subject=%s reason=%s",
                 task.kind,
@@ -891,15 +806,14 @@ class Expirer:
 
         # Reschedule the task with failure metadata
         retry_time = self._nextRetryAt(task, now=now)
-        with self._lock:
-            self.ctx.store.rescheduleFailedCleanupTask(
-                task.kind,
-                task.subject,
-                due_at=retry_time,
-                now=now,
-                last_error=error_text,
-                first_failed_at=first_failed_at,
-            )
+        self.ctx.store.rescheduleFailedCleanupTask(
+            task.kind,
+            task.subject,
+            due_at=retry_time,
+            now=now,
+            last_error=error_text,
+            first_failed_at=first_failed_at,
+        )
         logger.warning(
             "Cleanup task rescheduled after failure: kind=%s subject=%s retry_at=%s error=%s",
             task.kind,
@@ -919,6 +833,12 @@ class Expirer:
         immediate_block: bool = False,
     ) -> bool:
         """Return True when a failed cleanup task should be quarantined."""
+        attempt_limit = getattr(self.ctx.config, "cleanup_block_after_attempts", 10)
+        failure_age_limit = getattr(
+            self.ctx.config,
+            "cleanup_block_after_failure_age_seconds",
+            86400.0,
+        )
 
         # Check for the immediate_block flag 
         if immediate_block:
@@ -928,11 +848,11 @@ class Expirer:
             return True
 
         # Check for config thresholds 
-        if task.attempt_count >= self.ctx.config.cleanup_block_after_attempts:
+        if task.attempt_count >= attempt_limit:
             return True
         return (
             self._failureAgeSeconds(first_failed_at=first_failed_at, now=now)
-            >= self.ctx.config.cleanup_block_after_failure_age_seconds
+            >= failure_age_limit
         )
 
     def _bootErrorIsRetryable(self, exc: BootError) -> bool:
@@ -976,6 +896,12 @@ class Expirer:
         3 - The task has exceeded the configured retry attempt limit
         4 - The task has exceeded the configured failure time limit
         """
+        attempt_limit = getattr(self.ctx.config, "cleanup_block_after_attempts", 10)
+        failure_age_limit = getattr(
+            self.ctx.config,
+            "cleanup_block_after_failure_age_seconds",
+            86400.0,
+        )
 
         if immediate_block:
             return (
@@ -988,18 +914,29 @@ class Expirer:
                 f"Non-retryable cleanup failure during {operation} "
                 f"(status={code}): {exc}"
             )
-        if task.attempt_count >= self.ctx.config.cleanup_block_after_attempts:
+        if task.attempt_count >= attempt_limit:
             return (
                 f"Cleanup retry limit reached during {operation}: "
                 f"{task.attempt_count} attempts >= "
-                f"{self.ctx.config.cleanup_block_after_attempts} allowed"
+                f"{attempt_limit} allowed"
             )
         age_seconds = self._failureAgeSeconds(first_failed_at=first_failed_at, now=now)
         return (
             f"Cleanup failure age limit reached during {operation}: "
             f"{age_seconds:.0f}s >= "
-            f"{self.ctx.config.cleanup_block_after_failure_age_seconds:.0f}s"
+            f"{failure_age_limit:.0f}s"
         )
+
+    def _finishAccountDeleteTask(
+        self,
+        task: CleanupTaskRecord,
+        account,
+    ) -> tuple[str, str]:
+        self._completeTask(task.kind, task.subject)
+        logger.info(
+            f"Expired account deleted for account AID {account.account_aid}",
+        )
+        return "accounts_deleted", account.account_aid
 
     def _nextRetryAt(self, task: CleanupTaskRecord, *, now: str) -> str:
         """Compute the next retry time using exponential backoff and optional jitter"""
@@ -1026,17 +963,15 @@ class Expirer:
         reset_attempts: bool = False,
     ) -> None:
         """Saves a new due time for a task after deferral or failure in the DB"""
-        with self._lock:
-            self.ctx.store.scheduleCleanupTask(
-                kind,
-                subject,
-                due_at=due_at,
-                now=now,
-                last_error=last_error,
-                reset_attempts=reset_attempts,
-            )
+        self.ctx.store.scheduleCleanupTask(
+            kind,
+            subject,
+            due_at=due_at,
+            now=now,
+            last_error=last_error,
+            reset_attempts=reset_attempts,
+        )
 
     def _completeTask(self, kind: str, subject: str) -> None:
         """Remove a task from the durable queue once it has finished"""
-        with self._lock:
-            self.ctx.store.completeCleanupTask(kind, subject)
+        self.ctx.store.completeCleanupTask(kind, subject)

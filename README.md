@@ -130,6 +130,12 @@ There are no authenticated `qry` routes in this slice.
 - `Kramer`
 - `Exchanger`
 
+The service runs under one root HIO `Doist`:
+
+- Falcon is served by an HIO HTTP server doer.
+- periodic lifecycle cleanup is a normal HIO doer on the same runtime.
+- downstream witness/watcher boot calls still use the synchronous boot client.
+
 The server does not manually trust `serder.pre` as an auth substitute.
 Business handlers run only after the request has been parsed through the KRAM-enabled `Kevery`.
 

@@ -4,11 +4,10 @@ import argparse
 import logging
 import os
 import sys
-from wsgiref.simple_server import make_server
 
+from hio.base import doing
 from keri import help
 
-from kfboot.app import create_app
 from kfboot.basing import (
     CLEANUP_TASK_ACCOUNT_CLEANUP,
     CLEANUP_TASK_ACCOUNT_DELETE,
@@ -28,6 +27,7 @@ from kfboot.store import (
     UnsafeBlockedTaskDismissError,
     nowIso,
 )
+from kfboot.runtime import setup
 
 logger = help.ogler.getLogger(__name__)
 
@@ -290,15 +290,15 @@ def _blockedTaskOrExit(store: Store, *, kind: str, subject: str) -> CleanupTaskR
 
 
 def _runServe(_args: argparse.Namespace) -> None:
-    app, ctx = create_app()
-    server = make_server(ctx.config.host, ctx.config.port, app)
+    _app, ctx, doers = setup()
     try:
         logger.info(
             f"Server starting on http://{ctx.config.host}:{ctx.config.port}\n"
             f"Onboarding surface: {ctx.config.onboarding_public_url}\n"
             f"Account surface: {ctx.config.account_public_url}"
         )
-        server.serve_forever()
+        doist = doing.Doist(name="kf-boot", real=True, tock=0.00125)
+        doist.do(doers=doers)
     finally:
         ctx.close()
         logger.info(

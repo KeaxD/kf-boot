@@ -151,7 +151,6 @@ def test_config_from_env_parses_cleanup_settings(monkeypatch):
     monkeypatch.setenv("KF_BOOT_CLEANUP_INTERVAL_SECONDS", "15")
     monkeypatch.setenv("KF_BOOT_CLEANUP_BATCH_SIZE", "7")
     monkeypatch.setenv("KF_BOOT_CLEANUP_TIME_BUDGET_SECONDS", "3")
-    monkeypatch.setenv("KF_BOOT_CLEANUP_STOP_TIMEOUT_SECONDS", "18")
     monkeypatch.setenv("KF_BOOT_CLEANUP_FAILURE_BACKOFF_SECONDS", "45")
     monkeypatch.setenv("KF_BOOT_CLEANUP_FAILURE_BACKOFF_MAX_SECONDS", "300")
     monkeypatch.setenv("KF_BOOT_CLEANUP_FAILURE_JITTER_SECONDS", "2")
@@ -167,7 +166,6 @@ def test_config_from_env_parses_cleanup_settings(monkeypatch):
     assert config.cleanup_interval_seconds == 15
     assert config.cleanup_batch_size == 7
     assert config.cleanup_time_budget_seconds == 3
-    assert config.cleanup_stop_timeout_seconds == 18
     assert config.cleanup_failure_backoff_seconds == 45
     assert config.cleanup_failure_backoff_max_seconds == 300
     assert config.cleanup_failure_jitter_seconds == 2

@@ -244,7 +244,7 @@ class Config:
     account_ttl_seconds: float = 172800.0  # 48 hours
     # How long closed session rows are retained before final session deletion
     closed_session_retention_seconds: float | None = None
-    # Flag for enabling background periodic cleanup runner
+    # Flag for enabling periodic cleanup work
     cleanup_runner_enabled: bool = True
     # Delay between periodic cleanup sweep attempts
     cleanup_interval_seconds: float = 60.0
@@ -252,8 +252,6 @@ class Config:
     cleanup_batch_size: int = 100
     # Soft budget for one sweep before the runner yields until next interval
     cleanup_time_budget_seconds: float = 5.0
-    # How long shutdown waits for a cleanup sweep to finish
-    cleanup_stop_timeout_seconds: float = 15.0
     # Initial retry delay after a cleanup teardown/delete failure
     cleanup_failure_backoff_seconds: float = 60.0
     # Maximum retry delay cap for repeated cleanup failures
@@ -285,8 +283,6 @@ class Config:
             raise ValueError("cleanup_batch_size must be greater than 0.")
         if self.cleanup_time_budget_seconds <= 0:
             raise ValueError("cleanup_time_budget_seconds must be greater than 0.")
-        if self.cleanup_stop_timeout_seconds <= 0:
-            raise ValueError("cleanup_stop_timeout_seconds must be greater than 0.")
         if self.cleanup_failure_backoff_seconds < 0:
             raise ValueError("cleanup_failure_backoff_seconds must be greater than or equal to 0.")
         if self.cleanup_failure_backoff_max_seconds < self.cleanup_failure_backoff_seconds:
@@ -400,7 +396,6 @@ class Config:
             f"Cleanup interval seconds: {self.cleanup_interval_seconds}\n"
             f"Cleanup batch size: {self.cleanup_batch_size}\n"
             f"Cleanup time budget seconds: {self.cleanup_time_budget_seconds}\n"
-            f"Cleanup stop timeout seconds: {self.cleanup_stop_timeout_seconds}\n"
             f"Cleanup failure backoff seconds: {self.cleanup_failure_backoff_seconds}\n"
             f"Cleanup failure backoff max seconds: {self.cleanup_failure_backoff_max_seconds}\n"
             f"Cleanup failure jitter seconds: {self.cleanup_failure_jitter_seconds}\n"
@@ -515,9 +510,6 @@ class Config:
             ),
             cleanup_time_budget_seconds=float(
                 _env("CLEANUP_TIME_BUDGET_SECONDS", "5")
-            ),
-            cleanup_stop_timeout_seconds=float(
-                _env("CLEANUP_STOP_TIMEOUT_SECONDS", "15")
             ),
             cleanup_failure_backoff_seconds=float(
                 _env("CLEANUP_FAILURE_BACKOFF_SECONDS", "60")

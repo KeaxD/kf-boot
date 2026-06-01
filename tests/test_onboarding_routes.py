@@ -36,6 +36,7 @@ from .support import (
     register_aid,
     start_payload,
     start_session,
+    sweep_do,
     total_witness_create_calls,
     total_witness_created_eids,
     total_witness_delete_calls,
@@ -288,10 +289,12 @@ def test_session_start_marks_past_due_session_expired_and_blocks_until_cleanup_f
         assert contract.ctx.watcher_boot.create_calls == 1
 
         # Once cleanup runs, a follow-up start may allocate a fresh session safely.
-        cleaned = contract.ctx.exchanger.expirer.cleanupExpiredSessions(
-            now="2099-01-01T00:00:00+00:00"
+        cleaned = sweep_do(
+            contract.ctx.exchanger.expirer,
+            now="2099-01-01T00:00:00+00:00",
+            batch_size=1,
         )
-        assert cleaned == [first_session_id]
+        assert cleaned["sessions_cleaned"] == 1
 
         second_retry = post_cesr(
             contract,
@@ -539,6 +542,12 @@ def test_failed_session_teardown_is_retried_by_cleanup_tasks(contract_factory, m
 
         monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownSessionResources", flaky_teardown)
 
+        def flaky_teardown_do(*, session: Any, account=None, tymth, tock: float = 0.0):
+            yield tock
+            flaky_teardown(session=session, account=account)
+
+        monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownSessionResourcesDo", flaky_teardown_do)
+
         # Fail session clean up
         contract.ctx.exchanger.expirer.failSession(
             session=session,
@@ -554,14 +563,16 @@ def test_failed_session_teardown_is_retried_by_cleanup_tasks(contract_factory, m
         assert failed.resources_cleaned_at == ""
 
         # Run the cleanup
-        cleaned = contract.ctx.exchanger.expirer.cleanupExpiredSessions(
-            now="2099-01-01T00:00:00+00:00"
+        cleaned = sweep_do(
+            contract.ctx.exchanger.expirer,
+            now="2099-01-01T00:00:00+00:00",
+            batch_size=1,
         )
 
         # Assert sucessful teardown
         recovered = contract.ctx.store.getSession(session_id)
         failed_account = contract.ctx.store.getAccount(account.pre)
-        assert cleaned == [session_id]
+        assert cleaned["sessions_cleaned"] == 1
         assert recovered is not None
         assert recovered.resources_cleaned_at == "2099-01-01T00:00:00+00:00"
         assert failed_account is not None
@@ -588,20 +599,26 @@ def test_cleanup_expired_sessions_failure_does_not_report_false_success(contract
         session = contract.ctx.store.getSession(session_id)
         session.expires_at = "2000-01-01T00:00:00+00:00"
         contract.ctx.store.saveSession(session)
-        contract.ctx.exchanger.expirer.expireSessions(now="2026-01-01T00:00:00+00:00")
+        sweep_do(
+            contract.ctx.exchanger.expirer,
+            now="2026-01-01T00:00:00+00:00",
+            batch_size=1,
+        )
 
-        def always_fail(*, session: Any, account=None) -> None:
+        def always_fail_do(*, session: Any, account=None, tymth, tock: float = 0.0):
+            yield tock
             raise BootError("simulated cleanup retry failure", status_code=502)
 
-        monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownSessionResources", always_fail)
+        monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownSessionResourcesDo", always_fail_do)
 
-        cleaned = contract.ctx.exchanger.expirer.cleanupExpiredSessions(
+        cleaned = sweep_do(
+            contract.ctx.exchanger.expirer,
             now="2026-01-01T00:00:00+00:00"
         )
 
         updated = contract.ctx.store.getSession(session_id)
         task = contract.ctx.store.getCleanupTask("session_cleanup", session_id)
-        assert cleaned == []
+        assert cleaned["sessions_cleaned"] == 0
         assert updated is not None
         assert updated.resources_cleaned_at == ""
         assert task is not None
@@ -625,17 +642,28 @@ def test_cleanup_expired_sessions_blocks_non_retryable_failures(contract_factory
         session = contract.ctx.store.getSession(session_id)
         session.expires_at = "2000-01-01T00:00:00+00:00"
         contract.ctx.store.saveSession(session)
-        contract.ctx.exchanger.expirer.expireSessions(now="2026-01-01T00:00:00+00:00")
+        sweep_do(
+            contract.ctx.exchanger.expirer,
+            now="2026-01-01T00:00:00+00:00",
+            batch_size=1,
+        )
 
         # Simulate a malformed request with error code 400
-        def non_retryable(*, session: Any, account=None) -> None:
+        def non_retryable_do(*, session: Any, account=None, tymth, tock: float = 0.0):
+            yield tock
             raise BootError("simulated malformed cleanup request", status_code=400)
 
-        monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownSessionResources", non_retryable)
+        monkeypatch.setattr(
+            contract.ctx.exchanger.provisioner,
+            "teardownSessionResourcesDo",
+            non_retryable_do,
+        )
 
-        # Run the cleanup 
-        cleaned = contract.ctx.exchanger.expirer.cleanupExpiredSessions(
-            now="2026-01-01T00:00:00+00:00"
+        # Run the cleanup
+        cleaned = sweep_do(
+            contract.ctx.exchanger.expirer,
+            now="2026-01-01T00:00:00+00:00",
+            batch_size=1,
         )
 
         # Get the cleanup task and backlog
@@ -643,7 +671,7 @@ def test_cleanup_expired_sessions_blocks_non_retryable_failures(contract_factory
         snapshot = contract.ctx.store.cleanupBacklogSnapshot(now="2026-01-01T00:00:10+00:00")
 
         # Assert cleanning failed and task is blocked without retry attempts
-        assert cleaned == []
+        assert cleaned["sessions_cleaned"] == 0
         assert task is not None
 
         # Assert blocked task is cleared from due metadata and has blocked metadata
@@ -673,7 +701,10 @@ def test_expired_sessions_reclaim_hosted_resources_and_fail_pending_account(cont
         expired.expires_at = "2024-01-01T00:00:00+00:00"
         contract.ctx.store.saveSession(expired)
 
-        sweep = contract.ctx.exchanger.expirer.sweep(batch_size=10)
+        sweep = sweep_do(
+            contract.ctx.exchanger.expirer,
+            batch_size=10,
+        )
 
         register_aid(contract, "/onboarding", next_ephemeral)
         response = post_cesr(
@@ -1429,21 +1460,28 @@ def test_cleanup_expired_sessions_cleans_up_stale_staging_allocations(contract_f
 
     cleaned: list[tuple] = []
 
-    def fake_teardown(*, session: Any, account=None) -> None:
+    def fake_teardown_do(*, session: Any, account=None, tymth, tock: float = 0.0):
+        yield tock
         cleaned.append((session.session_id, account))
 
-    monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownSessionResources", fake_teardown)
+    monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownSessionResourcesDo", fake_teardown_do)
 
-    expired = contract.ctx.exchanger.expirer.expireSessions(now="2026-01-01T00:00:00+00:00")
-    cleaned_sessions = contract.ctx.exchanger.expirer.cleanupExpiredSessions(
-        now="2026-01-01T00:00:00+00:00"
+    expired = sweep_do(
+        contract.ctx.exchanger.expirer,
+        now="2026-01-01T00:00:00+00:00",
+        batch_size=1,
+    )
+    cleaned_sessions = sweep_do(
+        contract.ctx.exchanger.expirer,
+        now="2026-01-01T00:00:00+00:00",
+        batch_size=1,
     )
 
     expired_session = contract.ctx.store.getSession(session.session_id)
     assert expired_session is not None
     assert expired_session.state == SESSION_STATE_EXPIRED
-    assert [record.session_id for record in expired] == [session.session_id]
-    assert cleaned_sessions == [session.session_id]
+    assert expired["sessions_expired"] == 1
+    assert cleaned_sessions["sessions_cleaned"] == 1
     assert expired_session.resources_cleaned_at == "2026-01-01T00:00:00+00:00"
     assert cleaned == [(session.session_id, None)]
 

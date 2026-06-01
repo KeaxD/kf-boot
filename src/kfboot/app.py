@@ -17,7 +17,7 @@ from kfboot.boot_exchanger import BootContext, BootExchanger
 from kfboot.config import Config
 from kfboot.onboarding import CesrSurfaceEnd
 from kfboot.store import Store, nowIso
-from kfboot.sweeping import CleanupRunner
+from kfboot.sweeping import CleanupState
 
 
 logger = help.ogler.getLogger(__name__)
@@ -54,14 +54,12 @@ class Context:
     kvy: Kevery | None
     parser: Parser | None
     exchanger: BootExchanger | None
-    cleanup_runner: CleanupRunner | None
+    cleanup: CleanupState
 
     def close(self, *, clear: bool = False) -> None:
         logger.info(
             "App Context is closing",
         )
-        if self.cleanup_runner is not None:
-            self.cleanup_runner.stop(timeout=self.config.cleanup_stop_timeout_seconds)
         self.store.close()
         self.habery.close(clear=clear)
         logger.info(
@@ -75,11 +73,11 @@ class HealthEnd:
 
     def on_get(self, _req: falcon.Request, rep: falcon.Response) -> None:
         current = nowIso()
-        runner = self.ctx.cleanup_runner
+        cleanup_state = self.ctx.cleanup
         configured = bool(self.ctx.config.cleanup_runner_enabled)
-        expected_running = bool(runner.enabled) if runner is not None else False
-        running = bool(runner.is_running) if runner is not None else False
-        runner_state = runner.snapshot(now=current) if runner is not None else {}
+        expected_running = cleanup_state.expected_running
+        running = cleanup_state.is_running
+        runner_state = cleanup_state.snapshot(now=current)
         backlog = self.ctx.store.cleanupBacklogSnapshot(now=current)
 
         # Expose cleanup queue pressure so operators can tell the difference
@@ -181,7 +179,10 @@ def create_app(config: Config | None = None, *, temp: bool = False) -> tuple[fal
         kvy=None,
         parser=None,
         exchanger=None,
-        cleanup_runner=None,
+        cleanup=CleanupState(
+            enabled=config.cleanup_runner_enabled,
+            interval=config.cleanup_interval_seconds,
+        ),
     )
 
     exchanger = BootExchanger(
@@ -211,15 +212,6 @@ def create_app(config: Config | None = None, *, temp: bool = False) -> tuple[fal
     ctx.kvy = kvy
     ctx.parser = parser
     ctx.exchanger = exchanger
-    ctx.cleanup_runner = CleanupRunner(
-        expirer=exchanger.expirer,
-        interval=config.cleanup_interval_seconds,
-        batch_size=config.cleanup_batch_size,
-        time_budget_seconds=config.cleanup_time_budget_seconds,
-        stop_timeout_seconds=config.cleanup_stop_timeout_seconds,
-        enabled=config.cleanup_runner_enabled,
-    )
-    ctx.cleanup_runner.start()
 
     app = falcon.App()
     app.add_route("/health", HealthEnd(ctx))
