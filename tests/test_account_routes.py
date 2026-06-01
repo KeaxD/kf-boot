@@ -26,6 +26,7 @@ from .support import (
     post_cesr,
     register_aid,
     start_session,
+    sweep_do,
     total_witness_delete_calls,
 )
 
@@ -832,10 +833,15 @@ def test_expire_accounts_transitions_onboarded_account_to_expired(onboarded_bund
     contract.ctx.store.saveAccount(record)
 
     # Manually trigger the expiration process
-    contract.ctx.exchanger.expirer.expireAccounts()
+    sweep = sweep_do(
+        contract.ctx.exchanger.expirer,
+        now="2026-01-01T00:00:00+00:00",
+        batch_size=1,
+    )
 
     updated = contract.ctx.store.getAccount(account.pre)
     assert updated is not None
+    assert sweep["accounts_expired"] == 1
     assert updated.status == ACCOUNT_STATE_EXPIRED
 
 
@@ -916,20 +922,30 @@ def test_cleanup_expired_accounts_retries_with_backoff(onboarded_bundle, monkeyp
     # Create an attempts list to track back off behavior
     attempts: list[str] = []
 
-    def fake_teardown(*, account_aid: str, account=None) -> None:
+    def fake_teardown_do(*, account_aid: str, account=None, tymth, tock: float = 0.0):
         attempts.append(account_aid)
+        yield tock
         raise BootError("simulated teardown failure", status_code=502)
 
-    monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownAccountResources", fake_teardown)
+    monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownAccountResourcesDo", fake_teardown_do)
 
     # First sweep: task is due => teardown attempted => failure => task rescheduled with backoff.
-    first = contract.ctx.exchanger.expirer.cleanupExpiredAccounts(now="2026-01-01T00:00:00+00:00")
+    first = sweep_do(
+        contract.ctx.exchanger.expirer,
+        now="2026-01-01T00:00:00+00:00",
+    )
 
     # Second sweep (30 seconds later): backoff window has NOT elapsed => no retry should occur.
-    second = contract.ctx.exchanger.expirer.cleanupExpiredAccounts(now="2026-01-01T00:00:30+00:00")
+    second = sweep_do(
+        contract.ctx.exchanger.expirer,
+        now="2026-01-01T00:00:30+00:00",
+    )
 
     # Third sweep (61 seconds later): backoff window HAS elapsed => retry should occur.
-    third = contract.ctx.exchanger.expirer.cleanupExpiredAccounts(now="2026-01-01T00:01:01+00:00")
+    third = sweep_do(
+        contract.ctx.exchanger.expirer,
+        now="2026-01-01T00:01:01+00:00",
+    )
 
     # Retrieve the account and assert clean up was not successful
     updated = contract.ctx.store.getAccount(account.pre)
@@ -938,13 +954,13 @@ def test_cleanup_expired_accounts_retries_with_backoff(onboarded_bundle, monkeyp
     assert updated.resources_cleaned_at == ""
 
     # Failed cleanups should reschedule without being reported as successfully cleaned.
-    assert first == []
+    assert first["accounts_cleaned"] == 0
 
     # Second sweep skipped due to backoff
-    assert second == []
+    assert second["accounts_cleaned"] == 0
 
     # Third sweep retries after backoff, but still does not report success because cleanup failed again.
-    assert third == []
+    assert third["accounts_cleaned"] == 0
 
     # Assert attempts only contains the 1st and 3rd attempt
     assert attempts == [account.pre, account.pre]
@@ -1007,7 +1023,8 @@ def test_cleanup_expired_accounts_triggers_resource_teardown(contract_factory, m
 
     cleaned: list[tuple] = []
 
-    def fake_teardown(*, account_aid: str, account=None) -> None:
+    def fake_teardown_do(*, account_aid: str, account=None, tymth, tock: float = 0.0):
+        yield tock
         # Simulate what teardown_accountResources would do
         account.watcher_eid = ""
         account.witness_eids = []
@@ -1015,17 +1032,19 @@ def test_cleanup_expired_accounts_triggers_resource_teardown(contract_factory, m
         contract.ctx.store.saveAccount(account)
         cleaned.append((account_aid, account))
 
-    monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownAccountResources", fake_teardown)
+    monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownAccountResourcesDo", fake_teardown_do)
 
     # Run cleanup logic
-    cleaned_accounts = contract.ctx.exchanger.expirer.cleanupExpiredAccounts(
-        now="2026-01-01T00:00:00+00:00"
+    sweep = sweep_do(
+        contract.ctx.exchanger.expirer,
+        now="2026-01-01T00:00:00+00:00",
+        batch_size=1,
     )
 
     expired = contract.ctx.store.getAccount("AID_EXPIRED")
     assert expired is not None
     assert expired.status == ACCOUNT_STATE_EXPIRED
-    assert cleaned_accounts == ["AID_EXPIRED"]
+    assert sweep["accounts_cleaned"] == 1
 
     # Ensure teardown was invoked exactly once with correct args
     assert cleaned == [("AID_EXPIRED", expired)]
@@ -1049,7 +1068,11 @@ def test_cleanup_sweep_processes_expired_account_in_batches(onboarded_bundle):
     contract.ctx.store.saveAccount(record)
 
     # Set batch size to 1 to make sure it only does 1 work
-    first = contract.ctx.exchanger.expirer.sweep(batch_size=1)
+    first = sweep_do(
+        contract.ctx.exchanger.expirer,
+        batch_size=1,
+        now="2026-01-01T00:00:00+00:00",
+    )
 
     # Get the account after the sweep
     after_first = contract.ctx.store.getAccount(account.pre)
@@ -1076,7 +1099,11 @@ def test_cleanup_sweep_processes_expired_account_in_batches(onboarded_bundle):
         assert contract.ctx.store.getResource("witness", witness_id) is not None
     
     # Run the second sweep with a batch size to only 1
-    second = contract.ctx.exchanger.expirer.sweep(batch_size=1)
+    second = sweep_do(
+        contract.ctx.exchanger.expirer,
+        batch_size=1,
+        now="2026-01-01T00:00:00+00:00",
+    )
 
     # Retrieve the account after the 2nd sweep
     after_second = contract.ctx.store.getAccount(account.pre)
@@ -1101,7 +1128,11 @@ def test_cleanup_sweep_processes_expired_account_in_batches(onboarded_bundle):
 
 
     # Run a 3rd sweep with batch size of 1
-    third = contract.ctx.exchanger.expirer.sweep(batch_size=1)
+    third = sweep_do(
+        contract.ctx.exchanger.expirer,
+        batch_size=1,
+        now="2026-01-01T00:00:00+00:00",
+    )
 
     # Assert results
     assert third == {
@@ -1138,11 +1169,15 @@ def test_delete_expired_accounts_removes_account(onboarded_bundle):
     # Put it a fake cid to assert correct deletion behavior
     contract.ctx.store.addBinding(account.pre, "cid-to-delete")
 
-    # Run the function
-    deleted = contract.ctx.exchanger.expirer.deleteExpiredAccounts()
+    # Run the cleanup sweep
+    deleted = sweep_do(
+        contract.ctx.exchanger.expirer,
+        batch_size=1,
+        now="2026-01-01T00:00:00+00:00",
+    )
 
     # Assert correct deletion behavior
-    assert deleted == [account.pre]
+    assert deleted["accounts_deleted"] == 1
     assert contract.ctx.store.baser.bindings.get(keys=(account.pre, "cid-to-delete")) is None
     assert contract.ctx.store.getAccount(account.pre) is None
     assert contract.ctx.store.getSession(session_id) is None
@@ -1158,9 +1193,9 @@ def test_delete_expired_accounts_ignores_non_expired_accounts(onboarded_bundle):
     contract = onboarded_bundle["contract"]
     account = onboarded_bundle["account"]
 
-    deleted = contract.ctx.exchanger.expirer.deleteExpiredAccounts()
+    deleted = sweep_do(contract.ctx.exchanger.expirer)
 
-    assert deleted == []
+    assert deleted["accounts_deleted"] == 0
     assert contract.ctx.store.getAccount(account.pre) is not None
 
 

@@ -39,6 +39,10 @@ def contract_factory(tmp_path):
         ctx.watcher_boot = watcher_boot
         ctx.exchanger.ctx.witness_boots = witness_boots
         ctx.exchanger.ctx.watcher_boot = watcher_boot
+        ctx.exchanger.provisioner.configureCleanupBootClients(
+            witness_boots=witness_boots,
+            watcher_boot=watcher_boot,
+        )
 
         client = testing.TestClient(app)
         client.ctx = ctx

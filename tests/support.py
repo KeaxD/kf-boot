@@ -55,6 +55,10 @@ class FakeWitnessBoot:
         if self.delete_error is not None:
             raise self.delete_error
 
+    def deleteWitnessDo(self, eid: str, *, tymth, tock: float = 0.0):
+        yield tock
+        self.deleteWitness(eid)
+
 
 class FakeWatcherBoot:
     base_url = "http://boot.local/watchers"
@@ -106,6 +110,10 @@ class FakeWatcherBoot:
         self.delete_calls.append(eid)
         if self.delete_error is not None:
             raise self.delete_error
+
+    def deleteWatcherDo(self, eid: str, *, tymth, tock: float = 0.0):
+        yield tock
+        self.deleteWatcher(eid)
 
     def watcherStatus(self, eid: str) -> dict[str, Any]:
         self.status_calls.append(eid)
@@ -167,6 +175,33 @@ def total_witness_delete_calls(ctx) -> list[str]:
     return calls
 
 
+def drain_do(gen, *, max_steps: int = 200):
+    for _ in range(max_steps):
+        try:
+            next(gen)
+        except StopIteration as ex:
+            return ex.value
+    raise AssertionError("do generator did not finish")
+
+
+def sweep_do(
+    expirer,
+    *,
+    now: str | None = None,
+    batch_size: int | None = None,
+    time_budget_seconds: float | None = None,
+):
+    return drain_do(
+        expirer.sweepDo(
+            batch_size=batch_size,
+            time_budget_seconds=time_budget_seconds,
+            now=now,
+            tymth=lambda: 0.0,
+            tock=0.0,
+        )
+    )
+
+
 def make_config(tmp_path, *, index: int = 0, **overrides: Any) -> Config:
     witness_backends = overrides.pop("witness_backends", make_witness_backends())
     data = {
@@ -201,7 +236,6 @@ def make_config(tmp_path, *, index: int = 0, **overrides: Any) -> Config:
         "cleanup_interval_seconds": 0,
         "cleanup_batch_size": 100,
         "cleanup_time_budget_seconds": 5,
-        "cleanup_stop_timeout_seconds": 15,
         "cleanup_failure_backoff_seconds": 60,
         "cleanup_failure_backoff_max_seconds": 900,
         "cleanup_failure_jitter_seconds": 0,
@@ -276,7 +310,7 @@ def build_signed_serder(hab, serder: SerderKERI, *, end: bytes | bytearray = b""
 
 
 def build_exn(hab, *, route: str, payload: dict[str, Any]) -> bytes:
-    serder, end = exchanging.exchange(route=route, payload=payload, sender=hab.pre)
+    serder, end = exchanging.exchange(route=route, attributes=payload, sender=hab.pre)
     return build_signed_serder(hab, serder, end=end)
 
 

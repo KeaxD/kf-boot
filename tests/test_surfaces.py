@@ -77,10 +77,8 @@ def test_public_discovery_stays_plain_json_and_reply_frames_prepend_boot_kel(con
         assert reply.ked["a"]["session_id"].startswith("sess_")
 
 
-def test_health_reports_cleanup_runner_failure_when_cleanup_should_be_running(contract_factory):
+def test_health_reports_cleanup_runtime_failure_when_cleanup_should_be_running(contract_factory):
     contract = contract_factory(cleanup_interval_seconds=60)
-    # Stop the sweeper
-    contract.ctx.cleanup_runner.stop()
 
     health = contract.simulate_get("/health")   
     
