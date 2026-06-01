@@ -6,6 +6,7 @@ from typing import Any
 
 import falcon
 from keri import help
+from keri.peer import exchanging
 from keri.peer.exchanging import Exchanger
 
 from kfboot.basing import (
@@ -1124,7 +1125,18 @@ class BootExchanger(Exchanger):
 
     def queueReply(self, route: str, receiver: str, payload: dict[str, Any]) -> None:
         stream = bytearray(self.host_hab.replay())
-        stream.extend(self.host_hab.exchange(route=route, payload=payload, receiver=receiver or None))
+        serder, end = exchanging.exchange(
+            route=route,
+            attributes=payload,
+            sender=self.host_hab.pre,
+            receiver=receiver or "",
+        )
+        endorsed = self.host_hab.endorse(serder=serder, last=False, framed=True)
+        attachment = bytearray(endorsed)
+        del attachment[:serder.size]
+        if end:
+            attachment.extend(end)
+        stream.extend(bytes(serder.raw) + bytes(attachment))
         self.reply_streams.append(bytes(stream))
         logger.debug(
             f"Reply queued for route {route} to receiver {receiver}",

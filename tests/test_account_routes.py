@@ -950,6 +950,54 @@ def test_cleanup_expired_accounts_retries_with_backoff(onboarded_bundle, monkeyp
     assert attempts == [account.pre, account.pre]
 
 
+def test_cleanup_expired_accounts_blocks_after_retry_threshold(onboarded_bundle, monkeypatch):
+    """Repeated transient failures should eventually stop auto-retrying."""
+    contract = onboarded_bundle["contract"]
+    account = onboarded_bundle["account"]
+
+    contract.ctx.config = contract.ctx.config.__class__(
+        **{
+            **contract.ctx.config.__dict__,
+            "cleanup_block_after_attempts": 2,      # Set the block threshold to 2 attempts
+        }
+    )
+    contract.ctx.exchanger.ctx.config = contract.ctx.config
+
+    # Set account as expired to trigger cleanup
+    record = contract.ctx.store.getAccount(account.pre)
+    record.status = ACCOUNT_STATE_EXPIRED
+    record.expired_at = "2026-01-01T00:00:00+00:00"
+    contract.ctx.store.saveAccount(record)
+
+    attempts: list[str] = []
+
+    # Simulate constant teardown failure
+    def always_fail(*, account_aid: str, account=None) -> None:
+        attempts.append(account_aid)
+        raise BootError("simulated teardown failure", status_code=502)
+
+    monkeypatch.setattr(contract.ctx.exchanger.provisioner, "teardownAccountResources", always_fail)
+
+    first = contract.ctx.exchanger.expirer.cleanupExpiredAccounts(now="2026-01-01T00:00:00+00:00")
+    second = contract.ctx.exchanger.expirer.cleanupExpiredAccounts(now="2026-01-01T00:01:01+00:00")
+    third = contract.ctx.exchanger.expirer.cleanupExpiredAccounts(now="2026-01-01T00:02:02+00:00")
+
+    task = contract.ctx.store.getCleanupTask("account_cleanup", account.pre)
+    snapshot = contract.ctx.store.cleanupBacklogSnapshot(now="2026-01-01T00:02:03+00:00")
+    
+    # Assert the 3 attempts fails
+    assert first == []
+    assert second == []
+    assert third == []
+
+    # Assert that there was 2 attempts, the 3rd one results in the task being blocked
+    assert attempts == [account.pre, account.pre]
+    assert task is not None
+    assert task.blocked_at == "2026-01-01T00:01:01+00:00"
+    assert "Cleanup retry limit reached" in task.blocked_reason
+    assert snapshot["blocked_tasks"] == 1
+
+
 @pytest.mark.parametrize(
     ("status", "title"),
     [

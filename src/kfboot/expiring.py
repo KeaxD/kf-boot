@@ -51,6 +51,7 @@ class Expirer:
     - Tear down hosted resources for expired sessions and accounts.
     - Delete expired accounts after cleanup and retention windows.
     - Apply exponential‑backoff retry scheduling for cleanup failures.
+    - Quarantine cleanup tasks that no longer seem to resolve.
     - Provide helper APIs for session failure, TTL refresh, and dynamic
       expiration transitions.
 
@@ -426,18 +427,34 @@ class Expirer:
             - Clean up a session
             - Delete a session
         """
-        if task.kind == self.SESSION_EXPIRE_TASK:
-            return self._processSessionExpire(task, now=now)
-        if task.kind == self.SESSION_CLEANUP_TASK:
-            return self._processSessionCleanup(task, now=now)
-        if task.kind == self.SESSION_DELETE_TASK:
-            return self._processSessionDelete(task, now=now)
-        if task.kind == self.ACCOUNT_EXPIRE_TASK:
-            return self._processAccountExpire(task, now=now)
-        if task.kind == self.ACCOUNT_CLEANUP_TASK:
-            return self._processAccountCleanup(task, now=now)
-        if task.kind == self.ACCOUNT_DELETE_TASK:
-            return self._processAccountDelete(task, now=now)
+        try:
+            if task.kind == self.SESSION_EXPIRE_TASK:
+                return self._processSessionExpire(task, now=now)
+            if task.kind == self.SESSION_CLEANUP_TASK:
+                return self._processSessionCleanup(task, now=now)
+            if task.kind == self.SESSION_DELETE_TASK:
+                return self._processSessionDelete(task, now=now)
+            if task.kind == self.ACCOUNT_EXPIRE_TASK:
+                return self._processAccountExpire(task, now=now)
+            if task.kind == self.ACCOUNT_CLEANUP_TASK:
+                return self._processAccountCleanup(task, now=now)
+            if task.kind == self.ACCOUNT_DELETE_TASK:
+                return self._processAccountDelete(task, now=now)
+        except Exception as exc:
+            logger.exception(
+                "Unexpected cleanup task failure: kind=%s subject=%s",
+                task.kind,
+                task.subject,
+            )
+            # Set the task failure and block it immediately since it cannot be handled
+            self._handleTaskFailure(
+                task,
+                exc,
+                now=now,
+                operation=task.kind,
+                immediate_block=True,
+            )
+            return None, None
 
         logger.warning(f"Unknown cleanup task kind '{task.kind}' for subject {task.subject}")
         
@@ -546,21 +563,14 @@ class Expirer:
             session.updated_at = now
             with self._lock:
                 self.ctx.store.saveSession(session)
-                retryTime = self._nextRetryAt(task, now=now)
-                # Reschedule session deletion
-                self._rescheduleTask(
-                    task.kind,
-                    task.subject,
-                    due_at=retryTime,
-                    now=now,
-                    last_error=str(exc),
-                )
-            logger.warning(
-                f"Session resource teardown failed during expiry for session {session.session_id}: {exc}\n"
-                f"Task was reschedule for {retryTime}"
+            self._handleTaskFailure(
+                task,
+                exc,
+                now=now,
+                operation="session cleanup",
             )
-            # A reschedule means cleanup is still pending, so do not report this task as
-            # successfully cleaned in sweep results or cleanupExpiredSessions().
+            # Retry or block both mean cleanup is still pending, so do not report this
+            # task as successfully cleaned in sweep results or cleanupExpiredSessions().
             return None, None
         else:
             # Update session record with the resources cleaned up time
@@ -738,22 +748,15 @@ class Expirer:
                 account=account,
             )
         except BootError as exc:
-            with self._lock:
-                retryTime = self._nextRetryAt(task, now=now)
-                # Reschedule task due to errorr
-                self._rescheduleTask(
-                    task.kind,
-                    task.subject,
-                    due_at=retryTime,
-                    now=now,
-                    last_error=str(exc),
-                )
-            logger.warning(
-                f"Resource teardown failed for expired account {account.account_aid}: {exc}"
-                f"Task was rescheduled for {retryTime}"
+            self._handleTaskFailure(
+                task,
+                exc,
+                now=now,
+                operation="account cleanup",
             )
-            # The account is still waiting on teardown, so a retry should not count as a
-            # completed cleanup in sweep counters or cleanupExpiredAccounts().
+            # The account is still waiting on teardown, so retrying or blocking
+            # should not count as a completed cleanup in sweep counters or
+            # cleanupExpiredAccounts().
             return None, None
         else:
             # Update account record with cleaned up time
@@ -817,18 +820,11 @@ class Expirer:
                 account=account,
             )
         except BootError as exc:
-            with self._lock:
-                retryTime = self._nextRetryAt(task, now=now)
-                self._rescheduleTask(
-                    task.kind,
-                    task.subject,
-                    due_at=retryTime,
-                    now=now,
-                    last_error=str(exc),
-                )
-            logger.warning(
-                f"Expired account deletion failed for account {account.account_aid}: {exc}"
-                f"Task was rescheduled for {retryTime}"
+            self._handleTaskFailure(
+                task,
+                exc,
+                now=now,
+                operation="account delete",
             )
         else:
             with self._lock:
@@ -839,6 +835,171 @@ class Expirer:
             return "accounts_deleted", account.account_aid
 
         return None, None
+
+    def _handleTaskFailure(
+        self,
+        task: CleanupTaskRecord,
+        exc: Exception,
+        *,
+        now: str,
+        operation: str,
+        immediate_block: bool = False,
+    ) -> str:
+        """Either retry or quarantine a failed cleanup task.
+
+        Temporary downstream failures should keep using exponential backoff, but
+        poisoned tasks need a durable blocked state so the cleaner stops retrying
+        work that clearly needs operator intervention.
+        """
+
+        error_text = str(exc)
+        first_failed_at = task.first_failed_at or now
+
+        # First determine if the task should be blocked
+        if self._shouldBlockTask(
+            task,
+            exc,
+            now=now,
+            first_failed_at=first_failed_at,
+            immediate_block=immediate_block,
+        ):
+            # If it should be blocked, set the reason and save it in DB
+            blocked_reason = self._blockedReason(
+                task,
+                exc,
+                now=now,
+                operation=operation,
+                first_failed_at=first_failed_at,
+                immediate_block=immediate_block,
+            )
+            with self._lock:
+                self.ctx.store.blockCleanupTask(
+                    task.kind,
+                    task.subject,
+                    now=now,
+                    blocked_reason=blocked_reason,
+                    last_error=error_text,
+                    first_failed_at=first_failed_at,
+                )
+            logger.warning(
+                "Cleanup task blocked: kind=%s subject=%s reason=%s",
+                task.kind,
+                task.subject,
+                blocked_reason,
+            )
+            return "blocked"
+
+        # Reschedule the task with failure metadata
+        retry_time = self._nextRetryAt(task, now=now)
+        with self._lock:
+            self.ctx.store.rescheduleFailedCleanupTask(
+                task.kind,
+                task.subject,
+                due_at=retry_time,
+                now=now,
+                last_error=error_text,
+                first_failed_at=first_failed_at,
+            )
+        logger.warning(
+            "Cleanup task rescheduled after failure: kind=%s subject=%s retry_at=%s error=%s",
+            task.kind,
+            task.subject,
+            retry_time,
+            error_text,
+        )
+        return "rescheduled"
+
+    def _shouldBlockTask(
+        self,
+        task: CleanupTaskRecord,
+        exc: Exception,
+        *,
+        now: str,
+        first_failed_at: str,
+        immediate_block: bool = False,
+    ) -> bool:
+        """Return True when a failed cleanup task should be quarantined."""
+
+        # Check for the immediate_block flag 
+        if immediate_block:
+            return True
+
+        if isinstance(exc, BootError) and not self._bootErrorIsRetryable(exc):
+            return True
+
+        # Check for config thresholds 
+        if task.attempt_count >= self.ctx.config.cleanup_block_after_attempts:
+            return True
+        return (
+            self._failureAgeSeconds(first_failed_at=first_failed_at, now=now)
+            >= self.ctx.config.cleanup_block_after_failure_age_seconds
+        )
+
+    def _bootErrorIsRetryable(self, exc: BootError) -> bool:
+        """Classify which downstream HTTP failures are worth retrying."""
+
+        # Return true if it is not an HTTP error
+        if exc.status_code is None:
+            return True
+        
+        # Retry on server errors 
+        if exc.status_code >= 500:
+            return True
+        
+        # Retry on client errors like rate limits or timeouts
+        # This might be unecessary but those fits retryable errors
+        return exc.status_code in {408, 425, 429}
+
+    def _failureAgeSeconds(self, *, first_failed_at: str, now: str) -> float:
+        """Measure how long this task has been failing"""
+
+        try:
+            failed_at = datetime.fromisoformat(first_failed_at)
+            current = datetime.fromisoformat(now)
+        except ValueError:
+            return float("inf")
+        return max((current - failed_at).total_seconds(), 0.0)
+
+    def _blockedReason(
+        self,
+        task: CleanupTaskRecord,
+        exc: Exception,
+        *,
+        now: str,
+        operation: str,
+        first_failed_at: str,
+        immediate_block: bool = False,
+    ) -> str:
+        """Build a reason for task quarantine:
+        1 - Immediate block flag was set
+        2 - The error is non-retryable based on its type or status code
+        3 - The task has exceeded the configured retry attempt limit
+        4 - The task has exceeded the configured failure time limit
+        """
+
+        if immediate_block:
+            return (
+                f"Unexpected cleanup error during {operation}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        if isinstance(exc, BootError) and not self._bootErrorIsRetryable(exc):
+            code = exc.status_code if exc.status_code is not None else "unknown"
+            return (
+                f"Non-retryable cleanup failure during {operation} "
+                f"(status={code}): {exc}"
+            )
+        if task.attempt_count >= self.ctx.config.cleanup_block_after_attempts:
+            return (
+                f"Cleanup retry limit reached during {operation}: "
+                f"{task.attempt_count} attempts >= "
+                f"{self.ctx.config.cleanup_block_after_attempts} allowed"
+            )
+        age_seconds = self._failureAgeSeconds(first_failed_at=first_failed_at, now=now)
+        return (
+            f"Cleanup failure age limit reached during {operation}: "
+            f"{age_seconds:.0f}s >= "
+            f"{self.ctx.config.cleanup_block_after_failure_age_seconds:.0f}s"
+        )
 
     def _nextRetryAt(self, task: CleanupTaskRecord, *, now: str) -> str:
         """Compute the next retry time using exponential backoff and optional jitter"""
